@@ -13,6 +13,9 @@
 /dist/*
 !/dist/README.txt
 
+# Python cache (scripts/release_checksums.py)
+__pycache__/
+
 # ОС и редакторы
 Thumbs.db
 Desktop.ini

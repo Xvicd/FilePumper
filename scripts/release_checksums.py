@@ -1,12 +1,17 @@
-"""Download the release assets, check them and refresh the release body.
+"""Check the release assets and refresh the SHA-256 block in the release body.
 
-Usage: python scripts/_fix_release.py [--patch]
-ASCII-only source: works in any console code page. Russian text comes from
-release_notes.md, which is read and written as UTF-8.
+Usage:
+    python scripts/release_checksums.py              # download assets, print hashes
+    python scripts/release_checksums.py --patch       # also rewrite the release body
+    python scripts/release_checksums.py --tag v0.2.1 --notes docs/release-notes/v0.2.1.md --patch
+
+ASCII-only source so it runs in any console code page; the notes themselves are
+read and sent as UTF-8.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -18,9 +23,7 @@ import urllib.request
 import zipfile
 
 REPO = "Xvicd/FilePumper"
-TAG = "v0.2.0"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NOTES = os.path.join(ROOT, "release_notes.md")
 
 
 def token() -> str:
@@ -74,9 +77,22 @@ def pe_subsystem(path: str) -> int:
 
 
 def main() -> int:
-    patch = "--patch" in sys.argv[1:]
+    parser = argparse.ArgumentParser(description="Check release assets and refresh their SHA-256 in the release body.")
+    parser.add_argument("--tag", default="v0.2.0", help="release tag, e.g. v0.2.0")
+    parser.add_argument("--notes", default=None, help="markdown template with {{WIN_SHA}}/{{LINUX_SHA}}")
+    parser.add_argument("--patch", action="store_true", help="rewrite the release body from --notes")
+    args = parser.parse_args()
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    version = args.tag.lstrip("v")
+    notes = args.notes or os.path.join(ROOT, "docs", "release-notes", f"{args.tag}.md")
+    win_name = f"FilePumper-{version}-windows-x64.zip"
+    linux_name = f"FilePumper-{version}-linux-x64.tar.gz"
+
     tok = token()
-    release = api(f"https://api.github.com/repos/{REPO}/releases/tags/{TAG}", tok)
+    release = api(f"https://api.github.com/repos/{REPO}/releases/tags/{args.tag}", tok)
     workdir = os.path.join(tempfile.gettempdir(), "filepumper-release")
     os.makedirs(workdir, exist_ok=True)
 
@@ -89,7 +105,7 @@ def main() -> int:
         hashes[name] = digest
         print(f"{name} | {os.path.getsize(path)} bytes | sha256 {digest}")
 
-    zip_path = os.path.join(workdir, f"FilePumper-{TAG.lstrip('v')}-windows-x64.zip")
+    zip_path = os.path.join(workdir, win_name)
     if os.path.exists(zip_path):
         with zipfile.ZipFile(zip_path) as archive:
             for info in archive.infolist():
@@ -103,13 +119,13 @@ def main() -> int:
 
     print(f"downloaded into {workdir}")
 
-    if not patch:
+    if not args.patch:
         return 0
 
-    with open(NOTES, encoding="utf-8") as handle:
+    with open(notes, encoding="utf-8") as handle:
         body = handle.read()
-    body = body.replace("{{WIN_SHA}}", hashes[f"FilePumper-{TAG.lstrip('v')}-windows-x64.zip"])
-    body = body.replace("{{LINUX_SHA}}", hashes[f"FilePumper-{TAG.lstrip('v')}-linux-x64.tar.gz"])
+    body = body.replace("{{WIN_SHA}}", hashes[win_name])
+    body = body.replace("{{LINUX_SHA}}", hashes[linux_name])
     payload = json.dumps({"body": body}, ensure_ascii=False).encode("utf-8")
     updated = api(f"https://api.github.com/repos/{REPO}/releases/{release['id']}", tok, "PATCH", payload)
     print("--- body ---")

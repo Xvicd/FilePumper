@@ -43,9 +43,9 @@
 
 ### Готовые сборки
 
-Архивы прикладываются к релизам (`Releases`), а также лежат в каталоге `dist/`
-после локальной сборки: `FilePumper-<версия>-windows-x64.zip` и
-`FilePumper-<версия>-linux-x64.tar.gz`.
+Архивы прикладываются к [релизам](https://github.com/Xvicd/FilePumper/releases),
+а также лежат в каталоге `dist/` после локальной сборки:
+`FilePumper-<версия>-windows-x64.zip` и `FilePumper-<версия>-linux-x64.tar.gz`.
 
 | Платформа | Файл | Размер | Требования |
 | --- | --- | ---: | --- |
@@ -199,8 +199,16 @@ tests/
 ├── roundtrip.rs         сквозные тесты: накачка и встраивание → извлечение
 └── robustness.rs        устойчивость к обрезанию и повреждённым данным
 
+docs/
+└── release-notes/
+    └── v0.2.0.md        описание релиза с плейсхолдерами SHA-256
+
 scripts/
-└── check_linux_build.sh проверка собранного Linux-бинарника
+├── check_linux_build.sh    проверка собранного Linux-бинарника
+├── release_checksums.py    проверка файлов релиза и SHA-256 в описании
+├── release_logs.ps1        разбор логов упавшего workflow
+├── release_upload.ps1      заливка архивов из dist/ в релиз (GitHub API)
+└── wait_release.ps1        ожидание завершения workflow релиза
 ```
 
 Вся логика находится в библиотеке (`src/lib.rs`), поэтому её можно тестировать и
