@@ -109,10 +109,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Создать релиз на GitHub
+      # Релиз может уже существовать (например, собран и загружен локально),
+      # поэтому создаём его только при отсутствии и всегда перезаливаем файлы.
+      - name: Создать или обновить релиз на GitHub
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" artifacts/* \
-            --title "FilePumper $GITHUB_REF_NAME" \
-            --generate-notes
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "FilePumper $GITHUB_REF_NAME" \
+              --generate-notes
+          gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
