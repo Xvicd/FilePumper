@@ -1,4 +1,4 @@
-FilePumper 0.2.0 — готовые сборки
+FilePumper 0.3.0 — готовые сборки
 ===========================================
 
 windows\
@@ -8,10 +8,17 @@ windows\
   Команды CLI:
     FilePumper-cli.exe --help
     FilePumper-cli.exe --version
-    FilePumper-cli.exe pump <вход> <выход> --size <МБ> [--method ...]
+    FilePumper-cli.exe pump <вход>... --size <МБ> [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...]
     FilePumper-cli.exe embed <носитель> <нагрузка> [выход] [--copies 1..3] [--compress] [--password ПАРОЛЬ]
-    FilePumper-cli.exe extract <носитель> [выход] [--password ПАРОЛЬ]
-    FilePumper-cli.exe inspect <носитель>
+    FilePumper-cli.exe extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ] [--password ПАРОЛЬ]
+    FilePumper-cli.exe inspect <носитель>...
+
+  Пакетная накачка: можно передать сразу несколько файлов. Ошибка одного файла
+  не прерывает остальные, в конце печатается сводка. Результаты получают имя
+  <имя>_<размер>MB.<расширение> и не перезаписывают существующие файлы.
+  Пример (PowerShell):
+    $files = Get-ChildItem .\photos\*.jpg | ForEach-Object FullName
+    .\FilePumper-cli.exe pump @files --size 10 --method png-chunks --out-dir .\big
 
   Если запустить FilePumper.exe с аргументами, команда выполнится,
   но вывода в консоли не будет (её нет) — ошибки показываются диалогом.

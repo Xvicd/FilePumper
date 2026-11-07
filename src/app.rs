@@ -6,6 +6,7 @@ use std::thread;
 
 use eframe::egui;
 
+use crate::batch::{self, BatchItem};
 use crate::payload::{self, ContainerOptions, PayloadSummary};
 use crate::pumper::{AnimationFormat, Method};
 use crate::util::{reveal_in_explorer, CancelToken, Job, CANCELLED_MESSAGE, MIB};
@@ -14,6 +15,21 @@ enum WorkerMessage {
     Progress(f32, String),
     Finished(Result<(String, PathBuf), String>),
     Inspected(Result<PayloadSummary, String>),
+    BatchItemStarted(usize),
+    BatchItemDone(usize, Result<u64, String>),
+    BatchFinished {
+        ok: bool,
+        cancelled: bool,
+        text: String,
+        folder: Option<PathBuf>,
+    },
+}
+
+/// Строка списка пакета: файл и его состояние.
+struct BatchRow {
+    input: PathBuf,
+    status: String,
+    ok: Option<bool>,
 }
 
 struct Preview {
@@ -23,7 +39,8 @@ struct Preview {
 }
 
 pub struct PumperApp {
-    input: Option<PathBuf>,
+    rows: Vec<BatchRow>,
+    out_dir: Option<PathBuf>,
     method: Method,
     animation_format: AnimationFormat,
     target_mb: String,
@@ -44,11 +61,12 @@ pub struct PumperApp {
 impl Default for PumperApp {
     fn default() -> Self {
         Self {
-            input: None,
+            rows: Vec::new(),
+            out_dir: None,
             method: Method::default(),
             animation_format: AnimationFormat::default(),
             target_mb: "10".to_owned(),
-            status: "Выберите файл и режим, затем нажмите «Запустить».".to_owned(),
+            status: "Добавьте файлы и режим, затем нажмите «Запустить».".to_owned(),
             progress: 0.0,
             worker: None,
             cancel: CancelToken::new(),
@@ -78,13 +96,35 @@ impl PumperApp {
         (sender, self.cancel.clone())
     }
 
+    /// Добавляет файлы в список пакета, пропуская повторы и не-файлы.
+    fn add_files(&mut self, paths: Vec<PathBuf>) {
+        let mut added = 0_usize;
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            if self
+                .rows
+                .iter()
+                .any(|row| crate::util::same_file(&row.input, &path))
+            {
+                continue;
+            }
+            self.rows.push(BatchRow {
+                input: path,
+                status: "Ожидает".to_owned(),
+                ok: None,
+            });
+            added += 1;
+        }
+        if added > 0 {
+            self.status = format!("Файлов в списке: {}.", self.rows.len());
+        }
+    }
+
     fn start_pump(&mut self) {
-        let Some(input) = self.input.clone() else {
-            self.result_dialog = Some((false, "Выберите исходный файл.".to_owned(), None));
-            return;
-        };
-        if !input.is_file() {
-            self.result_dialog = Some((false, "Исходный файл не найден.".to_owned(), None));
+        if self.rows.is_empty() {
+            self.result_dialog = Some((false, "Добавьте хотя бы один файл.".to_owned(), None));
             return;
         }
         let normalized = self.target_mb.trim().replace(',', ".");
@@ -102,57 +142,105 @@ impl PumperApp {
             return;
         }
         let target_bytes = bytes_f64 as u64;
+        let method = self.method;
+        let format = self.animation_format;
+        let out_dir = self.out_dir.clone();
+        if let Some(directory) = out_dir.as_ref() {
+            if !directory.is_dir() {
+                if let Err(err) = std::fs::create_dir_all(directory) {
+                    self.result_dialog =
+                        Some((false, format!("Не удалось создать папку: {err}"), None));
+                    return;
+                }
+            }
+        }
 
-        let output_ext = match self.method {
-            Method::Animation => self.animation_format.extension(),
-            Method::PngChunks | Method::Upscale => "png",
-            Method::Svg => "svg",
-            Method::OfficePdf | Method::Padding => input
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("bin"),
-        };
-        let base = input
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or("output");
-        let suggested = format!("{base}_{}MB.{output_ext}", mb as u64);
-        let Some(output) = rfd::FileDialog::new()
-            .set_directory(input.parent().unwrap_or_else(|| std::path::Path::new(".")))
-            .set_file_name(&suggested)
-            .save_file()
-        else {
-            return;
-        };
-        if crate::util::same_file(&input, &output) {
-            self.result_dialog = Some((false, "Сохраните файл под новым именем.".to_owned(), None));
+        let mut work: Vec<(usize, BatchItem)> = Vec::new();
+        for (index, row) in self.rows.iter_mut().enumerate() {
+            row.ok = None;
+            match BatchItem::new(&row.input, target_bytes, method, format, out_dir.as_deref()) {
+                Ok(item) => {
+                    row.status = "Ожидает".to_owned();
+                    work.push((index, item));
+                }
+                Err(message) => {
+                    row.status = format!("Пропуск: {message}");
+                    row.ok = Some(false);
+                }
+            }
+        }
+        if work.is_empty() {
+            self.result_dialog = Some((false, "Ни один файл не подошёл.".to_owned(), None));
             return;
         }
 
-        let method = self.method;
-        let format = self.animation_format;
         let (sender, cancel) = self.begin_job();
         self.status = "Подготовка...".to_owned();
         thread::spawn(move || {
-            let progress_sender = sender.clone();
-            let progress = move |percent: f32, text: &str| {
-                let _ = progress_sender.send(WorkerMessage::Progress(
-                    (percent / 100.0).clamp(0.0, 1.0),
-                    text.to_owned(),
-                ));
+            let total = work.len();
+            let mut created = 0_usize;
+            let mut failed = 0_usize;
+            let mut cancelled = false;
+            let mut folder: Option<PathBuf> = None;
+            // Общий контекст нужен только ради общего флага отмены: прогресс
+            // каждого файла пересчитывается в общий дочерним контекстом.
+            let silent = |_: f32, _: &str| {};
+            let job = Job::new(&silent, &cancel);
+
+            for (position, (row_index, item)) in work.into_iter().enumerate() {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let _ = sender.send(WorkerMessage::BatchItemStarted(row_index));
+                let progress_sender = sender.clone();
+                let progress = move |percent: f32, text: &str| {
+                    let within = percent.clamp(0.0, 100.0) / 100.0;
+                    let overall = ((position as f32 + within) / total as f32).clamp(0.0, 1.0);
+                    let _ = progress_sender.send(WorkerMessage::Progress(
+                        overall,
+                        format!("Файл {}/{}: {text}", position + 1, total),
+                    ));
+                };
+                let item_job = job.child(&progress);
+                match batch::pump_one(&item, method, format, target_bytes, &item_job) {
+                    Ok(size) => {
+                        created += 1;
+                        folder = item.output.parent().map(PathBuf::from);
+                        let _ = sender.send(WorkerMessage::BatchItemDone(row_index, Ok(size)));
+                    }
+                    Err(message) if message == CANCELLED_MESSAGE => {
+                        cancelled = true;
+                        let _ = sender.send(WorkerMessage::BatchItemDone(row_index, Err(message)));
+                        break;
+                    }
+                    Err(message) => {
+                        failed += 1;
+                        let _ = sender.send(WorkerMessage::BatchItemDone(row_index, Err(message)));
+                    }
+                }
+            }
+
+            let mut text = if cancelled {
+                format!("Обработка отменена.\nГотово файлов: {created} из {total}.")
+            } else {
+                format!("Готово файлов: {created} из {total}.")
             };
-            let job = Job::new(&progress, &cancel);
-            let result = crate::pumper::run(method, format, &input, &output, target_bytes, &job)
-                .and_then(|()| {
-                    let size = std::fs::metadata(&output)
-                        .map_err(|err| err.to_string())?
-                        .len();
-                    Ok((
-                        format!("Файл создан.\nРазмер: {:.2} МБ", size as f64 / MIB as f64),
-                        output,
-                    ))
-                });
-            let _ = sender.send(WorkerMessage::Finished(result));
+            if failed > 0 {
+                text.push_str(&format!("\nС ошибкой: {failed}."));
+            }
+            match folder.as_ref() {
+                Some(directory) => {
+                    text.push_str(&format!("\nПапка результатов: {}", directory.display()));
+                }
+                None => text.push_str("\nРезультаты лежат рядом с исходными файлами."),
+            }
+            let _ = sender.send(WorkerMessage::BatchFinished {
+                ok: !cancelled && failed == 0,
+                cancelled,
+                text,
+                folder,
+            });
         });
     }
 
@@ -354,6 +442,50 @@ impl PumperApp {
                     self.status = "Полезная нагрузка не найдена.".to_owned();
                     self.result_dialog = Some((false, error, None));
                 }
+                WorkerMessage::BatchItemStarted(index) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.status = "Обработка...".to_owned();
+                        row.ok = None;
+                    }
+                }
+                WorkerMessage::BatchItemDone(index, Ok(size)) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.status = format!("Готово: {:.2} МБ", size as f64 / MIB as f64);
+                        row.ok = Some(true);
+                    }
+                }
+                WorkerMessage::BatchItemDone(index, Err(error)) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.status = format!("Ошибка: {error}");
+                        row.ok = Some(false);
+                    }
+                }
+                WorkerMessage::BatchFinished {
+                    ok,
+                    cancelled,
+                    text,
+                    folder,
+                } => {
+                    self.busy = false;
+                    self.worker = None;
+                    self.progress = if ok { 1.0 } else { 0.0 };
+                    self.status = if ok {
+                        "Пакет обработан.".to_owned()
+                    } else if cancelled {
+                        CANCELLED_MESSAGE.to_owned()
+                    } else {
+                        "Часть файлов не удалось обработать.".to_owned()
+                    };
+                    if cancelled {
+                        for row in self.rows.iter_mut() {
+                            if row.ok.is_none() {
+                                row.status = "Отменено".to_owned();
+                                row.ok = Some(false);
+                            }
+                        }
+                    }
+                    self.result_dialog = Some((ok, text, folder));
+                }
             }
         }
     }
@@ -370,7 +502,9 @@ impl PumperApp {
         if dropped.is_empty() {
             return;
         }
-        for path in dropped {
+        // Все перетащенные файлы попадают в пакет, а первые два дополнительно
+        // занимают слоты «носитель» и «нагрузка» для встраивания.
+        for path in dropped.iter() {
             if self.carrier_path.is_none() {
                 self.carrier_path = Some(path.clone());
             } else if self.payload_path.is_none() {
@@ -378,10 +512,8 @@ impl PumperApp {
             } else {
                 self.carrier_path = Some(path.clone());
             }
-            if self.input.is_none() {
-                self.input = Some(path);
-            }
         }
+        self.add_files(dropped);
         self.status = "Файлы добавлены перетаскиванием.".to_owned();
     }
 }
@@ -403,17 +535,75 @@ impl eframe::App for PumperApp {
                     ui.weak("Файлы можно перетаскивать в окно мышью.");
                     ui.separator();
 
+                    ui.label("1. Исходные файлы (можно сразу несколько):");
                     ui.horizontal(|ui| {
-                        if ui.button("1. Выбрать исходный файл...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                self.input = Some(path);
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Выбрать файлы..."))
+                            .clicked()
+                        {
+                            if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                                self.add_files(paths);
                             }
                         }
-                        match self.input.as_ref() {
-                            Some(path) => ui.monospace(path.display().to_string()),
-                            None => ui.weak("файл не выбран"),
+                        if ui
+                            .add_enabled(!self.busy && !self.rows.is_empty(), egui::Button::new("Очистить"))
+                            .clicked()
+                        {
+                            self.rows.clear();
+                            self.status = "Список файлов очищен.".to_owned();
+                        }
+                        match self.rows.len() {
+                            0 => ui.weak("файлы не выбраны"),
+                            count => ui.weak(format!("файлов: {count}")),
                         };
                     });
+
+                    if !self.rows.is_empty() {
+                        let mut remove: Option<usize> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("batch_rows")
+                            .max_height(160.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, row) in self.rows.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(!self.busy, egui::Button::new("✕"))
+                                            .clicked()
+                                        {
+                                            remove = Some(index);
+                                        }
+                                        let name = row
+                                            .input
+                                            .file_name()
+                                            .and_then(|value| value.to_str())
+                                            .unwrap_or("файл");
+                                        ui.monospace(name)
+                                            .on_hover_text(row.input.display().to_string());
+                                        match row.ok {
+                                            Some(true) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(0x3c, 0xb3, 0x71),
+                                                    &row.status,
+                                                );
+                                            }
+                                            Some(false) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(0xd9, 0x53, 0x4f),
+                                                    &row.status,
+                                                );
+                                            }
+                                            None => {
+                                                ui.weak(&row.status);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(index) = remove {
+                            self.rows.remove(index);
+                        }
+                    }
 
                     ui.add_space(6.0);
                     ui.label("2. Метод увеличения:");
@@ -454,11 +644,34 @@ impl eframe::App for PumperApp {
                         ui.add(egui::TextEdit::singleline(&mut self.target_mb).desired_width(100.0));
                     });
 
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Папка результатов..."))
+                            .clicked()
+                        {
+                            if let Some(directory) = rfd::FileDialog::new().pick_folder() {
+                                self.out_dir = Some(directory);
+                            }
+                        }
+                        match self.out_dir.as_ref() {
+                            Some(directory) => ui.monospace(directory.display().to_string()),
+                            None => ui.weak("рядом с каждым исходным файлом"),
+                        };
+                        if self.out_dir.is_some()
+                            && ui
+                                .add_enabled(!self.busy, egui::Button::new("Сбросить"))
+                                .clicked()
+                        {
+                            self.out_dir = None;
+                        }
+                    });
+
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
-                                !self.busy && self.input.is_some(),
+                                !self.busy && !self.rows.is_empty(),
                                 egui::Button::new("Запустить"),
                             )
                             .clicked()

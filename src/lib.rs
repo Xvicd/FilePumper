@@ -2,6 +2,7 @@
 //! нагрузки, извлечение, командная строка и графический интерфейс.
 
 pub mod app;
+pub mod batch;
 pub mod cli;
 pub mod payload;
 pub mod pumper;

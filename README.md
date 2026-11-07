@@ -7,7 +7,7 @@
 ![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)
 ![Windows | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![MIT](https://img.shields.io/badge/license-MIT-green)
-![Версия 0.2.0](https://img.shields.io/badge/version-0.2.0-lightgrey)
+![Версия 0.3.0](https://img.shields.io/badge/version-0.3.0-lightgrey)
 
 ## Содержание
 
@@ -35,8 +35,12 @@
   равно даст исходный файл.
 - **Проверка целостности** — SHA-256 блоба, CRC32 заголовка и концевого маркера;
   после записи готовый файл заново открывается декодером `image`.
-- **Интерфейс** — drag & drop файлов, превью перед извлечением, прогресс, кнопка
-  «Отмена», показ результата в проводнике, окно свободно масштабируется.
+- **Пакетная накачка** — сразу несколько файлов за один запуск: список в окне или
+  `pump file1 file2 ... --out-dir папка` в терминале. Ошибка одного файла не мешает
+  остальным, в конце — сводка «готово N из M».
+- **Интерфейс** — drag & drop файлов, список пакета с состоянием каждого файла,
+  превью перед извлечением, прогресс, кнопка «Отмена», показ результата в проводнике,
+  окно свободно масштабируется.
 - **CLI** — `pump`, `embed`, `extract`, `inspect`, коды выхода `0`/`1`, `--help`, `--version`.
 
 ## Установка
@@ -58,7 +62,7 @@
 подгружаются динамически и нужны только окну:
 
 ```bash
-tar -xzf FilePumper-0.2.0-linux-x64.tar.gz
+tar -xzf FilePumper-0.3.0-linux-x64.tar.gz
 chmod +x linux/file-pumper linux/file-pumper-cli
 ./linux/file-pumper-cli --help
 ```
@@ -70,7 +74,9 @@ chmod +x linux/file-pumper linux/file-pumper-cli
 ## Быстрый старт
 
 1. Запустить `FilePumper.exe` (Windows) или `./file-pumper` (Linux).
-2. **Накачка:** выбрать файл → метод → целевой размер в МБ → «Запустить».
+2. **Накачка:** нажать «Выбрать файлы…» (можно сразу несколько) → метод → целевой
+   размер в МБ → при необходимости выбрать папку результатов → «Запустить».
+   Список показывает состояние каждого файла, обработка идёт по очереди.
 3. **Спрятать файл:** выбрать носитель и нагрузку (или перетащить оба файла в окно)
    → задать копии/сжатие/пароль → «Вшить файл…».
 4. **Достать файл:** выбрать носитель → «Проверить и извлечь…» → посмотреть превью
@@ -80,23 +86,41 @@ chmod +x linux/file-pumper linux/file-pumper-cli
 
 | Команда | Назначение |
 | --- | --- |
-| `pump <вход> <выход> --size <МБ> [--method ...] [--format gif\|png\|webp]` | накачать файл до размера |
+| `pump <вход>... --size <МБ> [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--format gif\|png\|webp]` | накачать один или несколько файлов до размера |
 | `embed <носитель> <нагрузка> [выход] [--copies 1..3] [--compress] [--password ПАРОЛЬ]` | спрятать файл в носителе |
-| `extract <носитель> [выход] [--password ПАРОЛЬ]` | извлечь спрятанный файл |
-| `inspect <носитель>` | показать, что лежит внутри |
+| `extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ] [--password ПАРОЛЬ]` | извлечь спрятанный файл из одного или нескольких носителей |
+| `inspect <носитель>...` | показать, что лежит внутри |
 | `--help`, `--version` | справка и версия |
 
 ```powershell
 # накачать до 25 МБ методом png-chunks (методы: animation, png-chunks, upscale, svg, office, padding)
-file-pumper-cli pump .\photo.jpg .\photo_big.png --size 25 --method png-chunks
+file-pumper-cli pump .\photo.jpg --size 25 --method png-chunks --output .\photo_big.png
+
+# пакет: все JPEG из папки, результаты — в отдельный каталог
+$files = Get-ChildItem .\photos\*.jpg | ForEach-Object FullName
+file-pumper-cli pump @files --size 10 --method png-chunks --out-dir .\big
 
 # спрятать архив в картинке: 2 копии, сжатие, пароль
 file-pumper-cli embed .\photo.png .\secret.zip .\photo_secret.png --copies 2 --compress --password пароль
 
 # проверить содержимое и извлечь обратно
-file-pumper-cli inspect .\photo_secret.png
-file-pumper-cli extract .\photo_secret.png .\restored.zip --password пароль
+file-pumper-cli inspect .\photo_secret.png .\photo_secret2.png
+file-pumper-cli extract .\photo_secret.png .\photo_secret2.png --out-dir .\restored --password пароль
 ```
+
+Пакетные команды обрабатывают файлы по очереди: ошибка одного файла не прерывает
+остальные, в конце печатается строка «Готово: …» по каждому файлу и сводка.
+Код выхода `1`, если хоть один файл не удался.
+
+Результаты получают имя `<имя>_<размер>MB.<расширение>` (например, `photo_10MB.png`)
+и никогда не перезаписывают уже существующие файлы — при совпадении добавляется
+суффикс `-2`, `-3`. `--out-dir` складывает всё в одну папку, `--output` задаёт точное
+имя результата для одного файла.
+
+Старый синтаксис `pump <вход> <выход>` (и `extract <носитель> <выход>`) продолжает
+работать с предупреждением: если второй путь ещё не существует, он считается выходным
+файлом. Как только такой файл появился на диске, повторный запуск той же команды
+трактует оба пути как входные — для повторяемых команд сразу используйте `--output`.
 
 `inspect` показывает тип носителя, имя нагрузки, размер, число целых копий,
 сжатие/шифрование и оценку устойчивости к загрузке на сервер. Коды выхода:
@@ -105,7 +129,7 @@ file-pumper-cli extract .\photo_secret.png .\restored.zip --password парол�
 Из исходников:
 
 ```powershell
-cargo run --release --bin file-pumper-cli -- pump .\photo.jpg .\photo_big.png --size 25
+cargo run --release --bin file-pumper-cli -- pump .\photo.jpg --size 25 --output .\photo_big.png
 ```
 
 ## Режимы накачки
@@ -174,7 +198,8 @@ src/
 ├── bin/
 │   └── cli.rs           точка входа консольной версии
 ├── lib.rs               публичный API библиотеки
-├── app.rs               интерфейс: режимы, прогресс, отмена, превью нагрузки
+├── app.rs               интерфейс: список пакета, режимы, прогресс, отмена, превью нагрузки
+├── batch.rs             пакетная накачка: имена результатов, очередь, отчёт по файлам
 ├── cli.rs               команды pump / embed / extract / inspect
 ├── util.rs              прогресс, токен отмены, случайные данные, CRC32, пути
 ├── pumper/              методы накачки
@@ -197,11 +222,13 @@ src/
 
 tests/
 ├── roundtrip.rs         сквозные тесты: накачка и встраивание → извлечение
-└── robustness.rs        устойчивость к обрезанию и повреждённым данным
+├── robustness.rs        устойчивость к обрезанию и повреждённым данным
+└── cli_batch.rs         пакетные команды CLI: список файлов, папка результатов, коды выхода
 
 docs/
 └── release-notes/
-    └── v0.2.0.md        описание релиза с плейсхолдерами SHA-256
+    ├── v0.2.0.md        описание релиза с плейсхолдерами SHA-256
+    └── v0.3.0.md        описание релиза с плейсхолдерами SHA-256
 
 scripts/
 ├── check_linux_build.sh    проверка собранного Linux-бинарника

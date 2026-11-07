@@ -78,7 +78,7 @@ def pe_subsystem(path: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check release assets and refresh their SHA-256 in the release body.")
-    parser.add_argument("--tag", default="v0.2.0", help="release tag, e.g. v0.2.0")
+    parser.add_argument("--tag", default="v0.3.0", help="release tag, e.g. v0.3.0")
     parser.add_argument("--notes", default=None, help="markdown template with {{WIN_SHA}}/{{LINUX_SHA}}")
     parser.add_argument("--patch", action="store_true", help="rewrite the release body from --notes")
     args = parser.parse_args()

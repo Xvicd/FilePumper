@@ -56,6 +56,18 @@ impl<'a> Job<'a> {
         }
     }
 
+    /// Дочерний контекст: тот же флаг отмены, но собственный обработчик прогресса.
+    /// Нужен пакетной обработке: каждый файл рапортует о себе, отмена общая.
+    pub fn child<'b>(&'b self, progress: &'b dyn Fn(f32, &str)) -> Job<'b>
+    where
+        'a: 'b,
+    {
+        Job {
+            progress,
+            cancel: self.cancel,
+        }
+    }
+
     pub fn report(&self, percent: f32, text: &str) {
         (self.progress)(percent.clamp(0.0, 100.0), text);
     }
@@ -142,6 +154,43 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// файловой системе и при ещё не созданном целевом файле.
 pub fn same_file(first: &Path, second: &Path) -> bool {
     normalize_path(first) == normalize_path(second)
+}
+
+/// Подбирает свободное имя: при совпадении добавляет `-2`, `-3`, … перед расширением.
+/// Используется пакетной обработкой, когда результаты складываются в одну папку.
+pub fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file")
+        .to_owned();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_owned);
+    for index in 2..10_000_u32 {
+        let name = match extension.as_deref() {
+            Some(extension) => format!("{stem}-{index}.{extension}"),
+            None => format!("{stem}-{index}"),
+        };
+        let candidate = if parent.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            parent.join(name)
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
 }
 
 const RESERVED_NAMES: [&str; 22] = [
