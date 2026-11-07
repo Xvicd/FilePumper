@@ -87,7 +87,9 @@ jobs:
              target/x86_64-unknown-linux-gnu/release/file-pumper-cli dist/linux/
           cp dist/README.txt dist/linux/README.txt
           chmod +x dist/linux/file-pumper dist/linux/file-pumper-cli
-          tar -czf "FilePumper-$v-linux-x64.tar.gz" dist/linux
+          # -C dist: внутри архива пути linux/..., как в README.
+          tar -czf "FilePumper-$v-linux-x64.tar.gz" -C dist linux
+          tar -tzvf "FilePumper-$v-linux-x64.tar.gz"
           ./dist/linux/file-pumper-cli --version
 
       - uses: actions/upload-artifact@v4
