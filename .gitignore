@@ -1,0 +1,21 @@
+# Rust
+/target
+*.pdb
+*.rlib
+
+# Локальные артефакты и логи
+/tmp_cli
+/.tools
+*.log
+
+# Готовые сборки не хранятся в репозитории (они уходят в Releases),
+# но описание для архивов остаётся под контролем версий.
+/dist/*
+!/dist/README.txt
+
+# ОС и редакторы
+Thumbs.db
+Desktop.ini
+.DS_Store
+/.idea
+
