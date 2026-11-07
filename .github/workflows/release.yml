@@ -103,6 +103,10 @@ jobs:
     needs: [version, build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # gh ищет git-репозиторий, поэтому репозиторий задаём явно —
+    # тогда checkout в этом job'е не нужен.
+    env:
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
