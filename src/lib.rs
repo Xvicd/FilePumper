@@ -6,4 +6,6 @@ pub mod batch;
 pub mod cli;
 pub mod payload;
 pub mod pumper;
+pub mod report;
+pub mod scan;
 pub mod util;

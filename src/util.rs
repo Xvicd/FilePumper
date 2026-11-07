@@ -1,6 +1,7 @@
 //! Общие помощники: прогресс, отмена, случайные данные, контрольные суммы,
 //! работа с путями и именами файлов.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,6 +163,17 @@ pub fn unique_path(path: &Path) -> PathBuf {
     if !path.exists() {
         return path.to_path_buf();
     }
+    for index in 2..10_000_u32 {
+        let candidate = suffixed_path(path, index);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// `photo.png` + 3 → `photo-3.png`.
+fn suffixed_path(path: &Path, index: u32) -> PathBuf {
     let parent = path
         .parent()
         .filter(|value| !value.as_os_str().is_empty())
@@ -176,21 +188,47 @@ pub fn unique_path(path: &Path) -> PathBuf {
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_owned);
-    for index in 2..10_000_u32 {
-        let name = match extension.as_deref() {
-            Some(extension) => format!("{stem}-{index}.{extension}"),
-            None => format!("{stem}-{index}"),
-        };
-        let candidate = if parent.as_os_str().is_empty() {
-            PathBuf::from(name)
-        } else {
-            parent.join(name)
-        };
-        if !candidate.exists() {
-            return candidate;
-        }
+    let name = match extension.as_deref() {
+        Some(extension) => format!("{stem}-{index}.{extension}"),
+        None => format!("{stem}-{index}"),
+    };
+    if parent.as_os_str().is_empty() {
+        PathBuf::from(name)
+    } else {
+        parent.join(name)
     }
-    path.to_path_buf()
+}
+
+/// Набор уже занятых имён: нужен пакетной обработке, чтобы два файла с одинаковым
+/// именем из разных папок не получили один и тот же результат — в том числе когда
+/// файлы обрабатываются параллельно и проверка `exists()` ещё ничего не видит.
+#[derive(Default)]
+pub struct Reservations {
+    taken: HashSet<PathBuf>,
+}
+
+impl Reservations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Возвращает свободный путь и запоминает его как занятый.
+    pub fn reserve(&mut self, path: &Path) -> PathBuf {
+        let candidate = if self.is_taken(path) {
+            (2..10_000_u32)
+                .map(|index| suffixed_path(path, index))
+                .find(|candidate| !self.is_taken(candidate) && !candidate.exists())
+                .unwrap_or_else(|| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
+        self.taken.insert(normalize_path(&candidate));
+        candidate
+    }
+
+    pub fn is_taken(&self, path: &Path) -> bool {
+        self.taken.contains(&normalize_path(path)) || path.exists()
+    }
 }
 
 const RESERVED_NAMES: [&str; 22] = [

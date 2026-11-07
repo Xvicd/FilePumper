@@ -1,15 +1,17 @@
 //! Графический интерфейс: накачка файлов, встраивание и извлечение нагрузки.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
-use crate::batch::{self, BatchItem};
+use crate::batch::{self, BatchItem, PumpPlan, TargetMode};
 use crate::payload::{self, ContainerOptions, PayloadSummary};
 use crate::pumper::{AnimationFormat, Method};
-use crate::util::{reveal_in_explorer, CancelToken, Job, CANCELLED_MESSAGE, MIB};
+use crate::scan;
+use crate::util::{reveal_in_explorer, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB};
 
 enum WorkerMessage {
     Progress(f32, String),
@@ -38,20 +40,75 @@ struct Preview {
     error: Option<String>,
 }
 
+/// Настройки, которые переживают перезапуск. Пароль намеренно не сохраняется.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    method: usize,
+    format: usize,
+    target_mb: String,
+    size_mode: usize,
+    out_dir: Option<PathBuf>,
+    embed_compress: bool,
+    embed_copies: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            method: 0,
+            format: 0,
+            target_mb: "10".to_owned(),
+            size_mode: 0,
+            out_dir: None,
+            embed_compress: false,
+            embed_copies: 1,
+        }
+    }
+}
+
+fn method_from_index(index: usize) -> Method {
+    Method::ALL.get(index).copied().unwrap_or_default()
+}
+
+fn method_index(method: Method) -> usize {
+    Method::ALL
+        .iter()
+        .position(|item| *item == method)
+        .unwrap_or(0)
+}
+
+fn format_from_index(index: usize) -> AnimationFormat {
+    match index {
+        1 => AnimationFormat::Png,
+        2 => AnimationFormat::Webp,
+        _ => AnimationFormat::Gif,
+    }
+}
+
+fn format_index(format: AnimationFormat) -> usize {
+    match format {
+        AnimationFormat::Gif => 0,
+        AnimationFormat::Png => 1,
+        AnimationFormat::Webp => 2,
+    }
+}
+
 pub struct PumperApp {
     rows: Vec<BatchRow>,
     out_dir: Option<PathBuf>,
     method: Method,
     animation_format: AnimationFormat,
     target_mb: String,
+    size_mode: TargetMode,
     status: String,
     progress: f32,
     worker: Option<Receiver<WorkerMessage>>,
     cancel: CancelToken,
     busy: bool,
     result_dialog: Option<(bool, String, Option<PathBuf>)>,
-    carrier_path: Option<PathBuf>,
-    payload_path: Option<PathBuf>,
+    carriers: Vec<PathBuf>,
+    payloads: Vec<PathBuf>,
     embed_compress: bool,
     embed_password: String,
     embed_copies: usize,
@@ -66,14 +123,15 @@ impl Default for PumperApp {
             method: Method::default(),
             animation_format: AnimationFormat::default(),
             target_mb: "10".to_owned(),
+            size_mode: TargetMode::default(),
             status: "Добавьте файлы и режим, затем нажмите «Запустить».".to_owned(),
             progress: 0.0,
             worker: None,
             cancel: CancelToken::new(),
             busy: false,
             result_dialog: None,
-            carrier_path: None,
-            payload_path: None,
+            carriers: Vec::new(),
+            payloads: Vec::new(),
             embed_compress: false,
             embed_password: String::new(),
             embed_copies: 1,
@@ -87,6 +145,52 @@ fn channel() -> (mpsc::Sender<WorkerMessage>, Receiver<WorkerMessage>) {
 }
 
 impl PumperApp {
+    /// Создаёт приложение и восстанавливает настройки прошлого запуска.
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+        if let Some(storage) = cc.storage {
+            if let Some(settings) = eframe::get_value::<Settings>(storage, eframe::APP_KEY) {
+                app.apply_settings(settings);
+            }
+        }
+        app
+    }
+
+    fn settings(&self) -> Settings {
+        Settings {
+            method: method_index(self.method),
+            format: format_index(self.animation_format),
+            target_mb: self.target_mb.clone(),
+            size_mode: TargetMode::ALL
+                .iter()
+                .position(|mode| *mode == self.size_mode)
+                .unwrap_or(0),
+            out_dir: self.out_dir.clone(),
+            embed_compress: self.embed_compress,
+            embed_copies: self.embed_copies,
+        }
+    }
+
+    fn apply_settings(&mut self, settings: Settings) {
+        self.method = method_from_index(settings.method);
+        self.animation_format = format_from_index(settings.format);
+        if !settings.target_mb.trim().is_empty() {
+            self.target_mb = settings.target_mb;
+        }
+        self.size_mode = TargetMode::ALL
+            .get(settings.size_mode)
+            .copied()
+            .unwrap_or_default();
+        self.out_dir = settings.out_dir;
+        self.embed_compress = settings.embed_compress;
+        self.embed_copies = settings.embed_copies.clamp(1, 3);
+    }
+
+    /// Носитель для предпросмотра и извлечения — первый в списке.
+    fn primary_carrier(&self) -> Option<PathBuf> {
+        self.carriers.first().cloned()
+    }
+
     fn begin_job(&mut self) -> (mpsc::Sender<WorkerMessage>, CancelToken) {
         let (sender, receiver) = channel();
         self.cancel = CancelToken::new();
@@ -136,37 +240,33 @@ impl PumperApp {
                 return;
             }
         };
-        let bytes_f64 = mb * MIB as f64;
-        if bytes_f64 > u64::MAX as f64 {
-            self.result_dialog = Some((false, "Указанный размер слишком велик.".to_owned(), None));
-            return;
-        }
-        let target_bytes = bytes_f64 as u64;
         let method = self.method;
         let format = self.animation_format;
         let out_dir = self.out_dir.clone();
-        if let Some(directory) = out_dir.as_ref() {
-            if !directory.is_dir() {
-                if let Err(err) = std::fs::create_dir_all(directory) {
-                    self.result_dialog =
-                        Some((false, format!("Не удалось создать папку: {err}"), None));
-                    return;
-                }
+        let plan = match PumpPlan::new(method, format, out_dir.clone(), self.size_mode, &[mb]) {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.result_dialog = Some((false, message, None));
+                return;
+            }
+        };
+        let inputs: Vec<PathBuf> = self.rows.iter().map(|row| row.input.clone()).collect();
+        let planned = plan.build(&inputs);
+
+        for row in self.rows.iter_mut() {
+            row.ok = None;
+            row.status = "Ожидает".to_owned();
+        }
+        for (input, message) in &planned.rejected {
+            if let Some(row) = self.rows.iter_mut().find(|row| &row.input == input) {
+                row.status = format!("Пропуск: {message}");
+                row.ok = Some(false);
             }
         }
-
         let mut work: Vec<(usize, BatchItem)> = Vec::new();
-        for (index, row) in self.rows.iter_mut().enumerate() {
-            row.ok = None;
-            match BatchItem::new(&row.input, target_bytes, method, format, out_dir.as_deref()) {
-                Ok(item) => {
-                    row.status = "Ожидает".to_owned();
-                    work.push((index, item));
-                }
-                Err(message) => {
-                    row.status = format!("Пропуск: {message}");
-                    row.ok = Some(false);
-                }
+        for item in planned.items {
+            if let Some(index) = self.rows.iter().position(|row| row.input == item.input) {
+                work.push((index, item));
             }
         }
         if work.is_empty() {
@@ -203,7 +303,7 @@ impl PumperApp {
                     ));
                 };
                 let item_job = job.child(&progress);
-                match batch::pump_one(&item, method, format, target_bytes, &item_job) {
+                match batch::pump_one(&item, method, format, item.target, &item_job) {
                     Ok(size) => {
                         created += 1;
                         folder = item.output.parent().map(PathBuf::from);
@@ -245,7 +345,7 @@ impl PumperApp {
     }
 
     fn start_inspect(&mut self) {
-        let Some(carrier) = self.carrier_path.clone() else {
+        let Some(carrier) = self.primary_carrier() else {
             self.result_dialog = Some((false, "Выберите файл-носитель.".to_owned(), None));
             return;
         };
@@ -272,90 +372,195 @@ impl PumperApp {
     }
 
     fn start_embed(&mut self) {
-        let Some(carrier) = self.carrier_path.clone() else {
+        if self.carriers.is_empty() {
             self.result_dialog = Some((false, "Выберите файл-носитель.".to_owned(), None));
             return;
-        };
-        let Some(payload) = self.payload_path.clone() else {
+        }
+        if self.payloads.is_empty() {
             self.result_dialog = Some((
                 false,
                 "Выберите файл с полезной нагрузкой.".to_owned(),
                 None,
             ));
             return;
-        };
-        if !carrier.is_file() || !payload.is_file() {
-            self.result_dialog = Some((false, "Проверьте выбранные файлы.".to_owned(), None));
+        }
+        if let Some(bad) = self
+            .carriers
+            .iter()
+            .chain(self.payloads.iter())
+            .find(|path| !path.is_file())
+        {
+            self.result_dialog = Some((false, format!("Файл не найден: {}", bad.display()), None));
             return;
         }
-        let suggested = payload::default_output_path(&carrier);
-        let Some(output) = rfd::FileDialog::new()
-            .set_directory(
-                carrier
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            )
-            .set_file_name(
-                suggested
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("carrier_with_payload"),
-            )
-            .save_file()
-        else {
-            return;
-        };
+
+        // Один носитель и одна нагрузка — привычный диалог с именем результата.
+        // Пакетный режим пишет рядом с носителями или в выбранную папку.
+        let mut planned: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut reservations = Reservations::new();
+        if self.carriers.len() == 1 && self.payloads.len() == 1 {
+            let carrier = self.carriers[0].clone();
+            let suggested = payload::default_output_path(&carrier);
+            let Some(output) = rfd::FileDialog::new()
+                .set_directory(carrier.parent().unwrap_or_else(|| Path::new(".")))
+                .set_file_name(
+                    suggested
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("carrier_with_payload"),
+                )
+                .save_file()
+            else {
+                return;
+            };
+            planned.push((carrier, output));
+        } else {
+            if let Some(directory) = self.out_dir.as_ref() {
+                if !directory.is_dir() {
+                    if let Err(err) = std::fs::create_dir_all(directory) {
+                        self.result_dialog =
+                            Some((false, format!("Не удалось создать папку: {err}"), None));
+                        return;
+                    }
+                }
+            }
+            for carrier in &self.carriers {
+                let suggested = payload::default_output_path(carrier);
+                let candidate = match self.out_dir.as_ref() {
+                    Some(directory) => directory.join(
+                        suggested
+                            .file_name()
+                            .map(Path::new)
+                            .unwrap_or_else(|| Path::new("carrier_with_payload")),
+                    ),
+                    None => suggested,
+                };
+                planned.push((carrier.clone(), reservations.reserve(&candidate)));
+            }
+        }
+
+        let payloads = self.payloads.clone();
         let options = ContainerOptions {
             compress: self.embed_compress,
             password: password_or_none(&self.embed_password),
+            bundle: false,
         };
         let copies = self.embed_copies.clamp(1, 3);
         let (sender, cancel) = self.begin_job();
         self.status = "Встраивание полезной нагрузки...".to_owned();
         thread::spawn(move || {
-            let progress_sender = sender.clone();
-            let progress = move |percent: f32, text: &str| {
-                let _ = progress_sender.send(WorkerMessage::Progress(
-                    (percent / 100.0).clamp(0.0, 1.0),
-                    text.to_owned(),
-                ));
-            };
-            let job = Job::new(&progress, &cancel);
-            let result = payload::embed_file(&carrier, &payload, &output, &options, copies, &job).map(
-                |outcome| {
-                    let check = if outcome.verified_with_decoder {
-                        "файл заново открывается без ошибок"
-                    } else {
-                        "декодер не смог проверить файл"
-                    };
-                    (
-                        format!(
-                            "Нагрузка встроена.\nНоситель: {}\nКопий: {}\nОпции: {}\nПроверка: {}\nИтоговый размер: {:.2} МБ",
+            let total = planned.len().max(1) as f32;
+            let mut done = 0_usize;
+            let mut failed: Vec<String> = Vec::new();
+            let mut last_output: Option<PathBuf> = None;
+            let mut last_note = String::new();
+            for (index, (carrier, output)) in planned.iter().enumerate() {
+                let progress_sender = sender.clone();
+                let progress = move |percent: f32, text: &str| {
+                    let within = percent.clamp(0.0, 100.0) / 100.0;
+                    let overall = ((index as f32 + within) / total).clamp(0.0, 1.0);
+                    let _ = progress_sender.send(WorkerMessage::Progress(overall, text.to_owned()));
+                };
+                let job = Job::new(&progress, &cancel);
+                let result = if payloads.len() > 1 {
+                    payload::embed_bundle(carrier, &payloads, output, &options, copies, &job)
+                } else {
+                    payload::embed_file(carrier, &payloads[0], output, &options, copies, &job)
+                };
+                match result {
+                    Ok(outcome) => {
+                        done += 1;
+                        last_note = format!(
+                            "Носитель: {}\nКопий: {}\nОпции: {}\nПроверка: {}\nИтоговый размер: {:.2} МБ",
                             outcome.carrier.label(),
                             outcome.copies,
                             outcome.options,
-                            check,
+                            if outcome.verified_with_decoder {
+                                "файл заново открывается без ошибок"
+                            } else {
+                                "декодер не смог проверить файл"
+                            },
                             outcome.output_len as f64 / MIB as f64
-                        ),
-                        outcome.output,
-                    )
-                },
-            );
+                        );
+                        last_output = Some(outcome.output);
+                    }
+                    Err(error) => failed.push(format!("{} — {error}", carrier.display())),
+                }
+            }
+            let result = if failed.is_empty() {
+                Ok((
+                    format!("Нагрузка встроена.\n{last_note}"),
+                    last_output.unwrap_or_else(|| PathBuf::from(".")),
+                ))
+            } else if done == 0 {
+                Err(failed.join("\n"))
+            } else {
+                Ok((
+                    format!(
+                        "Готово файлов: {done} из {}.\nОшибки:\n{}",
+                        planned.len(),
+                        failed.join("\n")
+                    ),
+                    last_output.unwrap_or_else(|| PathBuf::from(".")),
+                ))
+            };
             let _ = sender.send(WorkerMessage::Finished(result));
         });
     }
 
     fn start_extract(&mut self, summary: &PayloadSummary, password: String) {
-        let Some(carrier) = self.carrier_path.clone() else {
+        let Some(carrier) = self.primary_carrier() else {
             return;
         };
+        let password = password_or_none(&password);
+
+        // Бандл распаковывается в папку: файлов внутри несколько.
+        if summary.info.bundle {
+            let Some(directory) = rfd::FileDialog::new()
+                .set_directory(carrier.parent().unwrap_or_else(|| Path::new(".")))
+                .pick_folder()
+            else {
+                return;
+            };
+            let (sender, cancel) = self.begin_job();
+            self.status = "Распаковка бандла...".to_owned();
+            self.preview = None;
+            thread::spawn(move || {
+                let progress_sender = sender.clone();
+                let progress = move |percent: f32, text: &str| {
+                    let _ = progress_sender.send(WorkerMessage::Progress(
+                        (percent / 100.0).clamp(0.0, 1.0),
+                        text.to_owned(),
+                    ));
+                };
+                let job = Job::new(&progress, &cancel);
+                let result =
+                    payload::extract_bundle_to(&carrier, &directory, password.as_deref(), &job)
+                        .map(|files| {
+                            let mut text = format!(
+                                "Бандл распакован.\nФайлов: {}\nПапка: {}",
+                                files.len(),
+                                directory.display()
+                            );
+                            for (path, size) in files.iter().take(20) {
+                                text.push_str(&format!(
+                                    "\n  {} ({:.1} КБ)",
+                                    path.file_name()
+                                        .and_then(|value| value.to_str())
+                                        .unwrap_or("файл"),
+                                    *size as f64 / 1024.0
+                                ));
+                            }
+                            (text, directory.clone())
+                        });
+                let _ = sender.send(WorkerMessage::Finished(result));
+            });
+            return;
+        }
+
         let suggested = payload::default_extract_path(&carrier, &summary.info.name);
         let Some(destination) = rfd::FileDialog::new()
-            .set_directory(
-                carrier
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            )
+            .set_directory(carrier.parent().unwrap_or_else(|| Path::new(".")))
             .set_file_name(
                 suggested
                     .file_name()
@@ -366,7 +571,6 @@ impl PumperApp {
         else {
             return;
         };
-        let password = password_or_none(&password);
         let (sender, cancel) = self.begin_job();
         self.status = "Извлечение полезной нагрузки...".to_owned();
         self.preview = None;
@@ -502,18 +706,17 @@ impl PumperApp {
         if dropped.is_empty() {
             return;
         }
-        // Все перетащенные файлы попадают в пакет, а первые два дополнительно
-        // занимают слоты «носитель» и «нагрузка» для встраивания.
-        for path in dropped.iter() {
-            if self.carrier_path.is_none() {
-                self.carrier_path = Some(path.clone());
-            } else if self.payload_path.is_none() {
-                self.payload_path = Some(path.clone());
-            } else {
-                self.carrier_path = Some(path.clone());
+        // Папки раскрываются рекурсивно; все файлы попадают в пакет, а первые два
+        // дополнительно занимают слоты «носитель» и «нагрузка» для встраивания.
+        let expanded = scan::expand_dropped(&dropped);
+        for path in expanded.iter() {
+            if self.carriers.is_empty() {
+                self.carriers.push(path.clone());
+            } else if self.payloads.is_empty() {
+                self.payloads.push(path.clone());
             }
         }
-        self.add_files(dropped);
+        self.add_files(expanded);
         self.status = "Файлы добавлены перетаскиванием.".to_owned();
     }
 }
@@ -643,6 +846,30 @@ impl eframe::App for PumperApp {
                         ui.label("3. Желаемый размер (МБ):");
                         ui.add(egui::TextEdit::singleline(&mut self.target_mb).desired_width(100.0));
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Как понимать размер:");
+                        egui::ComboBox::from_id_salt("size_mode")
+                            .selected_text(self.size_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in TargetMode::ALL {
+                                    ui.selectable_value(&mut self.size_mode, mode, mode.title());
+                                }
+                            });
+                    });
+                    if let Ok(mb) = self.target_mb.trim().replace(',', ".").parse::<f64>() {
+                        if mb.is_finite() && mb > 0.0 {
+                            for warning in
+                                scan::limits_warnings((mb * MIB as f64) as u64, self.method)
+                            {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xd9, 0x8a, 0x2f),
+                                    warning,
+                                );
+                            }
+                        }
+                    }
+
+
 
                     ui.add_space(5.0);
                     ui.horizontal(|ui| {
@@ -695,32 +922,26 @@ impl eframe::App for PumperApp {
                     ui.heading("4. Полезная нагрузка внутри файла");
                     ui.label("Спрячьте любой файл внутрь картинки, а потом извлеките обратно.");
 
-                    ui.horizontal(|ui| {
-                        if ui.button("Файл-носитель...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
-                                .pick_file()
-                            {
-                                self.carrier_path = Some(path);
-                            }
-                        }
-                        match self.carrier_path.as_ref() {
-                            Some(path) => ui.monospace(path.display().to_string()),
-                            None => ui.weak("носитель не выбран (PNG, JPEG, GIF, WebP, SVG или любой файл)"),
-                        };
-                    });
+                    ui.label("Файлы-носители (можно несколько):");
+                    path_list_ui(
+                        ui,
+                        "Выбрать носители...",
+                        "носители не выбраны (PNG, JPEG, GIF, WebP, SVG или любой файл)",
+                        &[("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "svg"])],
+                        self.busy,
+                        &mut self.carriers,
+                    );
 
-                    ui.horizontal(|ui| {
-                        if ui.button("Файл нагрузки...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                self.payload_path = Some(path);
-                            }
-                        }
-                        match self.payload_path.as_ref() {
-                            Some(path) => ui.monospace(path.display().to_string()),
-                            None => ui.weak("файл, который нужно спрятать"),
-                        };
-                    });
+                    ui.add_space(4.0);
+                    ui.label("Полезная нагрузка (несколько файлов упаковываются в бандл):");
+                    path_list_ui(
+                        ui,
+                        "Выбрать нагрузку...",
+                        "файлы, которые нужно спрятать",
+                        &[],
+                        self.busy,
+                        &mut self.payloads,
+                    );
 
                     ui.add_space(4.0);
                     ui.checkbox(
@@ -744,8 +965,8 @@ impl eframe::App for PumperApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let can_embed = !self.busy
-                            && self.carrier_path.is_some()
-                            && self.payload_path.is_some();
+                            && !self.carriers.is_empty()
+                            && !self.payloads.is_empty();
                         if ui
                             .add_enabled(can_embed, egui::Button::new("Вшить файл..."))
                             .clicked()
@@ -754,7 +975,7 @@ impl eframe::App for PumperApp {
                         }
                         if ui
                             .add_enabled(
-                                !self.busy && self.carrier_path.is_some(),
+                                !self.busy && !self.carriers.is_empty(),
                                 egui::Button::new("Проверить и извлечь..."),
                             )
                             .clicked()
@@ -770,6 +991,11 @@ impl eframe::App for PumperApp {
 
         self.show_result_dialog(ctx);
         self.show_preview_dialog(ctx);
+    }
+
+    /// Сохраняет настройки между запусками (пароль не сохраняется).
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &self.settings());
     }
 }
 
@@ -845,6 +1071,9 @@ impl PumperApp {
                 if info.legacy {
                     ui.label("Формат: старая версия контейнера (v1)");
                 }
+                if info.bundle {
+                    ui.label("Содержимое: бандл — несколько файлов, будут распакованы в папку");
+                }
                 ui.label(format!("Носитель: {}", carrier.label()));
                 ui.weak(carrier.survives_upload());
                 if info.encrypted {
@@ -887,6 +1116,63 @@ fn password_or_none(value: &str) -> Option<String> {
     }
 }
 
+/// Список путей с кнопками «добавить» и «✕»: используется для носителей и
+/// нагрузок, чтобы пакетный режим выглядел одинаково.
+fn path_list_ui(
+    ui: &mut egui::Ui,
+    button: &str,
+    empty_hint: &str,
+    filters: &[(&str, &[&str])],
+    busy: bool,
+    paths: &mut Vec<PathBuf>,
+) {
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!busy, egui::Button::new(button)).clicked() {
+            let mut dialog = rfd::FileDialog::new();
+            for &(name, extensions) in filters {
+                dialog = dialog.add_filter(name, extensions);
+            }
+            if let Some(picked) = dialog.pick_files() {
+                for path in picked {
+                    if !paths
+                        .iter()
+                        .any(|existing| crate::util::same_file(existing, &path))
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        if ui
+            .add_enabled(!busy && !paths.is_empty(), egui::Button::new("Очистить"))
+            .clicked()
+        {
+            paths.clear();
+        }
+        match paths.len() {
+            0 => ui.weak(empty_hint),
+            count => ui.weak(format!("выбрано: {count}")),
+        };
+    });
+    let mut remove: Option<usize> = None;
+    for (index, path) in paths.iter().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!busy, egui::Button::new("✕")).clicked() {
+                remove = Some(index);
+            }
+            ui.monospace(
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("файл"),
+            )
+            .on_hover_text(path.display().to_string());
+        });
+    }
+    if let Some(index) = remove {
+        paths.remove(index);
+    }
+}
+
 /// Запускает графический интерфейс.
 pub fn run_gui() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -901,6 +1187,6 @@ pub fn run_gui() -> eframe::Result<()> {
     eframe::run_native(
         "FilePumper",
         options,
-        Box::new(|_creation_context| Ok(Box::<PumperApp>::default())),
+        Box::new(|cc| Ok(Box::new(PumperApp::new(cc)))),
     )
 }

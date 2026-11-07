@@ -13,7 +13,9 @@ pub const CONTAINER_VERSION: u8 = 2;
 pub const LEGACY_VERSION: u8 = 1;
 pub const FLAG_COMPRESSED: u8 = 0b0000_0001;
 pub const FLAG_ENCRYPTED: u8 = 0b0000_0010;
-pub const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_ENCRYPTED;
+/// Внутри контейнера не один файл, а ZIP-бандл из нескольких.
+pub const FLAG_BUNDLE: u8 = 0b0000_0100;
+pub const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_ENCRYPTED | FLAG_BUNDLE;
 pub const MAX_CONTAINER_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_COPIES: usize = 3;
 pub const MIN_COPIES: usize = 1;
@@ -26,6 +28,8 @@ const FOOTER_LEN: usize = 12;
 pub struct ContainerOptions {
     pub compress: bool,
     pub password: Option<String>,
+    /// Полезная нагрузка — бандл из нескольких файлов (ZIP внутри контейнера).
+    pub bundle: bool,
 }
 
 impl ContainerOptions {
@@ -38,6 +42,9 @@ impl ContainerOptions {
 
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
+        if self.bundle {
+            parts.push("несколько файлов в одном контейнере".to_owned());
+        }
         if self.compress {
             parts.push("сжатие deflate".to_owned());
         }
@@ -58,6 +65,7 @@ pub struct ParsedContainer {
     pub payload: Vec<u8>,
     pub compressed: bool,
     pub encrypted: bool,
+    pub bundle: bool,
     pub legacy: bool,
 }
 
@@ -68,6 +76,7 @@ pub struct PayloadInfo {
     pub copies: usize,
     pub compressed: bool,
     pub encrypted: bool,
+    pub bundle: bool,
     pub legacy: bool,
 }
 
@@ -81,6 +90,7 @@ pub struct HeaderInfo {
     pub plain_len: u64,
     pub compressed: bool,
     pub encrypted: bool,
+    pub bundle: bool,
     pub legacy: bool,
 }
 
@@ -159,6 +169,7 @@ fn view_header(bytes: &[u8]) -> Result<HeaderView, String> {
                     plain_len,
                     compressed: flags & FLAG_COMPRESSED != 0,
                     encrypted: flags & FLAG_ENCRYPTED != 0,
+                    bundle: flags & FLAG_BUNDLE != 0,
                     legacy: false,
                 },
                 payload_start: cursor + 4,
@@ -185,6 +196,7 @@ fn view_header(bytes: &[u8]) -> Result<HeaderView, String> {
                     plain_len: stored_len as u64,
                     compressed: false,
                     encrypted: false,
+                    bundle: false,
                     legacy: true,
                 },
                 payload_start: name_end + 16,
@@ -269,6 +281,7 @@ pub fn parse_container(bytes: &[u8], password: Option<&str>) -> Result<ParsedCon
         payload,
         compressed: view.info.compressed,
         encrypted: view.info.encrypted,
+        bundle: view.info.bundle,
         legacy: view.info.legacy,
     })
 }
@@ -335,6 +348,7 @@ pub fn summarize(bytes: &[u8], password: Option<&str>) -> Result<PayloadInfo, St
         copies,
         compressed: parsed.compressed,
         encrypted: parsed.encrypted,
+        bundle: parsed.bundle,
         legacy: parsed.legacy,
     })
 }
@@ -354,6 +368,9 @@ pub fn build_container(
         ));
     }
     let mut flags = 0_u8;
+    if options.bundle {
+        flags |= FLAG_BUNDLE;
+    }
     let mut blob = payload.to_vec();
     if options.compress {
         job.check()?;

@@ -1,6 +1,7 @@
 //! Полезная нагрузка внутри файлов-носителей:
 //! упаковка, встраивание, проверка результата и извлечение.
 
+pub mod bundle;
 pub mod carrier;
 pub mod codes;
 pub mod format;
@@ -15,10 +16,11 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+pub use bundle::BundleEntry;
 pub use carrier::{detect_carrier, Carrier};
 pub use format::{ContainerOptions, HeaderInfo, ParsedContainer, PayloadInfo};
 
-use crate::util::{same_file, sanitize_file_name, Job};
+use crate::util::{hex_encode, same_file, sanitize_file_name, Job};
 
 #[derive(Clone, Debug)]
 pub struct EmbedOutcome {
@@ -138,7 +140,6 @@ pub fn embed_file(
     if same_file(payload, output) {
         return Err("Итоговый файл совпадает с файлом нагрузки. Выберите другое имя.".into());
     }
-    let kind = detect_carrier(carrier)?;
     let display_name = payload
         .file_name()
         .and_then(|value| value.to_str())
@@ -157,7 +158,66 @@ pub fn embed_file(
         .read_to_end(&mut bytes)
         .map_err(|err| err.to_string())?;
 
-    let container = format::build_container(&bytes, display_name, options, job)?;
+    embed_bytes(carrier, &bytes, display_name, output, options, copies, job)
+}
+
+/// Встраивает несколько файлов одним контейнером-бандлом.
+///
+/// Внутри носителя лежит ZIP: его можно распаковать `extract` или любым
+/// архиватором, если сохранить бандл отдельным файлом.
+pub fn embed_bundle(
+    carrier: &Path,
+    payloads: &[PathBuf],
+    output: &Path,
+    options: &ContainerOptions,
+    copies: usize,
+    job: &Job<'_>,
+) -> Result<EmbedOutcome, String> {
+    if payloads.is_empty() {
+        return Err("Не указан ни один файл нагрузки.".to_owned());
+    }
+    for payload in payloads {
+        if same_file(payload, output) {
+            return Err("Итоговый файл совпадает с файлом нагрузки. Выберите другое имя.".into());
+        }
+    }
+    job.check()?;
+    let data = bundle::build(payloads, job)?;
+    if data.len() > format::MAX_CONTAINER_BYTES {
+        return Err(format!(
+            "Бандл больше {} МБ — уменьшите набор файлов.",
+            format::MAX_CONTAINER_BYTES / (1024 * 1024)
+        ));
+    }
+    let mut options = options.clone();
+    options.bundle = true;
+    embed_bytes(
+        carrier,
+        &data,
+        bundle::BUNDLE_NAME,
+        output,
+        &options,
+        copies,
+        job,
+    )
+}
+
+/// Встраивает уже прочитанные байты нагрузки (общий путь для файла и бандла).
+pub fn embed_bytes(
+    carrier: &Path,
+    payload: &[u8],
+    display_name: &str,
+    output: &Path,
+    options: &ContainerOptions,
+    copies: usize,
+    job: &Job<'_>,
+) -> Result<EmbedOutcome, String> {
+    let copies = copies.clamp(format::MIN_COPIES, format::MAX_COPIES);
+    if same_file(carrier, output) {
+        return Err("Итоговый файл совпадает с носителем. Выберите другое имя.".into());
+    }
+    let kind = detect_carrier(carrier)?;
+    let container = format::build_container(payload, display_name, options, job)?;
     let mut stack = Vec::with_capacity(container.len() * copies);
     for _ in 0..copies {
         stack.extend_from_slice(&container);
@@ -222,6 +282,7 @@ pub fn inspect_file(carrier: &Path, password: Option<&str>) -> Result<PayloadSum
         copies: headers.len(),
         compressed: primary.compressed,
         encrypted: primary.encrypted,
+        bundle: primary.bundle,
         legacy: primary.legacy,
     };
     if info.encrypted {
@@ -236,7 +297,69 @@ pub fn inspect_file(carrier: &Path, password: Option<&str>) -> Result<PayloadSum
     })
 }
 
-/// Извлекает нагрузку в указанный файл.
+/// Итог проверки контейнера: данные на месте и контрольные суммы совпали.
+#[derive(Clone, Debug)]
+pub struct VerifyOutcome {
+    pub name: String,
+    pub size: u64,
+    pub copies: usize,
+    pub sha256: String,
+    pub bundle: bool,
+    pub entries: Vec<BundleEntry>,
+}
+
+/// Перечитывает носитель, разбирает контейнер и проверяет SHA-256.
+///
+/// Для бандла дополнительно читается оглавление ZIP — так видно, что архив не
+/// повреждён и все файлы на месте.
+pub fn verify_file(carrier: &Path, password: Option<&str>) -> Result<VerifyOutcome, String> {
+    let (parsed, copies, _kind) = extract_payload(carrier, password)?;
+    let entries = if parsed.bundle {
+        bundle::list(&parsed.payload)?
+    } else {
+        Vec::new()
+    };
+    Ok(VerifyOutcome {
+        name: if parsed.bundle {
+            bundle::BUNDLE_NAME.to_owned()
+        } else {
+            sanitize_file_name(&parsed.name)
+        },
+        size: parsed.payload.len() as u64,
+        copies,
+        sha256: hex_encode(&codes::sha256(&parsed.payload)),
+        bundle: parsed.bundle,
+        entries,
+    })
+}
+
+/// Оглавление бандла: пустой список означает, что внутри один файл.
+pub fn payload_entries(carrier: &Path, password: Option<&str>) -> Result<Vec<BundleEntry>, String> {
+    let (parsed, _copies, _kind) = extract_payload(carrier, password)?;
+    if !parsed.bundle {
+        return Ok(Vec::new());
+    }
+    bundle::list(&parsed.payload)
+}
+
+/// Распаковывает бандл из носителя в папку.
+pub fn extract_bundle_to(
+    carrier: &Path,
+    out_dir: &Path,
+    password: Option<&str>,
+    job: &Job<'_>,
+) -> Result<Vec<(PathBuf, u64)>, String> {
+    job.check()?;
+    job.report(5.0, "Поиск полезной нагрузки...");
+    let (parsed, _copies, _kind) = extract_payload(carrier, password)?;
+    if !parsed.bundle {
+        return Err("В этом файле один файл нагрузки, а не бандл.".to_owned());
+    }
+    job.report(40.0, "Распаковка бандла...");
+    bundle::unpack(&parsed.payload, out_dir, job)
+}
+
+/// Извлекает нагрузку в указанный файл (бандл сохраняется как ZIP).
 pub fn extract_to(
     carrier: &Path,
     destination: &Path,
