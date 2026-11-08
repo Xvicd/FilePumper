@@ -7,11 +7,20 @@ use std::thread;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::batch::{self, BatchItem, NameMode, PumpPlan, TargetMode};
+use crate::batch::{
+    self, BatchItem, GenerateTargets, JitterMode, NameMode, PumpPlan, SizeJitter, TargetMode,
+};
 use crate::payload::{self, ContainerOptions, PayloadSummary};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::scan;
 use crate::util::{reveal_in_explorer, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB};
+
+/// Цвет успешного результата в списке файлов.
+const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb3, 0x71);
+/// Цвет предупреждения: разброс, лимиты метода.
+const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x8a, 0x2f);
+/// Цвет ошибки.
+const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x53, 0x4f);
 
 enum WorkerMessage {
     Progress(f32, String),
@@ -40,6 +49,46 @@ struct Preview {
     error: Option<String>,
 }
 
+/// Вкладка окна: три задачи программы, каждая со своими настройками.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Tab {
+    /// Накачать выбранные файлы до нужного размера.
+    #[default]
+    Pump,
+    /// Спрятать нагрузку внутрь картинки и достать её обратно.
+    Payload,
+    /// Создать файл нужного размера без исходника.
+    Generate,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Pump, Tab::Payload, Tab::Generate];
+
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Pump => "Накачать файлы",
+            Tab::Payload => "Спрятать / извлечь",
+            Tab::Generate => "Создать файл",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Tab::Pump => "Добавьте файлы, задайте размер и метод — получите файлы нужного объёма, которые продолжают открываться.",
+            Tab::Payload => "Спрячьте любой файл внутрь картинки и достаньте его обратно: данные лежат в структуре файла, картинка остаётся рабочей.",
+            Tab::Generate => "Файл нужного размера без исходника: внутри криптослучайные байты, поэтому zip, gzip и 7z его не сожмут.",
+        }
+    }
+
+    fn index(self) -> usize {
+        Tab::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Tab::ALL.get(index).copied().unwrap_or_default()
+    }
+}
+
 /// Настройки, которые переживают перезапуск. Пароль намеренно не сохраняется.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,12 +96,14 @@ struct Settings {
     method: usize,
     format: usize,
     target_mb: String,
+    vary_mb: String,
+    vary_mode: usize,
     size_mode: usize,
     out_dir: Option<PathBuf>,
     embed_compress: bool,
     embed_copies: usize,
-    name_size: bool,
-    name_random: bool,
+    names: usize,
+    tab: usize,
     gen_kind: usize,
     gen_base: String,
     gen_count: usize,
@@ -65,12 +116,17 @@ impl Default for Settings {
             method: 0,
             format: 0,
             target_mb: "10".to_owned(),
+            vary_mb: "0".to_owned(),
+            vary_mode: JitterMode::ALL
+                .iter()
+                .position(|mode| *mode == JitterMode::default())
+                .unwrap_or(0),
             size_mode: 0,
             out_dir: None,
             embed_compress: false,
             embed_copies: 1,
-            name_size: true,
-            name_random: false,
+            names: 0,
+            tab: 0,
             gen_kind: 0,
             gen_base: "file".to_owned(),
             gen_count: 1,
@@ -124,6 +180,9 @@ pub struct PumperApp {
     animation_format: AnimationFormat,
     target_mb: String,
     size_mode: TargetMode,
+    vary_mb: String,
+    vary_mode: JitterMode,
+    tab: Tab,
     status: String,
     progress: f32,
     worker: Option<Receiver<WorkerMessage>>,
@@ -135,8 +194,7 @@ pub struct PumperApp {
     embed_compress: bool,
     embed_password: String,
     embed_copies: usize,
-    name_size: bool,
-    name_random: bool,
+    names: NameMode,
     gen_kind: GeneratedKind,
     gen_base: String,
     gen_count: usize,
@@ -153,6 +211,9 @@ impl Default for PumperApp {
             animation_format: AnimationFormat::default(),
             target_mb: "10".to_owned(),
             size_mode: TargetMode::default(),
+            vary_mb: "0".to_owned(),
+            vary_mode: JitterMode::default(),
+            tab: Tab::default(),
             status: "Добавьте файлы и режим, затем нажмите «Запустить».".to_owned(),
             progress: 0.0,
             worker: None,
@@ -164,8 +225,7 @@ impl Default for PumperApp {
             embed_compress: false,
             embed_password: String::new(),
             embed_copies: 1,
-            name_size: true,
-            name_random: false,
+            names: NameMode::Size,
             gen_kind: GeneratedKind::default(),
             gen_base: "file".to_owned(),
             gen_count: 1,
@@ -196,6 +256,11 @@ impl PumperApp {
             method: method_index(self.method),
             format: format_index(self.animation_format),
             target_mb: self.target_mb.clone(),
+            vary_mb: self.vary_mb.clone(),
+            vary_mode: JitterMode::ALL
+                .iter()
+                .position(|mode| *mode == self.vary_mode)
+                .unwrap_or(0),
             size_mode: TargetMode::ALL
                 .iter()
                 .position(|mode| *mode == self.size_mode)
@@ -203,8 +268,11 @@ impl PumperApp {
             out_dir: self.out_dir.clone(),
             embed_compress: self.embed_compress,
             embed_copies: self.embed_copies,
-            name_size: self.name_size,
-            name_random: self.name_random,
+            names: NameMode::ALL
+                .iter()
+                .position(|mode| *mode == self.names)
+                .unwrap_or(0),
+            tab: self.tab.index(),
             gen_kind: generated_kind_index(self.gen_kind),
             gen_base: self.gen_base.clone(),
             gen_count: self.gen_count,
@@ -218,6 +286,15 @@ impl PumperApp {
         if !settings.target_mb.trim().is_empty() {
             self.target_mb = settings.target_mb;
         }
+        self.vary_mb = if settings.vary_mb.trim().is_empty() {
+            "0".to_owned()
+        } else {
+            settings.vary_mb
+        };
+        self.vary_mode = JitterMode::ALL
+            .get(settings.vary_mode)
+            .copied()
+            .unwrap_or_default();
         self.size_mode = TargetMode::ALL
             .get(settings.size_mode)
             .copied()
@@ -225,8 +302,11 @@ impl PumperApp {
         self.out_dir = settings.out_dir;
         self.embed_compress = settings.embed_compress;
         self.embed_copies = settings.embed_copies.clamp(1, 3);
-        self.name_size = settings.name_size;
-        self.name_random = settings.name_random;
+        self.names = NameMode::ALL
+            .get(settings.names)
+            .copied()
+            .unwrap_or_default();
+        self.tab = Tab::from_index(settings.tab);
         self.gen_kind = generated_kind_from_index(settings.gen_kind);
         if !settings.gen_base.trim().is_empty() {
             self.gen_base = settings.gen_base;
@@ -237,13 +317,7 @@ impl PumperApp {
 
     /// Как называть результаты: с размером в имени, без него или случайно.
     fn name_mode(&self) -> NameMode {
-        if self.name_random {
-            NameMode::Random
-        } else if self.name_size {
-            NameMode::Size
-        } else {
-            NameMode::Plain
-        }
+        self.names
     }
 
     /// Пример имени результата для текущих настроек (показывается под кнопками).
@@ -275,6 +349,32 @@ impl PumperApp {
             .filter(|value| value.is_finite() && *value > 0.0)
     }
 
+    /// Разброс размера из полей окна: `Ok(None)` — разброс выключен.
+    fn jitter(&self) -> Result<Option<SizeJitter>, String> {
+        let raw = self.vary_mb.trim().replace(',', ".");
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let spread = raw
+            .parse::<f64>()
+            .map_err(|_| "Разброс должен быть числом в мегабайтах.".to_owned())?;
+        SizeJitter::from_mb(spread, self.vary_mode)
+    }
+
+    /// Подсказка «какой размер получится» для текущих настроек разброса.
+    fn size_range_hint(&self) -> Option<String> {
+        let mb = self.target_mb_value()?;
+        let jitter = self.jitter().ok().flatten()?;
+        let base = (mb * MIB as f64) as u64;
+        let (low, high) = jitter.range(base);
+        Some(format!(
+            "Каждый файл получит случайный размер от {:.2} до {:.2} МБ ({}).",
+            low as f64 / MIB as f64,
+            high as f64 / MIB as f64,
+            jitter.label()
+        ))
+    }
+
     /// Пример имени файла, созданного «с нуля» (показывается под кнопкой).
     fn generated_example_name(&self) -> String {
         let target = (self.target_mb_value().unwrap_or(10.0) * MIB as f64) as u64;
@@ -289,7 +389,7 @@ impl PumperApp {
     /// включённых случайных именах — случайная основа с тем же расширением.
     fn embed_suggested_path(&self, carrier: &Path) -> PathBuf {
         let suggested = payload::default_output_path(carrier);
-        if self.name_random {
+        if self.names == NameMode::Random {
             batch::with_random_stem(&suggested)
         } else {
             suggested
@@ -353,8 +453,15 @@ impl PumperApp {
         let method = self.method;
         let format = self.animation_format;
         let out_dir = self.out_dir.clone();
+        let jitter = match self.jitter() {
+            Ok(jitter) => jitter,
+            Err(message) => {
+                self.result_dialog = Some((false, message, None));
+                return;
+            }
+        };
         let plan = match PumpPlan::new(method, format, out_dir.clone(), self.size_mode, &[mb]) {
-            Ok(plan) => plan.with_names(self.name_mode()),
+            Ok(plan) => plan.with_names(self.name_mode()).with_jitter(jitter),
             Err(message) => {
                 self.result_dialog = Some((false, message, None));
                 return;
@@ -492,18 +599,29 @@ impl PumperApp {
                 return;
             }
         };
+        let jitter = match self.jitter() {
+            Ok(jitter) => jitter,
+            Err(message) => {
+                self.result_dialog = Some((false, message, None));
+                return;
+            }
+        };
         let payloads = if self.gen_attach {
             self.payloads.clone()
         } else {
             Vec::new()
+        };
+        let spec = GenerateTargets {
+            sizes: targets,
+            count: self.gen_count,
+            jitter,
         };
         let items = match batch::plan_generate(
             &self.gen_base,
             self.gen_kind,
             self.name_mode(),
             self.out_dir.as_deref(),
-            &targets,
-            self.gen_count,
+            &spec,
             &payloads,
         ) {
             Ok(items) => items,
@@ -979,351 +1097,52 @@ impl eframe::App for PumperApp {
             self.cancel.cancel();
         }
 
+        egui::TopBottomPanel::bottom("file_pumper_status").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(self.status.as_str()).strong());
+                if ui
+                    .add_enabled(self.busy, egui::Button::new("Отмена"))
+                    .clicked()
+                {
+                    self.cancel.cancel();
+                }
+            });
+            ui.add(
+                egui::ProgressBar::new(self.progress.clamp(0.0, 1.0))
+                    .show_percentage()
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(4.0);
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("FilePumper");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak("файлы можно перетаскивать в окно мышью");
+                });
+            });
+            ui.horizontal(|ui| {
+                for tab in Tab::ALL {
+                    let selected = self.tab == tab;
+                    if ui
+                        .selectable_label(selected, egui::RichText::new(tab.title()).size(16.0))
+                        .clicked()
+                    {
+                        self.tab = tab;
+                    }
+                }
+            });
+            ui.weak(self.tab.hint());
+            ui.separator();
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.heading("FilePumper");
-                    ui.label("Добавляет файлу объём и умеет прятать в него другой файл.");
-                    ui.weak("Файлы можно перетаскивать в окно мышью.");
-                    ui.separator();
-
-                    ui.label("1. Исходные файлы (можно сразу несколько):");
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("Выбрать файлы..."))
-                            .clicked()
-                        {
-                            if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                                self.add_files(paths);
-                            }
-                        }
-                        if ui
-                            .add_enabled(!self.busy && !self.rows.is_empty(), egui::Button::new("Очистить"))
-                            .clicked()
-                        {
-                            self.rows.clear();
-                            self.status = "Список файлов очищен.".to_owned();
-                        }
-                        match self.rows.len() {
-                            0 => ui.weak("файлы не выбраны"),
-                            count => ui.weak(format!("файлов: {count}")),
-                        };
-                    });
-
-                    if !self.rows.is_empty() {
-                        let mut remove: Option<usize> = None;
-                        egui::ScrollArea::vertical()
-                            .id_salt("batch_rows")
-                            .max_height(160.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (index, row) in self.rows.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(!self.busy, egui::Button::new("✕"))
-                                            .clicked()
-                                        {
-                                            remove = Some(index);
-                                        }
-                                        let name = row
-                                            .input
-                                            .file_name()
-                                            .and_then(|value| value.to_str())
-                                            .unwrap_or("файл");
-                                        ui.monospace(name)
-                                            .on_hover_text(row.input.display().to_string());
-                                        match row.ok {
-                                            Some(true) => {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(0x3c, 0xb3, 0x71),
-                                                    &row.status,
-                                                );
-                                            }
-                                            Some(false) => {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(0xd9, 0x53, 0x4f),
-                                                    &row.status,
-                                                );
-                                            }
-                                            None => {
-                                                ui.weak(&row.status);
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                        if let Some(index) = remove {
-                            self.rows.remove(index);
-                        }
-                    }
-
-                    ui.add_space(6.0);
-                    ui.label("2. Метод увеличения:");
-                    for method in Method::ALL {
-                        ui.radio_value(&mut self.method, method, method.title());
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.label("Формат режима 1:");
-                        egui::ComboBox::from_id_salt("animation_format")
-                            .selected_text(match self.animation_format {
-                                AnimationFormat::Gif => ".gif",
-                                AnimationFormat::Png => ".png (APNG)",
-                                AnimationFormat::Webp => ".webp",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.animation_format,
-                                    AnimationFormat::Gif,
-                                    ".gif",
-                                );
-                                ui.selectable_value(
-                                    &mut self.animation_format,
-                                    AnimationFormat::Png,
-                                    ".png (APNG)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.animation_format,
-                                    AnimationFormat::Webp,
-                                    ".webp",
-                                );
-                            });
-                    });
-
-                    ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        ui.label("3. Желаемый размер (МБ):");
-                        ui.add(egui::TextEdit::singleline(&mut self.target_mb).desired_width(100.0));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Как понимать размер:");
-                        egui::ComboBox::from_id_salt("size_mode")
-                            .selected_text(self.size_mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in TargetMode::ALL {
-                                    ui.selectable_value(&mut self.size_mode, mode, mode.title());
-                                }
-                            });
-                    });
-                    if let Ok(mb) = self.target_mb.trim().replace(',', ".").parse::<f64>() {
-                        if mb.is_finite() && mb > 0.0 {
-                            for warning in
-                                scan::limits_warnings((mb * MIB as f64) as u64, self.method)
-                            {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(0xd9, 0x8a, 0x2f),
-                                    warning,
-                                );
-                            }
-                        }
-                    }
-
-
-
-                    ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Имена результатов:");
-                        let label = if self.name_size {
-                            "Убрать размер из имени"
-                        } else {
-                            "Вернуть размер в имя"
-                        };
-                        if ui
-                            .add_enabled(
-                                !self.busy && !self.name_random,
-                                egui::Button::new(label),
-                            )
-                            .on_hover_text(
-                                "Обычно к имени дописывается размер: photo_10MB.png",
-                            )
-                            .clicked()
-                        {
-                            self.name_size = !self.name_size;
-                        }
-                        ui.add_enabled(
-                            !self.busy,
-                            egui::Checkbox::new(&mut self.name_random, "Случайное имя файла"),
-                        )
-                        .on_hover_text(
-                            "Нейтральное имя без размера и без исходного названия: \
-                             quiet-river-4821.png",
-                        );
-                    });
-                    ui.weak(format!("Пример: {}", self.example_name()));
-
-                    ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("Папка результатов..."))
-                            .clicked()
-                        {
-                            if let Some(directory) = rfd::FileDialog::new().pick_folder() {
-                                self.out_dir = Some(directory);
-                            }
-                        }
-                        match self.out_dir.as_ref() {
-                            Some(directory) => ui.monospace(directory.display().to_string()),
-                            None => ui.weak("рядом с каждым исходным файлом"),
-                        };
-                        if self.out_dir.is_some()
-                            && ui
-                                .add_enabled(!self.busy, egui::Button::new("Сбросить"))
-                                .clicked()
-                        {
-                            self.out_dir = None;
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !self.busy && !self.rows.is_empty(),
-                                egui::Button::new("Запустить"),
-                            )
-                            .clicked()
-                        {
-                            self.start_pump();
-                        }
-                        if ui.add_enabled(self.busy, egui::Button::new("Отмена")).clicked() {
-                            self.cancel.cancel();
-                        }
-                    });
-
-                    ui.add_space(6.0);
-                    ui.label(self.status.clone());
-                    ui.add(
-                        egui::ProgressBar::new(self.progress.clamp(0.0, 1.0))
-                            .show_percentage(),
-                    );
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.heading("4. Полезная нагрузка внутри файла");
-                    ui.label("Спрячьте любой файл внутрь картинки, а потом извлеките обратно.");
-
-                    ui.label("Файлы-носители (можно несколько):");
-                    path_list_ui(
-                        ui,
-                        "Выбрать носители...",
-                        "носители не выбраны (PNG, JPEG, GIF, WebP, SVG или любой файл)",
-                        &[("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "svg"])],
-                        self.busy,
-                        &mut self.carriers,
-                    );
-
-                    ui.add_space(4.0);
-                    ui.label("Полезная нагрузка (несколько файлов упаковываются в бандл):");
-                    path_list_ui(
-                        ui,
-                        "Выбрать нагрузку...",
-                        "файлы, которые нужно спрятать",
-                        &[],
-                        self.busy,
-                        &mut self.payloads,
-                    );
-
-                    ui.add_space(4.0);
-                    ui.checkbox(
-                        &mut self.embed_compress,
-                        "Сжимать нагрузку (deflate) перед встраиванием",
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("Копий нагрузки (устойчивость к обрезке сервером):");
-                        ui.add(egui::DragValue::new(&mut self.embed_copies).range(1..=3));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Пароль (необязательно):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.embed_password)
-                                .password(true)
-                                .hint_text("шифрование Argon2id + ChaCha20-Poly1305")
-                                .desired_width(260.0),
-                        );
-                    });
-
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let can_embed = !self.busy
-                            && !self.carriers.is_empty()
-                            && !self.payloads.is_empty();
-                        if ui
-                            .add_enabled(can_embed, egui::Button::new("Вшить файл..."))
-                            .clicked()
-                        {
-                            self.start_embed();
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.busy && !self.carriers.is_empty(),
-                                egui::Button::new("Проверить и извлечь..."),
-                            )
-                            .clicked()
-                        {
-                            self.start_inspect();
-                        }
-                    });
-                    ui.weak(
-                        "Данные кладутся внутрь структуры файла: чанки PNG, сегменты APP15 JPEG, комментарий GIF, RIFF-чанк WebP, metadata SVG. Картинка остаётся рабочей, поэтому сервер принимает файл целиком.",
-                    );
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.heading("5. Создать файл с нуля");
-                    ui.label(
-                        "Нужный размер без исходника: внутри криптослучайные байты, поэтому zip, \
-                         gzip и 7z файл не сожмут.",
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("Тип файла:");
-                        egui::ComboBox::from_id_salt("generated_kind")
-                            .selected_text(self.gen_kind.title())
-                            .show_ui(ui, |ui| {
-                                for kind in GeneratedKind::ALL {
-                                    ui.selectable_value(&mut self.gen_kind, kind, kind.title());
-                                }
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Основа имени:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.gen_base)
-                                .hint_text("file")
-                                .desired_width(140.0),
-                        );
-                        ui.label("Файлов на размер:");
-                        ui.add(egui::DragValue::new(&mut self.gen_count).range(1..=32));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_enabled(
-                            !self.busy && !self.payloads.is_empty(),
-                            egui::Checkbox::new(&mut self.gen_attach, "Прицепить второе дно"),
-                        )
-                        .on_hover_text(
-                            "Спрятать нагрузку из пункта 4 внутрь созданного файла: контейнер \
-                             встаёт в заранее посчитанное место, поэтому размер не увеличивается",
-                        );
-                        if self.payloads.is_empty() {
-                            ui.weak("сначала выберите нагрузку в пункте 4");
-                        } else {
-                            ui.weak(format!("нагрузок: {}", self.payloads.len()));
-                        }
-                    });
-                    ui.weak(format!(
-                        "Размер берётся из пункта 3 ({} МБ), пример имени: {}",
-                        self.target_mb.trim(),
-                        self.generated_example_name()
-                    ));
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("Создать файл..."))
-                            .clicked()
-                        {
-                            self.start_generate();
-                        }
-                        ui.weak("файлы попадают в папку результатов из пункта 3");
-                    });
+                .show(ui, |ui| match self.tab {
+                    Tab::Pump => self.pump_tab_ui(ui),
+                    Tab::Payload => self.payload_tab_ui(ui),
+                    Tab::Generate => self.generate_tab_ui(ui),
                 });
         });
 
@@ -1334,6 +1153,410 @@ impl eframe::App for PumperApp {
     /// Сохраняет настройки между запусками (пароль не сохраняется).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings());
+    }
+}
+
+/// Рамка-группа с заголовком: одинаковое оформление всех блоков окна.
+fn group_ui(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.group(|ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new(title).strong());
+        add(ui);
+    });
+    ui.add_space(6.0);
+}
+
+/// Кнопка-действие: крупная, чтобы её было видно сразу.
+fn action_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(text).size(17.0)).min_size(egui::vec2(200.0, 30.0)),
+    )
+    .clicked()
+}
+
+impl PumperApp {
+    /// Вкладка «Накачать файлы»: список файлов, размер, метод, имена, запуск.
+    fn pump_tab_ui(&mut self, ui: &mut egui::Ui) {
+        group_ui(ui, "1. Что накачиваем", |ui| self.files_ui(ui));
+        group_ui(ui, "2. До какого размера", |ui| {
+            self.size_ui(ui)
+        });
+        group_ui(ui, "3. Как увеличивать", |ui| {
+            for method in Method::ALL {
+                ui.radio_value(&mut self.method, method, method.title());
+            }
+            ui.add_enabled_ui(self.method == Method::Animation, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Формат анимации:");
+                    egui::ComboBox::from_id_salt("animation_format")
+                        .selected_text(match self.animation_format {
+                            AnimationFormat::Gif => ".gif",
+                            AnimationFormat::Png => ".png (APNG)",
+                            AnimationFormat::Webp => ".webp",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (format, label) in [
+                                (AnimationFormat::Gif, ".gif"),
+                                (AnimationFormat::Png, ".png (APNG)"),
+                                (AnimationFormat::Webp, ".webp"),
+                            ] {
+                                ui.selectable_value(&mut self.animation_format, format, label);
+                            }
+                        });
+                });
+            });
+        });
+        group_ui(
+            ui,
+            "4. Имена и папка результатов",
+            |ui| {
+                self.names_ui(ui);
+                self.out_dir_ui(ui);
+            },
+        );
+        ui.horizontal(|ui| {
+            let ready = !self.busy && !self.rows.is_empty();
+            if action_button(ui, ready, "Накачать") {
+                self.start_pump();
+            }
+            ui.weak(match self.rows.len() {
+                0 => "сначала добавьте файлы".to_owned(),
+                count => format!("файлов к обработке: {count}"),
+            });
+        });
+    }
+
+    /// Список файлов пакета: добавление, удаление и состояние каждого файла.
+    fn files_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Добавить файлы..."))
+                .clicked()
+            {
+                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                    self.add_files(paths);
+                }
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Добавить папку..."))
+                .on_hover_text("Папка добавляется вместе с подпапками")
+                .clicked()
+            {
+                if let Some(directory) = rfd::FileDialog::new().pick_folder() {
+                    match scan::collect_from_dir(&directory, true, &[]) {
+                        Ok(found) => self.add_files(found),
+                        Err(message) => self.result_dialog = Some((false, message, None)),
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.rows.is_empty(),
+                    egui::Button::new("Очистить список"),
+                )
+                .clicked()
+            {
+                self.rows.clear();
+                self.status = "Список файлов очищен.".to_owned();
+            }
+            match self.rows.len() {
+                0 => ui.weak(
+                    "файлы не выбраны — перетащите их в окно или нажмите «Добавить файлы...»",
+                ),
+                count => ui.weak(format!("файлов: {count}")),
+            };
+        });
+
+        if self.rows.is_empty() {
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("batch_rows")
+            .max_height(150.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (index, row) in self.rows.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.busy, egui::Button::new("✕")).clicked() {
+                            remove = Some(index);
+                        }
+                        let name = row
+                            .input
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("файл");
+                        ui.monospace(name)
+                            .on_hover_text(row.input.display().to_string());
+                        match row.ok {
+                            Some(true) => {
+                                ui.colored_label(OK_COLOR, &row.status);
+                            }
+                            Some(false) => {
+                                ui.colored_label(ERROR_COLOR, &row.status);
+                            }
+                            None => {
+                                ui.weak(&row.status);
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some(index) = remove {
+            self.rows.remove(index);
+        }
+    }
+
+    /// Размер и разброс: общий блок для накачки и создания файла.
+    fn size_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Размер:");
+            ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::singleline(&mut self.target_mb).desired_width(80.0),
+            )
+            .on_hover_text("В мегабайтах; дробная часть — через точку или запятую: 1.5 или 1,5");
+            ui.label("МБ");
+            ui.separator();
+            ui.label("считать как:");
+            egui::ComboBox::from_id_salt("size_mode")
+                .selected_text(self.size_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in TargetMode::ALL {
+                        ui.selectable_value(&mut self.size_mode, mode, mode.title());
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Разброс:");
+            ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::singleline(&mut self.vary_mb).desired_width(60.0),
+            )
+            .on_hover_text(
+                "Насколько размер может отличаться от указанного: 0 — ровно, 5 — плюс-минус 5 МБ",
+            );
+            ui.label("МБ");
+            ui.separator();
+            ui.label("направление:");
+            egui::ComboBox::from_id_salt("vary_mode")
+                .selected_text(self.vary_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in JitterMode::ALL {
+                        ui.selectable_value(&mut self.vary_mode, mode, mode.title());
+                    }
+                });
+        });
+        match self.jitter() {
+            Ok(Some(jitter)) => {
+                if let Some(hint) = self.size_range_hint() {
+                    ui.weak(hint);
+                }
+                if jitter.mode != JitterMode::Plus {
+                    if let Some(base) = self.target_mb_value().map(|mb| (mb * MIB as f64) as u64) {
+                        if jitter.spread >= base {
+                            ui.colored_label(
+                                WARN_COLOR,
+                                format!(
+                                    "Разброс {} не меньше самого размера — файл может выйти совсем маленьким.",
+                                    jitter.label()
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                ui.weak("Разброс 0 — размер всегда ровно указанный.");
+            }
+            Err(message) => {
+                ui.colored_label(ERROR_COLOR, message);
+            }
+        }
+        if let Some(mb) = self.target_mb_value() {
+            for warning in scan::limits_warnings((mb * MIB as f64) as u64, self.method) {
+                ui.colored_label(WARN_COLOR, warning);
+            }
+        }
+    }
+
+    /// Как называть результаты: размер в имени, без размера или случайно.
+    fn names_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Имена:");
+            for mode in NameMode::ALL {
+                ui.radio_value(&mut self.names, mode, mode.label())
+                    .on_hover_text(mode.title());
+            }
+        });
+        ui.weak(format!("Пример: {}", self.example_name()));
+    }
+
+    /// Папка результатов: по умолчанию файлы ложатся рядом с исходными.
+    fn out_dir_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Папка результатов..."))
+                .clicked()
+            {
+                if let Some(directory) = rfd::FileDialog::new().pick_folder() {
+                    self.out_dir = Some(directory);
+                }
+            }
+            match self.out_dir.as_ref() {
+                Some(directory) => ui.monospace(directory.display().to_string()),
+                None => ui.weak("рядом с каждым исходным файлом"),
+            };
+            if self.out_dir.is_some()
+                && ui
+                    .add_enabled(!self.busy, egui::Button::new("Сбросить"))
+                    .clicked()
+            {
+                self.out_dir = None;
+            }
+        });
+    }
+
+    /// Вкладка «Спрятать / извлечь»: носители, нагрузка, опции контейнера.
+    fn payload_tab_ui(&mut self, ui: &mut egui::Ui) {
+        group_ui(
+            ui,
+            "1. Носители (картинки и другие файлы)",
+            |ui| {
+                path_list_ui(
+                    ui,
+                    "Выбрать носители...",
+                    "носители не выбраны (PNG, JPEG, GIF, WebP, SVG или любой файл)",
+                    &[("Изображения", &["png", "jpg", "jpeg", "gif", "webp", "svg"])],
+                    self.busy,
+                    &mut self.carriers,
+                );
+            },
+        );
+        group_ui(ui, "2. Что спрятать (нагрузка)", |ui| {
+            path_list_ui(
+                ui,
+                "Выбрать нагрузку...",
+                "файлы, которые нужно спрятать (несколько — упакуются в бандл)",
+                &[],
+                self.busy,
+                &mut self.payloads,
+            );
+            ui.add_space(4.0);
+            ui.add_enabled(
+                !self.busy,
+                egui::Checkbox::new(
+                    &mut self.embed_compress,
+                    "Сжимать нагрузку (deflate) перед встраиванием",
+                ),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Копий внутри (устойчивость к обрезке):");
+                ui.add_enabled(
+                    !self.busy,
+                    egui::DragValue::new(&mut self.embed_copies).range(1..=3),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Пароль (необязательно):");
+                ui.add_enabled(
+                    !self.busy,
+                    egui::TextEdit::singleline(&mut self.embed_password)
+                        .password(true)
+                        .hint_text("Argon2id + ChaCha20-Poly1305")
+                        .desired_width(240.0),
+                );
+            });
+        });
+        group_ui(ui, "3. Имена файлов результата", |ui| {
+            self.names_ui(ui)
+        });
+        ui.horizontal(|ui| {
+            let can_embed = !self.busy && !self.carriers.is_empty() && !self.payloads.is_empty();
+            if action_button(ui, can_embed, "Спрятать файл") {
+                self.start_embed();
+            }
+            if action_button(
+                ui,
+                !self.busy && !self.carriers.is_empty(),
+                "Проверить и извлечь",
+            ) {
+                self.start_inspect();
+            }
+        });
+        ui.add_space(4.0);
+        ui.weak(
+            "Данные кладутся внутрь структуры файла: чанки PNG, сегменты APP15 JPEG, комментарий GIF, RIFF-чанк WebP, metadata SVG. Картинка остаётся рабочей, поэтому сервер принимает файл целиком.",
+        );
+    }
+
+    /// Вкладка «Создать файл»: размер, тип, имена и необязательное второе дно.
+    fn generate_tab_ui(&mut self, ui: &mut egui::Ui) {
+        group_ui(ui, "1. Размер нового файла", |ui| {
+            self.size_ui(ui)
+        });
+        group_ui(ui, "2. Тип файла", |ui| {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("generated_kind")
+                    .selected_text(self.gen_kind.title())
+                    .show_ui(ui, |ui| {
+                        for kind in GeneratedKind::ALL {
+                            ui.selectable_value(&mut self.gen_kind, kind, kind.title());
+                        }
+                    });
+                ui.weak(if self.gen_kind.is_image() {
+                    "останется открывающейся картинкой"
+                } else {
+                    "случайные байты без формата"
+                });
+            });
+        });
+        group_ui(ui, "3. Имя, количество и папка", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Основа имени:");
+                ui.add_enabled(
+                    !self.busy,
+                    egui::TextEdit::singleline(&mut self.gen_base)
+                        .hint_text("file")
+                        .desired_width(140.0),
+                );
+                ui.label("Файлов на размер:");
+                ui.add_enabled(
+                    !self.busy,
+                    egui::DragValue::new(&mut self.gen_count).range(1..=32),
+                );
+            });
+            self.names_ui(ui);
+            self.out_dir_ui(ui);
+        });
+        group_ui(
+            ui,
+            "4. Второе дно (необязательно)",
+            |ui| {
+                ui.add_enabled(
+                !self.busy && !self.payloads.is_empty(),
+                egui::Checkbox::new(
+                    &mut self.gen_attach,
+                    "Спрятать внутрь нагрузку со вкладки «Спрятать / извлечь»",
+                ),
+            )
+            .on_hover_text(
+                "Контейнер встаёт в заранее посчитанное место, поэтому размер файла не изменится",
+            );
+                match self.payloads.len() {
+                    0 => ui.weak("нагрузка не выбрана — вкладка «Спрятать / извлечь»"),
+                    count => ui.weak(format!("нагрузок выбрано: {count}")),
+                };
+            },
+        );
+        ui.horizontal(|ui| {
+            let ready = !self.busy && self.jitter().is_ok();
+            if action_button(ui, ready, "Создать файл") {
+                self.start_generate();
+            }
+            ui.weak(format!("пример имени: {}", self.generated_example_name()));
+        });
     }
 }
 

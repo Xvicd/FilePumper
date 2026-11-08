@@ -111,6 +111,137 @@ impl TargetMode {
     }
 }
 
+/// Куда отклоняется размер при разбросе: только вверх, только вниз или в обе стороны.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JitterMode {
+    /// Только прибавлять: 10 МБ + 0…2 МБ.
+    Plus,
+    /// Только убавлять: 10 МБ − 0…2 МБ.
+    Minus,
+    /// В любую сторону (по умолчанию): 10 ± 2 МБ.
+    #[default]
+    Both,
+}
+
+impl JitterMode {
+    pub const ALL: [JitterMode; 3] = [JitterMode::Both, JitterMode::Plus, JitterMode::Minus];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "both" | "plus-minus" | "±" | "обе" | "в-обе-стороны" => {
+                Ok(JitterMode::Both)
+            }
+            "plus" | "up" | "+" | "плюс" => Ok(JitterMode::Plus),
+            "minus" | "down" | "-" | "минус" => Ok(JitterMode::Minus),
+            other => Err(format!(
+                "Неизвестное направление разброса: {other}. Допустимо: plus, minus, both."
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            JitterMode::Both => "плюс-минус",
+            JitterMode::Plus => "только плюс",
+            JitterMode::Minus => "только минус",
+        }
+    }
+
+    /// Пояснение с примером — для интерфейса и справки.
+    pub fn title(self) -> &'static str {
+        match self {
+            JitterMode::Both => "Плюс-минус: 10 ± 2 МБ — от 8 до 12 МБ",
+            JitterMode::Plus => "Только плюс: 10 + 0…2 МБ — от 10 до 12 МБ",
+            JitterMode::Minus => "Только минус: 10 − 0…2 МБ — от 8 до 10 МБ",
+        }
+    }
+}
+
+/// Разброс целевого размера: вместо ровных 10 МБ файл получает случайный размер
+/// в пределах заданного отклонения.
+///
+/// Разброс применяется к уже посчитанному размеру (с учётом [`TargetMode`]),
+/// а результат остаётся точным: файл создаётся ровно того размера, который выпал.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizeJitter {
+    /// Максимальное отклонение в байтах (граница включительно).
+    pub spread: u64,
+    /// Куда отклоняться.
+    pub mode: JitterMode,
+}
+
+impl SizeJitter {
+    pub fn new(spread: u64, mode: JitterMode) -> Self {
+        Self { spread, mode }
+    }
+
+    /// Разброс из мегабайт. `Ok(None)` — разброс выключен (`--vary 0`).
+    pub fn from_mb(spread_mb: f64, mode: JitterMode) -> Result<Option<Self>, String> {
+        if !spread_mb.is_finite() {
+            return Err("Разброс должен быть числом в мегабайтах.".to_owned());
+        }
+        if spread_mb < 0.0 {
+            return Err("Разброс не может быть отрицательным.".to_owned());
+        }
+        let spread = (spread_mb * MIB as f64) as u64;
+        Ok((spread > 0).then_some(Self { spread, mode }))
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.spread > 0
+    }
+
+    /// Случайное отклонение в байтах: от 0 до `spread` включительно.
+    fn random_delta(&self) -> u64 {
+        use rand::Rng;
+        rand::thread_rng().gen_range(0..=self.spread)
+    }
+
+    /// Применяет разброс к базовому размеру.
+    ///
+    /// Вниз размер не опускается ниже одного байта: файл нулевой длины не нужен
+    /// ни одному методу.
+    pub fn apply(&self, base: u64) -> u64 {
+        if !self.is_active() {
+            return base;
+        }
+        let delta = self.random_delta();
+        match self.mode {
+            JitterMode::Plus => base.saturating_add(delta),
+            JitterMode::Minus => base.saturating_sub(delta).max(1),
+            JitterMode::Both => {
+                use rand::Rng;
+                if rand::thread_rng().gen_bool(0.5) {
+                    base.saturating_add(delta)
+                } else {
+                    base.saturating_sub(delta).max(1)
+                }
+            }
+        }
+    }
+
+    /// Границы, в которые попадёт размер: `(минимум, максимум)`.
+    pub fn range(&self, base: u64) -> (u64, u64) {
+        let top = base.saturating_add(self.spread);
+        let bottom = base.saturating_sub(self.spread).max(1);
+        match self.mode {
+            JitterMode::Plus => (base, top),
+            JitterMode::Minus => (bottom, base),
+            JitterMode::Both => (bottom, top),
+        }
+    }
+
+    /// Подпись для интерфейса, плана и отчёта: `±2MB`, `+0…2MB`, `−0…2MB`.
+    pub fn label(&self) -> String {
+        let spread = size_label(self.spread);
+        match self.mode {
+            JitterMode::Both => format!("±{spread}"),
+            JitterMode::Plus => format!("+0…{spread}"),
+            JitterMode::Minus => format!("−0…{spread}"),
+        }
+    }
+}
+
 /// Как называется файл результата: с размером в имени, без него или случайно.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NameMode {
@@ -164,6 +295,8 @@ pub struct PumpPlan {
     pub mode: TargetMode,
     /// Как называть результаты пакета.
     pub names: NameMode,
+    /// Разброс размера: `None` — размер всегда ровно указанный.
+    pub jitter: Option<SizeJitter>,
     /// Размеры в байтах, по одному на файл; последний повторяется.
     pub targets: Vec<u64>,
 }
@@ -182,6 +315,7 @@ impl PumpPlan {
             out_dir,
             mode,
             names: NameMode::Size,
+            jitter: None,
             targets: targets_from_mb(sizes_mb)?,
         })
     }
@@ -192,10 +326,20 @@ impl PumpPlan {
         self
     }
 
+    /// Разброс размера: каждому файлу достаётся случайный размер в его пределах.
+    pub fn with_jitter(mut self, jitter: Option<SizeJitter>) -> Self {
+        self.jitter = jitter;
+        self
+    }
+
     /// Размер для файла номер `index` (если размеров меньше — повторяется последний).
     pub fn target_for(&self, index: usize, input_len: u64) -> u64 {
         let base = self.targets[index.min(self.targets.len() - 1)];
-        self.mode.target_bytes(base, input_len)
+        let exact = self.mode.target_bytes(base, input_len);
+        match self.jitter {
+            Some(jitter) => jitter.apply(exact),
+            None => exact,
+        }
     }
 
     /// Проверяет, что размеров столько же, сколько файлов, либо указан один.
@@ -707,28 +851,44 @@ pub struct GenerateItem {
     pub payloads: Vec<PathBuf>,
 }
 
+/// Что создавать «с нуля»: размеры в байтах, число повторов и разброс размера.
+#[derive(Clone, Debug, Default)]
+pub struct GenerateTargets {
+    /// Размеры в байтах; каждый повторяется `count` раз.
+    pub sizes: Vec<u64>,
+    /// Сколько файлов создать на каждый размер.
+    pub count: usize,
+    /// Разброс размера: `None` — размер всегда ровно указанный.
+    pub jitter: Option<SizeJitter>,
+}
+
 /// План генерации: каждый размер создаётся `count` раз, имена — по [`NameMode`].
 pub fn plan_generate(
     base: &str,
     kind: GeneratedKind,
     names: NameMode,
     out_dir: Option<&Path>,
-    targets: &[u64],
-    count: usize,
+    targets: &GenerateTargets,
     payloads: &[PathBuf],
 ) -> Result<Vec<GenerateItem>, String> {
-    if targets.is_empty() {
+    if targets.sizes.is_empty() {
         return Err("Укажите размер файла.".to_owned());
     }
-    let count = count.clamp(1, 64);
+    let count = targets.count.clamp(1, 64);
     let mut reservations = Reservations::new();
-    let mut items = Vec::with_capacity(targets.len() * count);
-    for target in targets {
+    let mut items = Vec::with_capacity(targets.sizes.len() * count);
+    for size in &targets.sizes {
         for _ in 0..count {
-            let output = generated_path_in(base, *target, kind, out_dir, names, &mut reservations)?;
+            // Разброс считается для каждого файла отдельно: у серии из `count`
+            // файлов размеры будут разными, и имя покажет фактический размер.
+            let exact = match targets.jitter {
+                Some(jitter) => jitter.apply(*size),
+                None => *size,
+            };
+            let output = generated_path_in(base, exact, kind, out_dir, names, &mut reservations)?;
             items.push(GenerateItem {
                 output,
-                target: *target,
+                target: exact,
                 kind,
                 payloads: payloads.to_vec(),
             });
@@ -1362,13 +1522,17 @@ mod tests {
     #[test]
     fn plan_generate_repeats_every_size_and_keeps_names_unique() {
         let dir = tempfile::tempdir().unwrap();
+        let targets = GenerateTargets {
+            sizes: vec![MIB, MIB / 2],
+            count: 2,
+            jitter: None,
+        };
         let items = plan_generate(
             "seed",
             GeneratedKind::Bin,
             NameMode::Size,
             Some(dir.path()),
-            &[MIB, MIB / 2],
-            2,
+            &targets,
             &[],
         )
         .unwrap();
@@ -1382,6 +1546,158 @@ mod tests {
         assert_eq!(items[0].target, MIB);
         assert_eq!(items[2].target, MIB / 2);
         assert!(items.iter().all(|item| item.payloads.is_empty()));
+    }
+
+    #[test]
+    fn jitter_mode_parses_and_describes_itself() {
+        assert_eq!(JitterMode::parse("plus").unwrap(), JitterMode::Plus);
+        assert_eq!(JitterMode::parse("MINUS").unwrap(), JitterMode::Minus);
+        assert_eq!(JitterMode::parse(" both ").unwrap(), JitterMode::Both);
+        assert_eq!(JitterMode::parse("±").unwrap(), JitterMode::Both);
+        assert!(JitterMode::parse("sideways").is_err());
+        assert_eq!(JitterMode::default(), JitterMode::Both);
+        for mode in JitterMode::ALL {
+            assert!(!mode.label().is_empty());
+            assert!(!mode.title().is_empty());
+        }
+    }
+
+    #[test]
+    fn jitter_from_mb_validates_the_spread() {
+        assert!(SizeJitter::from_mb(0.0, JitterMode::Both)
+            .unwrap()
+            .is_none());
+        assert!(SizeJitter::from_mb(0.5, JitterMode::Both)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            SizeJitter::from_mb(2.0, JitterMode::Plus).unwrap().unwrap(),
+            SizeJitter::new(2 * MIB, JitterMode::Plus)
+        );
+        assert!(SizeJitter::from_mb(-1.0, JitterMode::Both).is_err());
+        assert!(SizeJitter::from_mb(f64::NAN, JitterMode::Both).is_err());
+    }
+
+    #[test]
+    fn jitter_label_shows_the_direction() {
+        let spread = 2 * MIB;
+        assert_eq!(SizeJitter::new(spread, JitterMode::Both).label(), "±2MB");
+        assert_eq!(SizeJitter::new(spread, JitterMode::Plus).label(), "+0…2MB");
+        assert_eq!(SizeJitter::new(spread, JitterMode::Minus).label(), "−0…2MB");
+    }
+
+    fn base_size() -> u64 {
+        3 * MIB
+    }
+
+    #[test]
+    fn jitter_stays_inside_the_range_and_follows_the_direction() {
+        let base = 8 * MIB;
+        let spread = MIB;
+        let plus = SizeJitter::new(spread, JitterMode::Plus);
+        let minus = SizeJitter::new(spread, JitterMode::Minus);
+        let both = SizeJitter::new(spread, JitterMode::Both);
+
+        let mut saw_above = false;
+        let mut saw_below = false;
+        for _ in 0..200 {
+            let value = plus.apply(base);
+            assert!((base..=base + spread).contains(&value), "плюс: {value}");
+            let value = minus.apply(base);
+            assert!((base - spread..=base).contains(&value), "минус: {value}");
+            let value = both.apply(base);
+            assert!(
+                (base - spread..=base + spread).contains(&value),
+                "плюс-минус: {value}"
+            );
+            saw_above |= value > base;
+            saw_below |= value < base;
+        }
+        assert!(saw_above, "разброс «плюс-минус» не поднимался выше размера");
+        assert!(saw_below, "разброс «плюс-минус» не опускался ниже размера");
+        assert_eq!(both.range(base), (base - spread, base + spread));
+        assert_eq!(plus.range(base), (base, base + spread));
+        assert_eq!(minus.range(base), (base - spread, base));
+    }
+
+    #[test]
+    fn jitter_never_produces_an_empty_file() {
+        let minus = SizeJitter::new(5 * MIB, JitterMode::Minus);
+        for _ in 0..50 {
+            assert!(minus.apply(MIB) >= 1);
+        }
+        let both = SizeJitter::new(5 * MIB, JitterMode::Both);
+        for _ in 0..50 {
+            assert!(both.apply(MIB) >= 1);
+        }
+        assert_eq!(both.range(MIB).0, 1);
+        let disabled = SizeJitter::new(0, JitterMode::Both);
+        assert_eq!(disabled.apply(base_size()), base_size());
+    }
+
+    #[test]
+    fn pump_plan_applies_jitter_to_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs: Vec<PathBuf> = (0..4)
+            .map(|index| {
+                let path = dir.path().join(format!("file{index}.txt"));
+                fs::write(&path, b"data").unwrap();
+                path
+            })
+            .collect();
+        let spread = MIB;
+        let jitter = SizeJitter::new(spread, JitterMode::Both);
+        let plan = PumpPlan::new(
+            Method::Padding,
+            AnimationFormat::Gif,
+            Some(dir.path().join("out")),
+            TargetMode::Exact,
+            &[4.0],
+        )
+        .unwrap()
+        .with_jitter(Some(jitter));
+        let planned = plan.build(&inputs);
+
+        assert_eq!(planned.items.len(), 4);
+        for item in &planned.items {
+            assert!(
+                (4 * MIB - spread..=4 * MIB + spread).contains(&item.target),
+                "размер {} вне разброса",
+                item.target
+            );
+        }
+    }
+
+    #[test]
+    fn generate_plan_gives_every_file_its_own_random_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let spread = MIB / 4;
+        let targets = GenerateTargets {
+            sizes: vec![2 * MIB],
+            count: 6,
+            jitter: Some(SizeJitter::new(spread, JitterMode::Plus)),
+        };
+        let items = plan_generate(
+            "seed",
+            GeneratedKind::Bin,
+            NameMode::Size,
+            Some(dir.path()),
+            &targets,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 6);
+        let mut distinct = std::collections::HashSet::new();
+        for item in &items {
+            assert!(
+                (2 * MIB..=2 * MIB + spread).contains(&item.target),
+                "размер {} вне разброса",
+                item.target
+            );
+            distinct.insert(item.target);
+        }
+        assert!(distinct.len() > 1, "размеры серии совпали: {distinct:?}");
     }
 
     #[test]

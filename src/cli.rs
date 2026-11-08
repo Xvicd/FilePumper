@@ -3,7 +3,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::batch::{self, BatchItem, BatchReport, ItemResult, NameMode, PumpPlan, TargetMode};
+use crate::batch::{
+    self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, NameMode, PumpPlan,
+    SizeJitter, TargetMode,
+};
 use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::report;
@@ -24,6 +27,7 @@ FilePumper
 Накачка файлов (можно сразу несколько):
   file-pumper-cli pump <вход>... --size <МБ[,МБ...]>
                                    [--size-mode exact|at-least|add]
+                                   [--vary <МБ> [--vary-mode plus|minus|both]]
                                    [--names size|plain|random]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--method animation|png-chunks|upscale|svg|office|padding]
@@ -37,6 +41,12 @@ FilePumper
                  (дробную часть пишите через точку: 1.5)
   --size-mode    exact — ровно столько (по умолчанию), at-least — не меньше,
                  add — прибавить указанный объём к каждому файлу
+  --vary         разброс размера: вместо ровных 400 МБ файл получит случайный
+                 размер в пределах ±указанного объёма (--vary 5 → 395…405 МБ).
+                 Разброс считается для каждого файла отдельно, а записанный файл
+                 всё равно ровно того размера, который выпал; 0 — выключить
+  --vary-mode    куда отклоняться: both — в обе стороны (по умолчанию),
+                 plus — только прибавлять, minus — только убавлять
   --names        имена результатов: size — с размером (photo_10MB.png,
                  по умолчанию), plain — без размера (photo.png), random —
                  случайное имя (quiet-river-4821.png)
@@ -52,6 +62,7 @@ FilePumper
 Создать файл с нуля (исходник не нужен; внутрь можно спрятать нагрузку):
   file-pumper-cli generate --size <МБ[,МБ...]> [--count N]
                                    [--type bin|png|gif|jpg|webp]
+                                   [--vary <МБ> [--vary-mode plus|minus|both]]
                                    [--name ОСНОВА] [--names size|plain|random]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--payload ФАЙЛ ...] [--copies 1..3]
@@ -71,6 +82,8 @@ FilePumper
   Примеры: file-pumper-cli generate --size 10 --type png --name photo
            file-pumper-cli generate --size 5,20 --count 2 --type gif
            file-pumper-cli generate --size 10 --payload secret.pdf --password 1234
+           file-pumper-cli generate --size 400 --vary 5 --type png
+           размер каждого файла — случайный в пределах 395…405 МБ
 
 Спрятать файлы в картинке (можно несколько носителей и нагрузок):
   file-pumper-cli embed <носитель>... --payload <файл> [--payload <файл>...]
@@ -105,6 +118,8 @@ struct Flags {
     positional: Vec<String>,
     sizes: Vec<f64>,
     size_mode: TargetMode,
+    vary: Option<f64>,
+    vary_mode: JitterMode,
     names: NameMode,
     method: Method,
     format: AnimationFormat,
@@ -167,12 +182,26 @@ fn parse_sizes(value: &str) -> Result<Vec<f64>, String> {
     Ok(sizes)
 }
 
+/// Разброс размера в мегабайтах: запятая тоже работает, отрицательный — ошибка.
+fn parse_spread(value: &str) -> Result<f64, String> {
+    let raw = value.trim().replace(',', ".").replace(' ', "");
+    let spread = raw
+        .parse::<f64>()
+        .map_err(|_| format!("Неверный разброс: {value}"))?;
+    if !spread.is_finite() || spread < 0.0 {
+        return Err("Разброс должен быть неотрицательным числом в мегабайтах.".to_owned());
+    }
+    Ok(spread)
+}
+
 impl Flags {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut flags = Flags {
             positional: Vec::new(),
             sizes: Vec::new(),
             size_mode: TargetMode::Exact,
+            vary: None,
+            vary_mode: JitterMode::Both,
             names: NameMode::Size,
             method: Method::Animation,
             format: AnimationFormat::Gif,
@@ -211,6 +240,14 @@ impl Flags {
                 "--size-mode" => {
                     let raw = next("--size-mode", &mut iterator)?;
                     flags.size_mode = TargetMode::parse(&raw)?;
+                }
+                "--vary" | "--jitter" => {
+                    let raw = next("--vary", &mut iterator)?;
+                    flags.vary = Some(parse_spread(&raw)?);
+                }
+                "--vary-mode" | "--jitter-mode" | "--vary-direction" => {
+                    let raw = next("--vary-mode", &mut iterator)?;
+                    flags.vary_mode = JitterMode::parse(&raw)?;
                 }
                 "--names" | "--name-mode" => {
                     let raw = next("--names", &mut iterator)?;
@@ -343,6 +380,39 @@ impl Flags {
     fn password(&self) -> Option<String> {
         self.options().password
     }
+
+    /// Разброс размера из `--vary` и `--vary-mode`; `None` — разброс выключен.
+    fn jitter(&self) -> Result<Option<SizeJitter>, String> {
+        SizeJitter::from_mb(self.vary.unwrap_or(0.0), self.vary_mode)
+    }
+}
+
+/// Предупреждает, если разброс способен «съесть» весь размер: при `minus` файл
+/// может получиться совсем маленьким, а для картинок — меньше служебного минимума.
+fn warn_jitter(jitter: Option<SizeJitter>, targets: &[u64]) {
+    let Some(jitter) = jitter else {
+        return;
+    };
+    if jitter.mode == JitterMode::Plus {
+        return;
+    }
+    if let Some(smallest) = targets.iter().copied().min() {
+        if jitter.spread >= smallest {
+            eprintln!(
+                "Предупреждение: разброс {} не меньше самого размера ({}) — файл может выйти совсем маленьким.",
+                jitter.label(),
+                batch::size_label(smallest)
+            );
+        }
+    }
+}
+
+/// Приписка к строке плана: `, разброс «±5MB»`.
+fn jitter_note(jitter: Option<SizeJitter>) -> String {
+    match jitter {
+        Some(jitter) => format!(", разброс «{}»", jitter.label()),
+        None => String::new(),
+    }
 }
 
 /// Возвращает код выхода процесса.
@@ -410,6 +480,9 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
         &flags.sizes,
     )?
     .with_names(flags.names);
+    let jitter = flags.jitter()?;
+    let plan = plan.with_jitter(jitter);
+    warn_jitter(jitter, &plan.targets);
     plan.ensure_sizes_match(inputs.len())?;
 
     let mut planned = match explicit_output {
@@ -461,10 +534,11 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
 
     if flags.dry_run {
         println!(
-            "План: {} файл(ов), метод «{}», режим «{}»",
+            "План: {} файл(ов), метод «{}», режим «{}»{}",
             planned.items.len(),
             flags.method.title(),
-            flags.size_mode.label()
+            flags.size_mode.label(),
+            jitter_note(jitter)
         );
         for item in &planned.items {
             let note = match batch::support_error(flags.method, &item.input) {
@@ -585,13 +659,19 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
         }
     }
     let targets = batch::targets_from_mb(&flags.sizes)?;
+    let jitter = flags.jitter()?;
+    warn_jitter(jitter, &targets);
+    let spec = GenerateTargets {
+        sizes: targets,
+        count: flags.count,
+        jitter,
+    };
     let mut items = batch::plan_generate(
         &flags.base_name,
         flags.generated,
         flags.names,
         flags.out_dir.as_deref(),
-        &targets,
-        flags.count,
+        &spec,
         &flags.payloads,
     )?;
 
@@ -614,10 +694,11 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
 
     if flags.dry_run {
         println!(
-            "План: {} файл(ов), тип «{}», имена «{}»",
+            "План: {} файл(ов), тип «{}», имена «{}»{}",
             items.len(),
             flags.generated.title(),
-            flags.names.label()
+            flags.names.label(),
+            jitter_note(jitter)
         );
         for item in &items {
             println!(
