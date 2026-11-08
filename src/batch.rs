@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::pumper::{self, AnimationFormat, Method};
-use crate::util::{same_file, unique_path, CancelToken, Job, Reservations, MIB};
+use crate::payload::{self, ContainerOptions};
+use crate::pumper::{self, generate, AnimationFormat, GeneratedKind, Method};
+use crate::util::{
+    same_file, sanitize_file_name, unique_path, CancelToken, Job, Reservations, MIB,
+};
 
 /// Один файл пакета: исходник, путь результата и его целевой размер.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,11 +32,12 @@ impl BatchItem {
         method: Method,
         format: AnimationFormat,
         out_dir: Option<&Path>,
+        names: NameMode,
     ) -> Result<Self, String> {
         if !input.is_file() {
             return Err("файл не найден".to_owned());
         }
-        let output = output_path(input, target_bytes, method, format, out_dir)?;
+        let output = output_path(input, target_bytes, method, format, out_dir, names)?;
         if same_file(input, &output) {
             return Err("результат совпадает с исходным файлом".to_owned());
         }
@@ -107,6 +111,50 @@ impl TargetMode {
     }
 }
 
+/// Как называется файл результата: с размером в имени, без него или случайно.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NameMode {
+    /// `photo_10MB.png` — размер дописывается к имени исходника (по умолчанию).
+    #[default]
+    Size,
+    /// `photo.png` — только имя исходника, без пометки размера.
+    Plain,
+    /// `quiet-river-4821.png` — случайное имя «в рамках приличия».
+    Random,
+}
+
+impl NameMode {
+    pub const ALL: [NameMode; 3] = [NameMode::Size, NameMode::Plain, NameMode::Random];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "size" | "with-size" | "размер" | "с-размером" => Ok(NameMode::Size),
+            "plain" | "clean" | "no-size" | "без-размера" => Ok(NameMode::Plain),
+            "random" | "случайно" | "случайное" => Ok(NameMode::Random),
+            other => Err(format!(
+                "Неизвестный режим имени: {other}. Допустимо: size, plain, random."
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NameMode::Size => "с размером",
+            NameMode::Plain => "без размера",
+            NameMode::Random => "случайное",
+        }
+    }
+
+    /// Пример и пояснение режима для интерфейса и справки.
+    pub fn title(self) -> &'static str {
+        match self {
+            NameMode::Size => "С размером: photo_10MB.png",
+            NameMode::Plain => "Без размера: photo.png",
+            NameMode::Random => "Случайное: quiet-river-4821.png",
+        }
+    }
+}
+
 /// Готовый план пакета: настройки, размеры и список входов.
 #[derive(Clone, Debug)]
 pub struct PumpPlan {
@@ -114,6 +162,8 @@ pub struct PumpPlan {
     pub format: AnimationFormat,
     pub out_dir: Option<PathBuf>,
     pub mode: TargetMode,
+    /// Как называть результаты пакета.
+    pub names: NameMode,
     /// Размеры в байтах, по одному на файл; последний повторяется.
     pub targets: Vec<u64>,
 }
@@ -126,27 +176,20 @@ impl PumpPlan {
         mode: TargetMode,
         sizes_mb: &[f64],
     ) -> Result<Self, String> {
-        if sizes_mb.is_empty() {
-            return Err("Укажите размер: --size <МБ>.".to_owned());
-        }
-        let mut targets = Vec::with_capacity(sizes_mb.len());
-        for size_mb in sizes_mb {
-            if !(size_mb.is_finite() && *size_mb > 0.0) {
-                return Err("Размер должен быть положительным числом.".to_owned());
-            }
-            let target = (size_mb * MIB as f64) as u64;
-            if target == 0 {
-                return Err("Размер слишком мал: укажите хотя бы 0,001 МБ.".to_owned());
-            }
-            targets.push(target);
-        }
         Ok(Self {
             method,
             format,
             out_dir,
             mode,
-            targets,
+            names: NameMode::Size,
+            targets: targets_from_mb(sizes_mb)?,
         })
+    }
+
+    /// Как называть результаты: с размером, без него или случайно.
+    pub fn with_names(mut self, names: NameMode) -> Self {
+        self.names = names;
+        self
     }
 
     /// Размер для файла номер `index` (если размеров меньше — повторяется последний).
@@ -197,7 +240,7 @@ impl PumpPlan {
         }
         let input_len = fs::metadata(input).map_err(|err| err.to_string())?.len();
         let target = self.target_for(index, input_len);
-        let name = result_name(input, target, self.method, self.format);
+        let name = result_name(input, target, self.method, self.format, self.names);
         let candidate = match self.out_dir.as_deref() {
             Some(directory) => directory.join(&name),
             None => input.with_file_name(&name),
@@ -327,23 +370,62 @@ pub fn size_label(target_bytes: u64) -> String {
     format!("{text}MB")
 }
 
-/// Имя результата: `photo.jpg` → `photo_10MB.png` (расширение зависит от метода).
+/// Имя результата: `photo.jpg` → `photo_10MB.png`. Расширение зависит от метода,
+/// а [`NameMode`] решает, попадёт ли в имя размер (`Size`), исчезнет ли он (`Plain`)
+/// или имя станет случайным (`Random`).
 pub fn result_name(
     input: &Path,
     target_bytes: u64,
     method: Method,
     format: AnimationFormat,
+    names: NameMode,
 ) -> String {
     let stem = input
         .file_stem()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .unwrap_or("output");
-    format!(
-        "{stem}_{}.{}",
-        size_label(target_bytes),
-        output_extension(method, format, input)
-    )
+    let extension = output_extension(method, format, input);
+    match names {
+        NameMode::Size => format!("{stem}_{}.{extension}", size_label(target_bytes)),
+        NameMode::Plain => format!("{stem}.{extension}"),
+        NameMode::Random => format!("{}.{extension}", random_stem()),
+    }
+}
+
+/// Прилагательные для случайных имён: нейтральные, короткие, латиницей —
+/// чтобы имя одинаково выглядело в любой файловой системе.
+const NAME_ADJECTIVES: [&str; 24] = [
+    "amber", "brave", "bright", "calm", "clever", "cozy", "crisp", "gentle", "golden", "happy",
+    "lucky", "merry", "misty", "quiet", "rapid", "silver", "sunny", "swift", "tidy", "velvet",
+    "vivid", "warm", "wild", "witty",
+];
+
+/// Существительные для случайных имён.
+const NAME_NOUNS: [&str; 24] = [
+    "apple", "bay", "birch", "breeze", "brook", "cedar", "cloud", "comet", "dawn", "delta",
+    "ember", "fern", "forest", "garden", "harbor", "hill", "island", "lagoon", "meadow", "moon",
+    "orchard", "pebble", "river", "sky",
+];
+
+/// Случайная основа имени «в рамках приличия»: `quiet-river-4821`.
+pub fn random_stem() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let adjective = NAME_ADJECTIVES[rng.gen_range(0..NAME_ADJECTIVES.len())];
+    let noun = NAME_NOUNS[rng.gen_range(0..NAME_NOUNS.len())];
+    let number: u32 = rng.gen_range(1000..10_000);
+    format!("{adjective}-{noun}-{number}")
+}
+
+/// Подставляет случайную основу, сохраняя расширение:
+/// `photo_with_payload.png` → `calm-bay-7314.png`.
+pub fn with_random_stem(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    path.with_file_name(format!("{}.{extension}", random_stem()))
 }
 
 /// Путь результата: рядом с исходником или в указанной папке, без перезаписи
@@ -354,8 +436,9 @@ pub fn output_path(
     method: Method,
     format: AnimationFormat,
     out_dir: Option<&Path>,
+    names: NameMode,
 ) -> Result<PathBuf, String> {
-    let name = result_name(input, target_bytes, method, format);
+    let name = result_name(input, target_bytes, method, format, names);
     let candidate = match out_dir {
         Some(directory) => directory.join(&name),
         None => input.with_file_name(&name),
@@ -531,6 +614,259 @@ pub fn pump_parallel(
     report
 }
 
+/// Размеры в байтах из списка мегабайт: `[10.0, 0.5]` → `[10485760, 524288]`.
+pub fn targets_from_mb(sizes_mb: &[f64]) -> Result<Vec<u64>, String> {
+    if sizes_mb.is_empty() {
+        return Err("Укажите размер: --size <МБ>.".to_owned());
+    }
+    let mut targets = Vec::with_capacity(sizes_mb.len());
+    for size_mb in sizes_mb {
+        if !(size_mb.is_finite() && *size_mb > 0.0) {
+            return Err("Размер должен быть положительным числом.".to_owned());
+        }
+        let target = (size_mb * MIB as f64) as u64;
+        if target == 0 {
+            return Err("Размер слишком мал: укажите хотя бы 0,001 МБ.".to_owned());
+        }
+        targets.push(target);
+    }
+    Ok(targets)
+}
+
+/// Основа имени для созданного файла: пустая строка превращается в `file`,
+/// недопустимые символы вырезаются, хвостовые точки и пробелы убираются.
+fn generated_stem(base: &str) -> String {
+    let trimmed = base.trim();
+    if trimmed.is_empty() {
+        return "file".to_owned();
+    }
+    let cleaned = sanitize_file_name(trimmed);
+    let stem = cleaned.trim_end_matches(['.', ' ']);
+    if stem.is_empty() {
+        "file".to_owned()
+    } else {
+        stem.to_owned()
+    }
+}
+
+/// Имя файла, созданного «с нуля»: `file_10MB.bin`, `file.png` или
+/// `quiet-river-4821.png` — режим имён тот же, что у накачки.
+pub fn generated_name(
+    base: &str,
+    target_bytes: u64,
+    kind: GeneratedKind,
+    names: NameMode,
+) -> String {
+    let stem = generated_stem(base);
+    let extension = kind.extension();
+    match names {
+        NameMode::Size => format!("{stem}_{}.{extension}", size_label(target_bytes)),
+        NameMode::Plain => format!("{stem}.{extension}"),
+        NameMode::Random => format!("{}.{extension}", random_stem()),
+    }
+}
+
+/// Путь для файла, созданного «с нуля»: папка результатов или текущая,
+/// без перезаписи существующих файлов.
+pub fn generated_path(
+    base: &str,
+    target_bytes: u64,
+    kind: GeneratedKind,
+    out_dir: Option<&Path>,
+    names: NameMode,
+) -> Result<PathBuf, String> {
+    let mut reservations = Reservations::new();
+    generated_path_in(base, target_bytes, kind, out_dir, names, &mut reservations)
+}
+
+/// Общий набор занятых имён нужен серии файлов: два одинаковых размера не
+/// должны получить один и тот же путь.
+fn generated_path_in(
+    base: &str,
+    target_bytes: u64,
+    kind: GeneratedKind,
+    out_dir: Option<&Path>,
+    names: NameMode,
+    reservations: &mut Reservations,
+) -> Result<PathBuf, String> {
+    let name = generated_name(base, target_bytes, kind, names);
+    let candidate = match out_dir {
+        Some(directory) => directory.join(name),
+        None => PathBuf::from(name),
+    };
+    Ok(reservations.reserve(&candidate))
+}
+
+/// Задание на создание файла «с нуля»: путь результата, размер, тип и
+/// (необязательно) нагрузка для второго дна.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerateItem {
+    pub output: PathBuf,
+    pub target: u64,
+    pub kind: GeneratedKind,
+    pub payloads: Vec<PathBuf>,
+}
+
+/// План генерации: каждый размер создаётся `count` раз, имена — по [`NameMode`].
+pub fn plan_generate(
+    base: &str,
+    kind: GeneratedKind,
+    names: NameMode,
+    out_dir: Option<&Path>,
+    targets: &[u64],
+    count: usize,
+    payloads: &[PathBuf],
+) -> Result<Vec<GenerateItem>, String> {
+    if targets.is_empty() {
+        return Err("Укажите размер файла.".to_owned());
+    }
+    let count = count.clamp(1, 64);
+    let mut reservations = Reservations::new();
+    let mut items = Vec::with_capacity(targets.len() * count);
+    for target in targets {
+        for _ in 0..count {
+            let output = generated_path_in(base, *target, kind, out_dir, names, &mut reservations)?;
+            items.push(GenerateItem {
+                output,
+                target: *target,
+                kind,
+                payloads: payloads.to_vec(),
+            });
+        }
+    }
+    Ok(items)
+}
+
+/// Создаёт файл «с нуля» и возвращает его размер.
+///
+/// Если указана нагрузка, она прячется внутрь готового файла (второе дно):
+/// размер остаётся ровно целевым, потому что контейнер встраивается в заранее
+/// посчитанное место, а не дописывается сверху.
+pub fn generate_one(
+    item: &GenerateItem,
+    options: &ContainerOptions,
+    copies: usize,
+    job: &Job<'_>,
+) -> Result<u64, String> {
+    job.check()?;
+    create_parent_dir(&item.output)?;
+    if item.payloads.is_empty() {
+        return generate::run(item.kind, &item.output, item.target, job);
+    }
+
+    let copies = copies.clamp(payload::MIN_COPIES, payload::MAX_COPIES);
+    let prepared = payload::prepare_payload(&item.payloads, job)?;
+    let mut options = options.clone();
+    options.bundle = prepared.bundle;
+    let container_len = prepared.container_len(&options, copies, job)?;
+    let min_size = generate::min_size(item.kind)?;
+    if item.target < min_size + container_len {
+        return Err(too_small_message(item.kind, min_size, container_len));
+    }
+
+    // Служебные байты формата (заголовки чанков, сегментов, блоков) измеряем
+    // на минимальном носителе: тогда готовый файл попадёт точно в цель.
+    let overhead = measure_overhead(item.kind, &prepared, &options, copies, &item.output, job)?;
+    let carrier_target = item.target - container_len - overhead;
+    if carrier_target < min_size {
+        return Err(too_small_message(
+            item.kind,
+            min_size,
+            container_len + overhead,
+        ));
+    }
+
+    job.report(5.0, "Генерация случайных данных...");
+    let directory = parent_dir(&item.output).to_path_buf();
+    let carrier = tempfile::NamedTempFile::new_in(&directory)
+        .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
+    generate::run(item.kind, carrier.path(), carrier_target, job)?;
+    payload::embed_bytes(
+        carrier.path(),
+        &prepared.bytes,
+        &prepared.name,
+        &item.output,
+        &options,
+        copies,
+        job,
+    )?;
+    drop(carrier);
+
+    let len = fs::metadata(&item.output)
+        .map_err(|err| err.to_string())?
+        .len();
+    if len != item.target {
+        return Err(format!(
+            "Ожидался размер {} байт, получилось {}.",
+            item.target, len
+        ));
+    }
+    job.report(100.0, "Готово.");
+    Ok(len)
+}
+
+/// Сколько байт формат добавляет вокруг контейнера: узнаём на минимальном
+/// носителе, чтобы не считать формулы для PNG, GIF, JPEG и WebP вручную.
+fn measure_overhead(
+    kind: GeneratedKind,
+    prepared: &payload::PreparedPayload,
+    options: &ContainerOptions,
+    copies: usize,
+    output: &Path,
+    job: &Job<'_>,
+) -> Result<u64, String> {
+    let directory = parent_dir(output);
+    let base = generate::base_bytes(kind)?;
+    let carrier = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
+    fs::write(carrier.path(), &base).map_err(|err| err.to_string())?;
+    let probe = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
+    payload::embed_bytes(
+        carrier.path(),
+        &prepared.bytes,
+        &prepared.name,
+        probe.path(),
+        options,
+        copies,
+        job,
+    )?;
+    let container_len = prepared.container_len(options, copies, job)?;
+    let probe_len = fs::metadata(probe.path())
+        .map_err(|err| err.to_string())?
+        .len();
+    drop(probe);
+    drop(carrier);
+    Ok(probe_len.saturating_sub(base.len() as u64 + container_len))
+}
+
+fn too_small_message(kind: GeneratedKind, min_size: u64, payload_len: u64) -> String {
+    format!(
+        "Размер слишком мал для типа «{}»: нужно минимум {} байт (служебные данные {} + второе дно {}).",
+        kind.title(),
+        min_size.saturating_add(payload_len),
+        min_size,
+        payload_len
+    )
+}
+
+/// Папка результата: пустой родитель означает текущую папку.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(directory) if !directory.as_os_str().is_empty() => directory,
+        _ => Path::new("."),
+    }
+}
+
+fn create_parent_dir(path: &Path) -> Result<(), String> {
+    let directory = parent_dir(path);
+    if !directory.is_dir() {
+        fs::create_dir_all(directory)
+            .map_err(|err| format!("Не удалось создать папку {}: {err}", directory.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,21 +883,125 @@ mod tests {
     fn result_name_uses_method_extension() {
         let input = Path::new("C:/photos/IMG_0001.jpeg");
         assert_eq!(
-            result_name(input, 5 * MIB, Method::PngChunks, AnimationFormat::Gif),
+            result_name(
+                input,
+                5 * MIB,
+                Method::PngChunks,
+                AnimationFormat::Gif,
+                NameMode::Size
+            ),
             "IMG_0001_5MB.png"
         );
         assert_eq!(
-            result_name(input, 5 * MIB, Method::Animation, AnimationFormat::Webp),
+            result_name(
+                input,
+                5 * MIB,
+                Method::Animation,
+                AnimationFormat::Webp,
+                NameMode::Size
+            ),
             "IMG_0001_5MB.webp"
         );
         assert_eq!(
-            result_name(input, 5 * MIB, Method::Padding, AnimationFormat::Gif),
+            result_name(
+                input,
+                5 * MIB,
+                Method::Padding,
+                AnimationFormat::Gif,
+                NameMode::Size
+            ),
             "IMG_0001_5MB.jpeg"
         );
         assert_eq!(
-            result_name(input, 5 * MIB, Method::Svg, AnimationFormat::Gif),
+            result_name(
+                input,
+                5 * MIB,
+                Method::Svg,
+                AnimationFormat::Gif,
+                NameMode::Size
+            ),
             "IMG_0001_5MB.svg"
         );
+    }
+
+    #[test]
+    fn name_mode_parse_accepts_russians() {
+        assert_eq!(NameMode::parse("size"), Ok(NameMode::Size));
+        assert_eq!(NameMode::parse("plain"), Ok(NameMode::Plain));
+        assert_eq!(NameMode::parse("no-size"), Ok(NameMode::Plain));
+        assert_eq!(NameMode::parse(" Random "), Ok(NameMode::Random));
+        assert_eq!(NameMode::parse("случайное"), Ok(NameMode::Random));
+        assert!(NameMode::parse("мусор").is_err());
+        assert_eq!(NameMode::default(), NameMode::Size);
+    }
+
+    #[test]
+    fn plain_mode_drops_the_size_label() {
+        let input = Path::new("C:/photos/photo.jpeg");
+        assert_eq!(
+            result_name(
+                input,
+                10 * MIB,
+                Method::Padding,
+                AnimationFormat::Gif,
+                NameMode::Plain
+            ),
+            "photo.jpeg"
+        );
+        assert_eq!(
+            result_name(
+                input,
+                MIB,
+                Method::PngChunks,
+                AnimationFormat::Gif,
+                NameMode::Plain
+            ),
+            "photo.png"
+        );
+        assert_eq!(
+            result_name(
+                input,
+                MIB,
+                Method::Svg,
+                AnimationFormat::Gif,
+                NameMode::Plain
+            ),
+            "photo.svg"
+        );
+    }
+
+    #[test]
+    fn random_mode_generates_tidy_names() {
+        let input = Path::new("C:/photos/photo.jpeg");
+        for _ in 0..50 {
+            let name = result_name(
+                input,
+                10 * MIB,
+                Method::PngChunks,
+                AnimationFormat::Gif,
+                NameMode::Random,
+            );
+            let stem = name
+                .strip_suffix(".png")
+                .unwrap_or_else(|| panic!("нет расширения: {name}"));
+            assert!(is_tidy_random_stem(stem), "неприличное имя: {name}");
+        }
+        let renamed = with_random_stem(Path::new("C:/photos/photo_with_payload.png"));
+        assert_eq!(renamed.extension().and_then(|v| v.to_str()), Some("png"));
+        let stem = renamed.file_stem().and_then(|v| v.to_str()).unwrap();
+        assert!(is_tidy_random_stem(stem), "имя: {stem}");
+    }
+
+    /// `quiet-river-4821`: два слова из списков и число от 1000 до 9999.
+    fn is_tidy_random_stem(stem: &str) -> bool {
+        let parts: Vec<&str> = stem.split('-').collect();
+        parts.len() == 3
+            && NAME_ADJECTIVES.contains(&parts[0])
+            && NAME_NOUNS.contains(&parts[1])
+            && parts[2].len() == 4
+            && parts[2]
+                .parse::<u32>()
+                .is_ok_and(|value| (1000..10_000).contains(&value))
     }
 
     #[test]
@@ -569,11 +1009,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("photo.png");
         fs::write(&input, b"x").unwrap();
-        let first = output_path(&input, MIB, Method::Padding, AnimationFormat::Gif, None).unwrap();
+        let first = output_path(
+            &input,
+            MIB,
+            Method::Padding,
+            AnimationFormat::Gif,
+            None,
+            NameMode::Size,
+        )
+        .unwrap();
         assert_eq!(first, dir.path().join("photo_1MB.png"));
         fs::write(&first, b"y").unwrap();
-        let second = output_path(&input, MIB, Method::Padding, AnimationFormat::Gif, None).unwrap();
+        let second = output_path(
+            &input,
+            MIB,
+            Method::Padding,
+            AnimationFormat::Gif,
+            None,
+            NameMode::Size,
+        )
+        .unwrap();
         assert_eq!(second, dir.path().join("photo_1MB-2.png"));
+    }
+
+    #[test]
+    fn plain_mode_next_to_the_source_picks_a_free_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("photo.png");
+        fs::write(&input, b"x").unwrap();
+        let output = output_path(
+            &input,
+            MIB,
+            Method::Padding,
+            AnimationFormat::Gif,
+            None,
+            NameMode::Plain,
+        )
+        .unwrap();
+        // Исходник остаётся нетронутым: имя получает суффикс, а не совпадает с ним.
+        assert_eq!(output, dir.path().join("photo-2.png"));
     }
 
     #[test]
@@ -592,6 +1066,7 @@ mod tests {
                 Method::Padding,
                 AnimationFormat::Gif,
                 Some(&out_dir),
+                NameMode::Size,
             )
             .unwrap(),
             BatchItem::new(
@@ -600,6 +1075,7 @@ mod tests {
                 Method::Padding,
                 AnimationFormat::Gif,
                 Some(&out_dir),
+                NameMode::Size,
             )
             .unwrap(),
         ];
@@ -640,6 +1116,7 @@ mod tests {
                 Method::PngChunks,
                 AnimationFormat::Gif,
                 Some(&out_dir),
+                NameMode::Size,
             )
             .unwrap(),
             BatchItem::new(
@@ -648,6 +1125,7 @@ mod tests {
                 Method::PngChunks,
                 AnimationFormat::Gif,
                 Some(&out_dir),
+                NameMode::Size,
             )
             .unwrap(),
         ];
@@ -690,6 +1168,7 @@ mod tests {
             Method::Padding,
             AnimationFormat::Gif,
             None,
+            NameMode::Size,
         )
         .unwrap_err();
         assert_eq!(error, "файл не найден");
@@ -744,6 +1223,52 @@ mod tests {
         .build(&[first.clone(), second.clone()]);
         assert_eq!(same_target.items[0].target, MIB + 1);
         assert_ne!(same_target.items[0].output, same_target.items[1].output);
+    }
+
+    #[test]
+    fn plan_applies_name_mode_to_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&first, b"a").unwrap();
+        fs::write(&second, b"b").unwrap();
+        let out_dir = dir.path().join("out");
+
+        let plain = PumpPlan::new(
+            Method::Padding,
+            AnimationFormat::Gif,
+            Some(out_dir.clone()),
+            TargetMode::Exact,
+            &[1.0],
+        )
+        .unwrap()
+        .with_names(NameMode::Plain)
+        .build(&[first.clone(), second.clone()]);
+        assert_eq!(plain.items[0].output, out_dir.join("first.txt"));
+        assert_eq!(plain.items[1].output, out_dir.join("second.txt"));
+
+        let random = PumpPlan::new(
+            Method::Padding,
+            AnimationFormat::Gif,
+            Some(out_dir.clone()),
+            TargetMode::Exact,
+            &[1.0],
+        )
+        .unwrap()
+        .with_names(NameMode::Random)
+        .build(&[first.clone(), second.clone()]);
+        assert!(random.rejected.is_empty());
+        // Случайные имена не должны ни совпадать, ни содержать размер.
+        assert_ne!(random.items[0].output, random.items[1].output);
+        for item in &random.items {
+            let stem = item
+                .output
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap();
+            assert!(is_tidy_random_stem(stem), "имя: {stem}");
+            assert!(!stem.contains("MB"), "в имени остался размер: {stem}");
+        }
     }
 
     #[test]
@@ -832,5 +1357,112 @@ mod tests {
         assert!(report.cancelled);
         assert_eq!(report.created(), 0);
         assert_eq!(report.skipped(), 2);
+    }
+
+    #[test]
+    fn plan_generate_repeats_every_size_and_keeps_names_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = plan_generate(
+            "seed",
+            GeneratedKind::Bin,
+            NameMode::Size,
+            Some(dir.path()),
+            &[MIB, MIB / 2],
+            2,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 4);
+        let names: Vec<PathBuf> = items.iter().map(|item| item.output.clone()).collect();
+        assert_eq!(names[0], dir.path().join("seed_1MB.bin"));
+        assert_eq!(names[1], dir.path().join("seed_1MB-2.bin"));
+        assert_eq!(names[2], dir.path().join("seed_0.5MB.bin"));
+        assert_eq!(names[3], dir.path().join("seed_0.5MB-2.bin"));
+        assert_eq!(items[0].target, MIB);
+        assert_eq!(items[2].target, MIB / 2);
+        assert!(items.iter().all(|item| item.payloads.is_empty()));
+    }
+
+    #[test]
+    fn generate_one_writes_exactly_the_requested_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("made.bin");
+        let item = GenerateItem {
+            output: output.clone(),
+            target: 64 * 1024,
+            kind: GeneratedKind::Bin,
+            payloads: Vec::new(),
+        };
+        let written = generate_one(
+            &item,
+            &ContainerOptions::default(),
+            payload::MIN_COPIES,
+            &Job::quiet(),
+        )
+        .unwrap();
+        assert_eq!(written, item.target);
+        assert_eq!(fs::metadata(&output).unwrap().len(), item.target);
+    }
+
+    #[test]
+    fn generate_one_hides_payload_without_growing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        fs::write(&secret, b"hidden payload\n").unwrap();
+        let output = dir.path().join("made.png");
+        let item = GenerateItem {
+            output: output.clone(),
+            target: 256 * 1024,
+            kind: GeneratedKind::Png,
+            payloads: vec![secret],
+        };
+        let options = ContainerOptions::default();
+        let written = generate_one(&item, &options, payload::MIN_COPIES, &Job::quiet()).unwrap();
+
+        assert_eq!(written, item.target);
+        assert_eq!(fs::metadata(&output).unwrap().len(), item.target);
+        assert!(image::open(&output).is_ok(), "PNG остаётся рабочим");
+        let (parsed, copies, _carrier) = payload::extract_payload(&output, None).unwrap();
+        assert_eq!(parsed.name, "secret.txt");
+        assert_eq!(parsed.payload, b"hidden payload\n");
+        assert!(copies >= payload::MIN_COPIES);
+    }
+
+    #[test]
+    fn generate_one_rejects_a_target_smaller_than_the_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        fs::write(&secret, vec![7_u8; 32 * 1024]).unwrap();
+        let item = GenerateItem {
+            output: dir.path().join("made.png"),
+            target: 16 * 1024,
+            kind: GeneratedKind::Png,
+            payloads: vec![secret],
+        };
+        let error = generate_one(
+            &item,
+            &ContainerOptions::default(),
+            payload::MIN_COPIES,
+            &Job::quiet(),
+        )
+        .unwrap_err();
+        assert!(error.contains("минимум"), "{error}");
+        assert!(!item.output.exists());
+    }
+
+    #[test]
+    fn generated_names_clean_up_the_base() {
+        assert_eq!(
+            generated_name("  ", MIB, GeneratedKind::Gif, NameMode::Size),
+            "file_1MB.gif"
+        );
+        assert_eq!(
+            generated_name("photo.", MIB, GeneratedKind::Jpeg, NameMode::Plain),
+            "photo.jpg"
+        );
+        let random = generated_name("photo", MIB, GeneratedKind::Webp, NameMode::Random);
+        assert!(random.ends_with(".webp"), "{random}");
+        assert!(!random.starts_with("photo"), "{random}");
     }
 }

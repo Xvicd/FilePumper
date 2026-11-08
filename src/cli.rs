@@ -3,9 +3,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::batch::{self, BatchItem, BatchReport, ItemResult, PumpPlan, TargetMode};
+use crate::batch::{self, BatchItem, BatchReport, ItemResult, NameMode, PumpPlan, TargetMode};
 use crate::payload::{self, ContainerOptions};
-use crate::pumper::{AnimationFormat, Method};
+use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::report;
 use crate::scan;
 use crate::util::{
@@ -24,6 +24,7 @@ FilePumper
 Накачка файлов (можно сразу несколько):
   file-pumper-cli pump <вход>... --size <МБ[,МБ...]>
                                    [--size-mode exact|at-least|add]
+                                   [--names size|plain|random]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--method animation|png-chunks|upscale|svg|office|padding]
                                    [--format gif|png|webp]
@@ -36,6 +37,9 @@ FilePumper
                  (дробную часть пишите через точку: 1.5)
   --size-mode    exact — ровно столько (по умолчанию), at-least — не меньше,
                  add — прибавить указанный объём к каждому файлу
+  --names        имена результатов: size — с размером (photo_10MB.png,
+                 по умолчанию), plain — без размера (photo.png), random —
+                 случайное имя (quiet-river-4821.png)
   --from-dir     добавить все файлы папки, --recursive — вместе с подпапками
   --ext          фильтр расширений для --from-dir (например png,jpg)
   --from-file    текстовый список путей (по одному в строке, # — комментарий)
@@ -45,12 +49,37 @@ FilePumper
   --verify       после записи проверить размер результата
   --report       сохранить отчёт CSV или JSON (формат по расширению)
 
+Создать файл с нуля (исходник не нужен; внутрь можно спрятать нагрузку):
+  file-pumper-cli generate --size <МБ[,МБ...]> [--count N]
+                                   [--type bin|png|gif|jpg|webp]
+                                   [--name ОСНОВА] [--names size|plain|random]
+                                   [--out-dir ПАПКА] [--output ФАЙЛ]
+                                   [--payload ФАЙЛ ...] [--copies 1..3]
+                                   [--compress] [--password ПАРОЛЬ]
+                                   [--dry-run] [--verify]
+                                   [--report ОТЧЁТ.csv|ОТЧЁТ.json]
+
+  Содержимое — криптослучайные байты, поэтому архиватор файл не сожмёт:
+  zip, gzip и 7z вернут примерно тот же объём.
+  --type         bin — обычный файл (по умолчанию); png, gif, jpg, webp —
+                 валидная картинка: объём лежит внутри её структуры
+  --count N      сколько файлов создать для каждого размера: --size 5,10
+                 --count 2 даёт четыре файла (по два на каждый размер)
+  --name         основа имени без расширения (по умолчанию file)
+  --payload      что спрятать внутрь: контейнер встаёт в заранее посчитанное
+                 место, поэтому размер файла остаётся ровно заданным
+  Примеры: file-pumper-cli generate --size 10 --type png --name photo
+           file-pumper-cli generate --size 5,20 --count 2 --type gif
+           file-pumper-cli generate --size 10 --payload secret.pdf --password 1234
+
 Спрятать файлы в картинке (можно несколько носителей и нагрузок):
   file-pumper-cli embed <носитель>... --payload <файл> [--payload <файл>...]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--copies 1..3] [--compress] [--password ПАРОЛЬ]
+                                   [--names random]
                                    [--dry-run] [--report ОТЧЁТ.csv|ОТЧЁТ.json]
   Несколько --payload упаковываются в один ZIP-бандл внутри контейнера.
+  --names random даёт результатам случайные имена (quiet-river-4821.png).
 
 Извлечь файлы из картинки (можно несколько носителей):
   file-pumper-cli extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ]
@@ -76,6 +105,7 @@ struct Flags {
     positional: Vec<String>,
     sizes: Vec<f64>,
     size_mode: TargetMode,
+    names: NameMode,
     method: Method,
     format: AnimationFormat,
     copies: usize,
@@ -93,6 +123,9 @@ struct Flags {
     jobs: usize,
     report_path: Option<PathBuf>,
     verify: bool,
+    generated: GeneratedKind,
+    base_name: String,
+    count: usize,
 }
 
 fn parse_method(value: &str) -> Result<Method, String> {
@@ -140,6 +173,7 @@ impl Flags {
             positional: Vec::new(),
             sizes: Vec::new(),
             size_mode: TargetMode::Exact,
+            names: NameMode::Size,
             method: Method::Animation,
             format: AnimationFormat::Gif,
             copies: 1,
@@ -157,6 +191,9 @@ impl Flags {
             jobs: 1,
             report_path: None,
             verify: false,
+            generated: GeneratedKind::default(),
+            base_name: "file".to_owned(),
+            count: 1,
         };
         let mut iterator = args.iter();
         let next = |name: &str, iterator: &mut std::slice::Iter<'_, String>| {
@@ -174,6 +211,10 @@ impl Flags {
                 "--size-mode" => {
                     let raw = next("--size-mode", &mut iterator)?;
                     flags.size_mode = TargetMode::parse(&raw)?;
+                }
+                "--names" | "--name-mode" => {
+                    let raw = next("--names", &mut iterator)?;
+                    flags.names = NameMode::parse(&raw)?;
                 }
                 "--copies" => {
                     let raw = next("--copies", &mut iterator)?;
@@ -224,6 +265,21 @@ impl Flags {
                 "--format" => {
                     let raw = next("--format", &mut iterator)?;
                     flags.format = parse_format(&raw)?;
+                }
+                "--type" | "--kind" => {
+                    let raw = next("--type", &mut iterator)?;
+                    flags.generated = GeneratedKind::parse(&raw)?;
+                }
+                "--name" | "--base-name" => {
+                    let raw = next("--name", &mut iterator)?;
+                    flags.base_name = raw;
+                }
+                "--count" => {
+                    let raw = next("--count", &mut iterator)?;
+                    flags.count = raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("Неверное число файлов: {raw}"))?
+                        .clamp(1, 64);
                 }
                 other if other.starts_with("--") => {
                     return Err(format!("Неизвестный параметр: {other}"));
@@ -318,6 +374,7 @@ pub fn execute(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(rest)?;
     match command.as_str() {
         "pump" => command_pump(&flags),
+        "generate" | "make" => command_generate(&flags),
         "embed" => command_embed(&flags),
         "extract" => command_extract(&flags),
         "inspect" => command_inspect(&flags),
@@ -351,7 +408,8 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
         flags.out_dir.clone(),
         flags.size_mode,
         &flags.sizes,
-    )?;
+    )?
+    .with_names(flags.names);
     plan.ensure_sizes_match(inputs.len())?;
 
     let mut planned = match explicit_output {
@@ -511,6 +569,158 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
     Ok(())
 }
 
+/// Что лежит внутри будущего файла — для отчёта и `--dry-run`.
+fn payloads_label(payloads: &[PathBuf]) -> String {
+    match payloads.len() {
+        0 => "нет".to_owned(),
+        1 => payloads[0].display().to_string(),
+        count => format!("бандл из {count} файлов"),
+    }
+}
+
+fn command_generate(flags: &Flags) -> Result<(), String> {
+    for payload in &flags.payloads {
+        if !payload.is_file() {
+            return Err(format!("Файл нагрузки не найден: {}", payload.display()));
+        }
+    }
+    let targets = batch::targets_from_mb(&flags.sizes)?;
+    let mut items = batch::plan_generate(
+        &flags.base_name,
+        flags.generated,
+        flags.names,
+        flags.out_dir.as_deref(),
+        &targets,
+        flags.count,
+        &flags.payloads,
+    )?;
+
+    if let Some(output) = flags.output.as_ref() {
+        if items.len() > 1 {
+            return Err(
+                "Параметр --output работает только для одного файла: поставьте --count 1 и один --size."
+                    .to_owned(),
+            );
+        }
+        for payload in &flags.payloads {
+            if crate::util::same_file(payload, output) {
+                return Err(
+                    "Итоговый файл совпадает с файлом нагрузки. Выберите другое имя.".to_owned(),
+                );
+            }
+        }
+        items[0].output = output.clone();
+    }
+
+    if flags.dry_run {
+        println!(
+            "План: {} файл(ов), тип «{}», имена «{}»",
+            items.len(),
+            flags.generated.title(),
+            flags.names.label()
+        );
+        for item in &items {
+            println!(
+                "  {} ({}){}",
+                item.output.display(),
+                batch::size_label(item.target),
+                if item.kind.is_image() {
+                    " — валидная картинка"
+                } else {
+                    " — случайные данные"
+                }
+            );
+        }
+        println!("  внутрь: {}", payloads_label(&flags.payloads));
+        return Ok(());
+    }
+
+    let total = items.len();
+    let token = CancelToken::new();
+    let progress = progress_printer();
+    let options = flags.options();
+    let mut results: Vec<(PathBuf, ItemResult)> = Vec::with_capacity(total);
+    for (index, item) in items.iter().enumerate() {
+        if token.is_cancelled() {
+            break;
+        }
+        let local = |percent: f32, text: &str| {
+            let within = percent.clamp(0.0, 100.0) / 100.0;
+            let overall = ((index as f32 + within) / total as f32).clamp(0.0, 1.0);
+            progress(overall, &format!("{}/{total}: {text}", index + 1));
+        };
+        let job = Job::new(&local, &token);
+        let result = match batch::generate_one(item, &options, flags.copies, &job) {
+            Ok(size) => ItemResult::Created {
+                output: item.output.clone(),
+                size,
+            },
+            Err(message) => ItemResult::Failed { message },
+        };
+        results.push((item.output.clone(), result));
+    }
+    eprintln!();
+
+    if flags.verify {
+        for (index, (path, result)) in results.iter_mut().enumerate() {
+            let ItemResult::Created { size, .. } = result else {
+                continue;
+            };
+            let expected = items[index].target;
+            let actual = std::fs::metadata(&*path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            if actual != expected || *size != expected {
+                *result = ItemResult::Failed {
+                    message: format!("проверка размера не прошла: {actual} из {expected} байт"),
+                };
+            }
+        }
+    }
+
+    let batch_report = BatchReport {
+        cancelled: token.is_cancelled(),
+        items: results,
+    };
+
+    for (path, result) in &batch_report.items {
+        match result {
+            ItemResult::Created { output, size } => {
+                let note = if flags.payloads.is_empty() {
+                    String::new()
+                } else {
+                    format!(", внутрь: {}", payloads_label(&flags.payloads))
+                };
+                println!(
+                    "Готово: {} ({:.2} МБ{note})",
+                    output.display(),
+                    *size as f64 / MIB as f64
+                );
+            }
+            ItemResult::Failed { message } => {
+                eprintln!("Ошибка: {} — {message}", path.display());
+            }
+            ItemResult::Skipped { reason } => {
+                eprintln!("Пропущено: {} — {reason}", path.display());
+            }
+        }
+    }
+
+    if let Some(path) = flags.report_path.as_deref() {
+        report::write_report(path, &batch_report)?;
+        println!("Отчёт: {}", path.display());
+    }
+
+    if batch_report.cancelled {
+        return Err(CANCELLED_MESSAGE.to_owned());
+    }
+    let failed = batch_report.failed();
+    if failed > 0 {
+        return Err(format!("Не удалось создать {failed} из {total} файлов."));
+    }
+    Ok(())
+}
+
 fn command_embed(flags: &Flags) -> Result<(), String> {
     let mut carriers = flags.paths();
     let mut payloads = flags.payloads.clone();
@@ -565,6 +775,11 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
             Some(path) => path,
             None => {
                 let suggested = payload::default_output_path(carrier);
+                let suggested = if flags.names == NameMode::Random {
+                    batch::with_random_stem(&suggested)
+                } else {
+                    suggested
+                };
                 let candidate = match flags.out_dir.as_deref() {
                     Some(directory) => directory.join(
                         suggested

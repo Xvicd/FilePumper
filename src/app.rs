@@ -7,9 +7,9 @@ use std::thread;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::batch::{self, BatchItem, PumpPlan, TargetMode};
+use crate::batch::{self, BatchItem, NameMode, PumpPlan, TargetMode};
 use crate::payload::{self, ContainerOptions, PayloadSummary};
-use crate::pumper::{AnimationFormat, Method};
+use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::scan;
 use crate::util::{reveal_in_explorer, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB};
 
@@ -51,6 +51,12 @@ struct Settings {
     out_dir: Option<PathBuf>,
     embed_compress: bool,
     embed_copies: usize,
+    name_size: bool,
+    name_random: bool,
+    gen_kind: usize,
+    gen_base: String,
+    gen_count: usize,
+    gen_attach: bool,
 }
 
 impl Default for Settings {
@@ -63,6 +69,12 @@ impl Default for Settings {
             out_dir: None,
             embed_compress: false,
             embed_copies: 1,
+            name_size: true,
+            name_random: false,
+            gen_kind: 0,
+            gen_base: "file".to_owned(),
+            gen_count: 1,
+            gen_attach: false,
         }
     }
 }
@@ -94,6 +106,17 @@ fn format_index(format: AnimationFormat) -> usize {
     }
 }
 
+fn generated_kind_from_index(index: usize) -> GeneratedKind {
+    GeneratedKind::ALL.get(index).copied().unwrap_or_default()
+}
+
+fn generated_kind_index(kind: GeneratedKind) -> usize {
+    GeneratedKind::ALL
+        .iter()
+        .position(|item| *item == kind)
+        .unwrap_or(0)
+}
+
 pub struct PumperApp {
     rows: Vec<BatchRow>,
     out_dir: Option<PathBuf>,
@@ -112,6 +135,12 @@ pub struct PumperApp {
     embed_compress: bool,
     embed_password: String,
     embed_copies: usize,
+    name_size: bool,
+    name_random: bool,
+    gen_kind: GeneratedKind,
+    gen_base: String,
+    gen_count: usize,
+    gen_attach: bool,
     preview: Option<Preview>,
 }
 
@@ -135,6 +164,12 @@ impl Default for PumperApp {
             embed_compress: false,
             embed_password: String::new(),
             embed_copies: 1,
+            name_size: true,
+            name_random: false,
+            gen_kind: GeneratedKind::default(),
+            gen_base: "file".to_owned(),
+            gen_count: 1,
+            gen_attach: false,
             preview: None,
         }
     }
@@ -168,6 +203,12 @@ impl PumperApp {
             out_dir: self.out_dir.clone(),
             embed_compress: self.embed_compress,
             embed_copies: self.embed_copies,
+            name_size: self.name_size,
+            name_random: self.name_random,
+            gen_kind: generated_kind_index(self.gen_kind),
+            gen_base: self.gen_base.clone(),
+            gen_count: self.gen_count,
+            gen_attach: self.gen_attach,
         }
     }
 
@@ -184,6 +225,75 @@ impl PumperApp {
         self.out_dir = settings.out_dir;
         self.embed_compress = settings.embed_compress;
         self.embed_copies = settings.embed_copies.clamp(1, 3);
+        self.name_size = settings.name_size;
+        self.name_random = settings.name_random;
+        self.gen_kind = generated_kind_from_index(settings.gen_kind);
+        if !settings.gen_base.trim().is_empty() {
+            self.gen_base = settings.gen_base;
+        }
+        self.gen_count = settings.gen_count.clamp(1, 64);
+        self.gen_attach = settings.gen_attach;
+    }
+
+    /// Как называть результаты: с размером в имени, без него или случайно.
+    fn name_mode(&self) -> NameMode {
+        if self.name_random {
+            NameMode::Random
+        } else if self.name_size {
+            NameMode::Size
+        } else {
+            NameMode::Plain
+        }
+    }
+
+    /// Пример имени результата для текущих настроек (показывается под кнопками).
+    fn example_name(&self) -> String {
+        let mb = self
+            .target_mb
+            .trim()
+            .replace(',', ".")
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(10.0);
+        batch::result_name(
+            Path::new("photo.png"),
+            (mb * MIB as f64) as u64,
+            self.method,
+            self.animation_format,
+            self.name_mode(),
+        )
+    }
+
+    /// Размер из поля «Размер» в мегабайтах (запятая тоже работает).
+    fn target_mb_value(&self) -> Option<f64> {
+        self.target_mb
+            .trim()
+            .replace(',', ".")
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+    }
+
+    /// Пример имени файла, созданного «с нуля» (показывается под кнопкой).
+    fn generated_example_name(&self) -> String {
+        let target = (self.target_mb_value().unwrap_or(10.0) * MIB as f64) as u64;
+        match self.name_mode() {
+            // Случайное имя менялось бы каждый кадр, поэтому показываем образец.
+            NameMode::Random => format!("quiet-river-4821.{}", self.gen_kind.extension()),
+            names => batch::generated_name(&self.gen_base, target, self.gen_kind, names),
+        }
+    }
+
+    /// Имя результата встраивания: `<носитель>_with_payload.<ext>`, а при
+    /// включённых случайных именах — случайная основа с тем же расширением.
+    fn embed_suggested_path(&self, carrier: &Path) -> PathBuf {
+        let suggested = payload::default_output_path(carrier);
+        if self.name_random {
+            batch::with_random_stem(&suggested)
+        } else {
+            suggested
+        }
     }
 
     /// Носитель для предпросмотра и извлечения — первый в списке.
@@ -244,7 +354,7 @@ impl PumperApp {
         let format = self.animation_format;
         let out_dir = self.out_dir.clone();
         let plan = match PumpPlan::new(method, format, out_dir.clone(), self.size_mode, &[mb]) {
-            Ok(plan) => plan,
+            Ok(plan) => plan.with_names(self.name_mode()),
             Err(message) => {
                 self.result_dialog = Some((false, message, None));
                 return;
@@ -344,6 +454,146 @@ impl PumperApp {
         });
     }
 
+    /// Создаёт файл «с нуля»: размер из пункта 3, тип и основа имени — из пункта 5.
+    /// Если включено «Прицепить второе дно», внутрь уходит нагрузка из пункта 4.
+    fn start_generate(&mut self) {
+        let Some(mb) = self.target_mb_value() else {
+            self.result_dialog = Some((false, "Введите корректный размер в МБ.".to_owned(), None));
+            return;
+        };
+        if self.gen_attach && self.payloads.is_empty() {
+            self.result_dialog = Some((
+                false,
+                "Для второго дна выберите файлы нагрузки в пункте 4.".to_owned(),
+                None,
+            ));
+            return;
+        }
+        if self.gen_attach {
+            if let Some(bad) = self.payloads.iter().find(|path| !path.is_file()) {
+                self.result_dialog =
+                    Some((false, format!("Файл не найден: {}", bad.display()), None));
+                return;
+            }
+        }
+        if let Some(directory) = self.out_dir.as_ref() {
+            if !directory.is_dir() {
+                if let Err(err) = std::fs::create_dir_all(directory) {
+                    self.result_dialog =
+                        Some((false, format!("Не удалось создать папку: {err}"), None));
+                    return;
+                }
+            }
+        }
+        let targets = match batch::targets_from_mb(&[mb]) {
+            Ok(targets) => targets,
+            Err(message) => {
+                self.result_dialog = Some((false, message, None));
+                return;
+            }
+        };
+        let payloads = if self.gen_attach {
+            self.payloads.clone()
+        } else {
+            Vec::new()
+        };
+        let items = match batch::plan_generate(
+            &self.gen_base,
+            self.gen_kind,
+            self.name_mode(),
+            self.out_dir.as_deref(),
+            &targets,
+            self.gen_count,
+            &payloads,
+        ) {
+            Ok(items) => items,
+            Err(message) => {
+                self.result_dialog = Some((false, message, None));
+                return;
+            }
+        };
+        if items.is_empty() {
+            self.result_dialog = Some((false, "Нечего создавать.".to_owned(), None));
+            return;
+        }
+
+        let options = ContainerOptions {
+            compress: self.embed_compress,
+            password: password_or_none(&self.embed_password),
+            bundle: false,
+        };
+        let copies = self.embed_copies.clamp(1, 3);
+        let (sender, cancel) = self.begin_job();
+        self.status = "Создание файлов...".to_owned();
+        thread::spawn(move || {
+            let total = items.len();
+            let mut created = 0_usize;
+            let mut failed = 0_usize;
+            let mut cancelled = false;
+            let mut last_error: Option<String> = None;
+            let mut folder: Option<PathBuf> = None;
+            // Общий контекст нужен только ради флага отмены: прогресс каждого
+            // файла пересчитывается в общий через дочерний контекст.
+            let silent = |_: f32, _: &str| {};
+            let job = Job::new(&silent, &cancel);
+
+            for (position, item) in items.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let progress_sender = sender.clone();
+                let progress = move |percent: f32, text: &str| {
+                    let within = percent.clamp(0.0, 100.0) / 100.0;
+                    let overall = ((position as f32 + within) / total as f32).clamp(0.0, 1.0);
+                    let _ = progress_sender.send(WorkerMessage::Progress(
+                        overall,
+                        format!("Файл {}/{}: {text}", position + 1, total),
+                    ));
+                };
+                let item_job = job.child(&progress);
+                match batch::generate_one(item, &options, copies, &item_job) {
+                    Ok(_) => {
+                        created += 1;
+                        folder = item.output.parent().map(PathBuf::from);
+                    }
+                    Err(message) if message == CANCELLED_MESSAGE => {
+                        cancelled = true;
+                        break;
+                    }
+                    Err(message) => {
+                        failed += 1;
+                        last_error = Some(message);
+                    }
+                }
+            }
+
+            let mut text = if cancelled {
+                format!("Создание отменено.\nГотово файлов: {created} из {total}.")
+            } else {
+                format!("Готово файлов: {created} из {total}.")
+            };
+            if failed > 0 {
+                text.push_str(&format!("\nС ошибкой: {failed}."));
+            }
+            if let Some(message) = last_error {
+                text.push_str(&format!("\nПоследняя ошибка: {message}"));
+            }
+            match folder.as_ref() {
+                Some(directory) => {
+                    text.push_str(&format!("\nПапка результатов: {}", directory.display()));
+                }
+                None => text.push_str("\nФайлы созданы в рабочей папке."),
+            }
+            let _ = sender.send(WorkerMessage::BatchFinished {
+                ok: !cancelled && failed == 0,
+                cancelled,
+                text,
+                folder,
+            });
+        });
+    }
+
     fn start_inspect(&mut self) {
         let Some(carrier) = self.primary_carrier() else {
             self.result_dialog = Some((false, "Выберите файл-носитель.".to_owned(), None));
@@ -400,7 +650,7 @@ impl PumperApp {
         let mut reservations = Reservations::new();
         if self.carriers.len() == 1 && self.payloads.len() == 1 {
             let carrier = self.carriers[0].clone();
-            let suggested = payload::default_output_path(&carrier);
+            let suggested = self.embed_suggested_path(&carrier);
             let Some(output) = rfd::FileDialog::new()
                 .set_directory(carrier.parent().unwrap_or_else(|| Path::new(".")))
                 .set_file_name(
@@ -425,7 +675,7 @@ impl PumperApp {
                 }
             }
             for carrier in &self.carriers {
-                let suggested = payload::default_output_path(carrier);
+                let suggested = self.embed_suggested_path(carrier);
                 let candidate = match self.out_dir.as_ref() {
                     Some(directory) => directory.join(
                         suggested
@@ -873,6 +1123,37 @@ impl eframe::App for PumperApp {
 
                     ui.add_space(5.0);
                     ui.horizontal(|ui| {
+                        ui.label("Имена результатов:");
+                        let label = if self.name_size {
+                            "Убрать размер из имени"
+                        } else {
+                            "Вернуть размер в имя"
+                        };
+                        if ui
+                            .add_enabled(
+                                !self.busy && !self.name_random,
+                                egui::Button::new(label),
+                            )
+                            .on_hover_text(
+                                "Обычно к имени дописывается размер: photo_10MB.png",
+                            )
+                            .clicked()
+                        {
+                            self.name_size = !self.name_size;
+                        }
+                        ui.add_enabled(
+                            !self.busy,
+                            egui::Checkbox::new(&mut self.name_random, "Случайное имя файла"),
+                        )
+                        .on_hover_text(
+                            "Нейтральное имя без размера и без исходного названия: \
+                             quiet-river-4821.png",
+                        );
+                    });
+                    ui.weak(format!("Пример: {}", self.example_name()));
+
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
                         if ui
                             .add_enabled(!self.busy, egui::Button::new("Папка результатов..."))
                             .clicked()
@@ -986,6 +1267,63 @@ impl eframe::App for PumperApp {
                     ui.weak(
                         "Данные кладутся внутрь структуры файла: чанки PNG, сегменты APP15 JPEG, комментарий GIF, RIFF-чанк WebP, metadata SVG. Картинка остаётся рабочей, поэтому сервер принимает файл целиком.",
                     );
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.heading("5. Создать файл с нуля");
+                    ui.label(
+                        "Нужный размер без исходника: внутри криптослучайные байты, поэтому zip, \
+                         gzip и 7z файл не сожмут.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Тип файла:");
+                        egui::ComboBox::from_id_salt("generated_kind")
+                            .selected_text(self.gen_kind.title())
+                            .show_ui(ui, |ui| {
+                                for kind in GeneratedKind::ALL {
+                                    ui.selectable_value(&mut self.gen_kind, kind, kind.title());
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Основа имени:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.gen_base)
+                                .hint_text("file")
+                                .desired_width(140.0),
+                        );
+                        ui.label("Файлов на размер:");
+                        ui.add(egui::DragValue::new(&mut self.gen_count).range(1..=32));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            !self.busy && !self.payloads.is_empty(),
+                            egui::Checkbox::new(&mut self.gen_attach, "Прицепить второе дно"),
+                        )
+                        .on_hover_text(
+                            "Спрятать нагрузку из пункта 4 внутрь созданного файла: контейнер \
+                             встаёт в заранее посчитанное место, поэтому размер не увеличивается",
+                        );
+                        if self.payloads.is_empty() {
+                            ui.weak("сначала выберите нагрузку в пункте 4");
+                        } else {
+                            ui.weak(format!("нагрузок: {}", self.payloads.len()));
+                        }
+                    });
+                    ui.weak(format!(
+                        "Размер берётся из пункта 3 ({} МБ), пример имени: {}",
+                        self.target_mb.trim(),
+                        self.generated_example_name()
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Создать файл..."))
+                            .clicked()
+                        {
+                            self.start_generate();
+                        }
+                        ui.weak("файлы попадают в папку результатов из пункта 3");
+                    });
                 });
         });
 

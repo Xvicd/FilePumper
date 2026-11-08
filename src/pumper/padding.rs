@@ -75,11 +75,21 @@ pub fn append_png_padding(path: &Path, target: u64, job: &Job<'_>) -> Result<(),
     io::copy(&mut prefix, temp.as_file_mut()).map_err(|err| err.to_string())?;
     drop(prefix);
 
-    let bytes_needed = target - current;
-    let mut written = 0_u64;
-    while written < bytes_needed {
+    // Каждый чанк — это 12 байт служебных полей (длина, тип, CRC) и полезные
+    // данные, поэтому в цель входят и они, иначе файл выйдет чуть больше.
+    let needed = target - current;
+    let mut chunks = needed.div_ceil(PNG_CHUNK_LIMIT as u64);
+    while chunks > 0 && 12 * chunks >= needed {
+        chunks -= 1;
+    }
+    if chunks == 0 {
+        return Err("Для добивки PNG нужно минимум 13 байт запаса.".to_owned());
+    }
+    let mut remaining = needed - 12 * chunks;
+    let data_len = remaining;
+    while remaining > 0 {
         job.check()?;
-        let payload_size = (bytes_needed - written).min(PNG_CHUNK_LIMIT as u64) as usize;
+        let payload_size = remaining.min(PNG_CHUNK_LIMIT as u64) as usize;
         let payload = random_bytes(payload_size)?;
         let chunk_type = b"caBX";
         let chunk_len =
@@ -93,9 +103,9 @@ pub fn append_png_padding(path: &Path, target: u64, job: &Job<'_>) -> Result<(),
         hasher.update(&payload);
         temp.write_all(&hasher.finalize().to_be_bytes())
             .map_err(|err| err.to_string())?;
-        written += payload_size as u64;
+        remaining -= payload_size as u64;
         job.report(
-            written as f32 / bytes_needed as f32 * 100.0,
+            (data_len - remaining) as f32 / data_len.max(1) as f32 * 100.0,
             "Добавление приватных PNG-чанков...",
         );
     }
@@ -187,21 +197,40 @@ mod tests {
         let image = image::RgbImage::from_pixel(2, 2, image::Rgb([20, 30, 40]));
         image.save(&path).unwrap();
         let original_len = fs::metadata(&path).unwrap().len();
-        append_png_padding(&path, original_len + 17, &Job::quiet()).unwrap();
+        let target = original_len + 17;
+        append_png_padding(&path, target, &Job::quiet()).unwrap();
 
         let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, target);
         assert!(image::open(&path).is_ok());
         let chunk_start = (original_len - 12) as usize;
         assert_eq!(&bytes[chunk_start + 4..chunk_start + 8], b"caBX");
-        let payload = &bytes[chunk_start + 8..chunk_start + 8 + 17];
+        // Прирост в 17 байт — это 12 байт служебных полей чанка и 5 байт данных.
+        let payload = &bytes[chunk_start + 8..chunk_start + 13];
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(b"caBX");
         hasher.update(payload);
         let expected = hasher.finalize().to_be_bytes();
         assert_eq!(
-            &bytes[chunk_start + 8 + 17..chunk_start + 12 + 17],
+            &bytes[chunk_start + 13..chunk_start + 17],
             expected.as_slice()
         );
+    }
+
+    #[test]
+    fn png_padding_with_several_chunks_lands_exactly_on_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.png");
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([7, 8, 9]));
+        image.save(&path).unwrap();
+        let start = fs::metadata(&path).unwrap().len();
+        // Два полных чанка и хвост: 12 байт служебных полей каждого чанка
+        // входят в цель, поэтому файл не должен перерасти её.
+        let target = start + 2 * PNG_CHUNK_LIMIT as u64 + 1000;
+        append_png_padding(&path, target, &Job::quiet()).unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().len(), target);
+        assert!(image::open(&path).is_ok());
     }
 
     #[test]

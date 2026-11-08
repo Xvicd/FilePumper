@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 
 pub use bundle::BundleEntry;
 pub use carrier::{detect_carrier, Carrier};
-pub use format::{ContainerOptions, HeaderInfo, ParsedContainer, PayloadInfo};
+pub use format::{
+    ContainerOptions, HeaderInfo, ParsedContainer, PayloadInfo, MAX_CONTAINER_BYTES, MAX_COPIES,
+    MIN_COPIES,
+};
 
 use crate::util::{hex_encode, same_file, sanitize_file_name, Job};
 
@@ -182,24 +185,95 @@ pub fn embed_bundle(
         }
     }
     job.check()?;
-    let data = bundle::build(payloads, job)?;
-    if data.len() > format::MAX_CONTAINER_BYTES {
-        return Err(format!(
-            "Бандл больше {} МБ — уменьшите набор файлов.",
-            format::MAX_CONTAINER_BYTES / (1024 * 1024)
-        ));
-    }
+    let prepared = prepare_payload(payloads, job)?;
     let mut options = options.clone();
     options.bundle = true;
     embed_bytes(
         carrier,
-        &data,
-        bundle::BUNDLE_NAME,
+        &prepared.bytes,
+        &prepared.name,
         output,
         &options,
         copies,
         job,
     )
+}
+
+/// Нагрузка, прочитанная в память: один файл как есть или ZIP-бандл из
+/// нескольких файлов.
+///
+/// Нужна и встраиванию, и генерации «с нуля»: второе дно должно поместиться
+/// в файл, не увеличивая заданный размер, поэтому размер контейнера считают
+/// заранее ([`PreparedPayload::container_len`]).
+#[derive(Clone, Debug)]
+pub struct PreparedPayload {
+    /// Готовые байты нагрузки (для бандла — ZIP).
+    pub bytes: Vec<u8>,
+    /// Имя, которое увидит получатель после извлечения.
+    pub name: String,
+    /// Нагрузка — ZIP-бандл из нескольких файлов.
+    pub bundle: bool,
+}
+
+impl PreparedPayload {
+    /// Сколько байт займут копии контейнера в готовом файле.
+    pub fn container_len(
+        &self,
+        options: &ContainerOptions,
+        copies: usize,
+        job: &Job<'_>,
+    ) -> Result<u64, String> {
+        let mut options = options.clone();
+        options.bundle = self.bundle;
+        let container = format::build_container(&self.bytes, &self.name, &options, job)?;
+        let copies = copies.clamp(format::MIN_COPIES, format::MAX_COPIES) as u64;
+        Ok(container.len() as u64 * copies)
+    }
+}
+
+/// Читает файлы нагрузки в память: один файл как есть, несколько — в ZIP-бандл.
+pub fn prepare_payload(payloads: &[PathBuf], job: &Job<'_>) -> Result<PreparedPayload, String> {
+    if payloads.is_empty() {
+        return Err("Не указан ни один файл нагрузки.".to_owned());
+    }
+    job.check()?;
+    if payloads.len() > 1 {
+        let data = bundle::build(payloads, job)?;
+        if data.len() > format::MAX_CONTAINER_BYTES {
+            return Err(format!(
+                "Бандл больше {} МБ — уменьшите набор файлов.",
+                format::MAX_CONTAINER_BYTES / (1024 * 1024)
+            ));
+        }
+        return Ok(PreparedPayload {
+            bytes: data,
+            name: bundle::BUNDLE_NAME.to_owned(),
+            bundle: true,
+        });
+    }
+    let payload = &payloads[0];
+    let size = fs::metadata(payload).map_err(|err| err.to_string())?.len();
+    if size > format::MAX_CONTAINER_BYTES as u64 {
+        return Err(format!(
+            "Файл нагрузки больше {} МБ — уменьшите его.",
+            format::MAX_CONTAINER_BYTES / (1024 * 1024)
+        ));
+    }
+    let name = payload
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("payload.bin")
+        .to_owned();
+    job.report(2.0, &format!("Чтение {name}..."));
+    let mut bytes = Vec::with_capacity(size as usize);
+    BufReader::new(File::open(payload).map_err(|err| err.to_string())?)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    Ok(PreparedPayload {
+        bytes,
+        name,
+        bundle: false,
+    })
 }
 
 /// Встраивает уже прочитанные байты нагрузки (общий путь для файла и бандла).

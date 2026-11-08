@@ -22,9 +22,15 @@ pub fn embed(carrier: &Path, data: &[u8], copy_len: usize, output: &Path) -> Res
     if &head[0..4] != b"RIFF" || &head[8..12] != b"WEBP" {
         return Err("Файл не является WebP.".into());
     }
+    // Сколько байт занимает сам RIFF по заголовку: всё, что лежит дальше,
+    // считается «хвостом» (например, случайные данные генератора) и в RIFF
+    // не попадает, иначе декодеры споткнутся о мусор в середине файла.
+    let declared = 8 + u64::from(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+    let valid_end = declared.clamp(12, total);
+
     let mut target = BufWriter::new(File::create(output).map_err(|err| err.to_string())?);
     target.write_all(&head).map_err(|err| err.to_string())?;
-    let mut rest = source.take(total - 12);
+    let mut rest = source.by_ref().take(valid_end - 12);
     std::io::copy(&mut rest, &mut target).map_err(|err| err.to_string())?;
 
     // Отдельный RIFF-чанк на каждую копию.
@@ -43,6 +49,11 @@ pub fn embed(carrier: &Path, data: &[u8], copy_len: usize, output: &Path) -> Res
     let written = target.stream_position().map_err(|err| err.to_string())?;
     let riff_size = u32::try_from(written - 8)
         .map_err(|_| "Итоговый файл слишком велик для WebP.".to_owned())?;
+
+    // Хвост за пределами RIFF переносим как есть: он остаётся вне размера RIFF.
+    let mut tail = source.take(total - valid_end);
+    std::io::copy(&mut tail, &mut target).map_err(|err| err.to_string())?;
+
     target.flush().map_err(|err| err.to_string())?;
     drop(target);
 
