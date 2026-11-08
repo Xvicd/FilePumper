@@ -79,8 +79,8 @@
 | --- | --- | ---: | --- |
 | **Windows 10/11 x64** | `FilePumper.exe` — окно приложения, консоль не открывается | 12,2 МБ | DirectX 12 или Vulkan для интерфейса; при ошибке про DLL — [Visual C++ 2015-2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
 | | `FilePumper-cli.exe` — только командная строка | 2,1 МБ | — |
-| **Linux x86_64** | `file-pumper` — окно приложения | 17,4 МБ | glibc ≥ 2.17, X11 или Wayland, драйвер Vulkan/Mesa |
-| | `file-pumper-cli` — только командная строка | 3,1 МБ | glibc ≥ 2.17 |
+| **Linux x86_64** | `file-pumper` — окно приложения | 17,5 МБ | glibc ≥ 2.17, X11 или Wayland, драйвер Vulkan/Mesa |
+| | `file-pumper-cli` — только командная строка | 3,2 МБ | glibc ≥ 2.17 |
 
 На Linux CLI-версии не нужно ничего, кроме `libc` — все графические библиотеки
 подгружаются динамически и нужны только окну:
