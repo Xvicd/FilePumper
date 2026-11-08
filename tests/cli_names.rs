@@ -229,6 +229,133 @@ fn names_random_also_works_for_embedding() {
 }
 
 #[test]
+fn names_random_chars_style_uses_length_and_alphabet() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs: Vec<PathBuf> = (0..2)
+        .map(|index| text_file(dir.path(), &format!("src{index}.txt")))
+        .collect();
+    let out_dir = dir.path().join("out");
+
+    let mut list = vec![String::from("pump")];
+    list.extend(inputs.iter().map(|path| path.to_string_lossy().to_string()));
+    list.extend(args(&[
+        "--size",
+        "1",
+        "--method",
+        "padding",
+        "--names",
+        "random",
+        "--random-style",
+        "chars",
+        "--random-length",
+        "6",
+        "--random-alphabet",
+        "ab",
+        "--out-dir",
+        &out_dir.to_string_lossy(),
+    ]));
+    let code = file_pumper::cli::run(&list);
+    assert_eq!(code, 0);
+
+    let created = made_files(&out_dir, &[]);
+    assert_eq!(created.len(), 2, "создано: {created:?}");
+    for path in &created {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap()
+            .to_owned();
+        assert_eq!(stem.chars().count(), 6, "длина имени: {stem}");
+        assert!(
+            stem.chars().all(|symbol| symbol == 'a' || symbol == 'b'),
+            "в имени чужие символы: {stem}"
+        );
+    }
+}
+
+#[test]
+fn names_random_chars_style_works_for_generate() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+
+    let code = cli(&[
+        "generate",
+        "--size",
+        "1",
+        "--type",
+        "bin",
+        "--names",
+        "random",
+        "--random-style",
+        "chars",
+        "--random-length",
+        "12",
+        "--random-alphabet",
+        "0123456789",
+        "--out-dir",
+        path_str(&out_dir),
+    ]);
+
+    assert_eq!(code, 0);
+    let created = made_files(&out_dir, &[]);
+    assert_eq!(created.len(), 1, "создано: {created:?}");
+    let stem = created[0]
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap()
+        .to_owned();
+    assert_eq!(stem.len(), 12, "длина имени: {stem}");
+    assert!(
+        stem.chars().all(|symbol| symbol.is_ascii_digit()),
+        "в имени не только цифры: {stem}"
+    );
+}
+
+#[test]
+fn random_alphabet_without_usable_symbols_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = text_file(dir.path(), "note.txt");
+
+    let code = cli(&[
+        "pump",
+        path_str(&input),
+        "--size",
+        "1",
+        "--method",
+        "padding",
+        "--names",
+        "random",
+        "--random-style",
+        "chars",
+        "--random-alphabet",
+        "абв",
+    ]);
+
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn random_length_out_of_range_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = text_file(dir.path(), "note.txt");
+
+    let code = cli(&[
+        "pump",
+        path_str(&input),
+        "--size",
+        "1",
+        "--method",
+        "padding",
+        "--names",
+        "random",
+        "--random-length",
+        "1",
+    ]);
+
+    assert_eq!(code, 1);
+}
+
+#[test]
 fn unknown_name_mode_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let input = text_file(dir.path(), "note.txt");

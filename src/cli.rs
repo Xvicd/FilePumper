@@ -4,8 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::batch::{
-    self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, NameMode, PumpPlan,
-    SizeJitter, TargetMode,
+    self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, NameMode, Names,
+    PumpPlan, RandomNames, RandomStyle, SizeJitter, TargetMode,
 };
 use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
@@ -29,6 +29,8 @@ FilePumper
                                    [--size-mode exact|at-least|add]
                                    [--vary <МБ> [--vary-mode plus|minus|both]]
                                    [--names size|plain|random]
+                                   [--random-style words|chars]
+                                   [--random-length N] [--random-alphabet НАБОР]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--method animation|png-chunks|upscale|svg|office|padding]
                                    [--format gif|png|webp]
@@ -49,7 +51,13 @@ FilePumper
                  plus — только прибавлять, minus — только убавлять
   --names        имена результатов: size — с размером (photo_10MB.png,
                  по умолчанию), plain — без размера (photo.png), random —
-                 случайное имя (quiet-river-4821.png)
+                 случайное имя (quiet-river-4821.png или набор символов)
+  --random-style вид случайного имени: words — два слова и число
+                 (green-apple-4821, по умолчанию), chars — символы из алфавита
+  --random-length  сколько символов в случайном имени при --random-style chars
+                 (10 по умолчанию, допустимо 3..48)
+  --random-alphabet  из каких символов собирать имя (по умолчанию a-z0-9);
+                 лишние символы отбрасываются: годятся латиница, цифры, - и _
   --from-dir     добавить все файлы папки, --recursive — вместе с подпапками
   --ext          фильтр расширений для --from-dir (например png,jpg)
   --from-file    текстовый список путей (по одному в строке, # — комментарий)
@@ -64,6 +72,8 @@ FilePumper
                                    [--type bin|png|gif|jpg|webp]
                                    [--vary <МБ> [--vary-mode plus|minus|both]]
                                    [--name ОСНОВА] [--names size|plain|random]
+                                   [--random-style words|chars]
+                                   [--random-length N] [--random-alphabet НАБОР]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--payload ФАЙЛ ...] [--copies 1..3]
                                    [--compress] [--password ПАРОЛЬ]
@@ -92,7 +102,8 @@ FilePumper
                                    [--names random]
                                    [--dry-run] [--report ОТЧЁТ.csv|ОТЧЁТ.json]
   Несколько --payload упаковываются в один ZIP-бандл внутри контейнера.
-  --names random даёт результатам случайные имена (quiet-river-4821.png).
+  --names random даёт результатам случайные имена (quiet-river-4821.png);
+  вид задают --random-style, --random-length и --random-alphabet.
 
 Извлечь файлы из картинки (можно несколько носителей):
   file-pumper-cli extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ]
@@ -121,6 +132,8 @@ struct Flags {
     vary: Option<f64>,
     vary_mode: JitterMode,
     names: NameMode,
+    /// Настройки случайных имён: работают вместе с `--names random`.
+    random: RandomNames,
     method: Method,
     format: AnimationFormat,
     copies: usize,
@@ -203,6 +216,7 @@ impl Flags {
             vary: None,
             vary_mode: JitterMode::Both,
             names: NameMode::Size,
+            random: RandomNames::default(),
             method: Method::Animation,
             format: AnimationFormat::Gif,
             copies: 1,
@@ -252,6 +266,36 @@ impl Flags {
                 "--names" | "--name-mode" => {
                     let raw = next("--names", &mut iterator)?;
                     flags.names = NameMode::parse(&raw)?;
+                }
+                "--random-style" | "--random-name-style" => {
+                    let raw = next("--random-style", &mut iterator)?;
+                    flags.random.style = RandomStyle::parse(&raw)?;
+                }
+                "--random-length" | "--random-len" => {
+                    let raw = next("--random-length", &mut iterator)?;
+                    let length = raw
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| format!("Неверная длина случайного имени: {raw}"))?;
+                    let range = batch::RANDOM_LENGTH_RANGE;
+                    if !range.contains(&length) {
+                        return Err(format!(
+                            "Длина случайного имени — от {} до {} символов.",
+                            range.start(),
+                            range.end()
+                        ));
+                    }
+                    flags.random.length = length;
+                }
+                "--random-alphabet" | "--random-chars" => {
+                    let raw = next("--random-alphabet", &mut iterator)?;
+                    let alphabet = batch::sanitize_alphabet(&raw);
+                    if alphabet.is_empty() {
+                        return Err(format!(
+                            "Алфавит случайного имени пуст: в «{raw}» нет латинских букв, цифр, «-» или «_»."
+                        ));
+                    }
+                    flags.random.alphabet = alphabet;
                 }
                 "--copies" => {
                     let raw = next("--copies", &mut iterator)?;
@@ -385,6 +429,19 @@ impl Flags {
     fn jitter(&self) -> Result<Option<SizeJitter>, String> {
         SizeJitter::from_mb(self.vary.unwrap_or(0.0), self.vary_mode)
     }
+
+    /// Режим имён вместе с настройками случайных имён.
+    fn names_value(&self) -> Names {
+        Names::new(self.names).with_random(self.random.clone())
+    }
+}
+
+/// Подпись режима имён для строки плана: у случайного имени ещё и способ.
+fn names_label(flags: &Flags) -> String {
+    match flags.names {
+        NameMode::Random => format!("{} ({})", NameMode::Random.label(), flags.random.label()),
+        other => other.label().to_owned(),
+    }
 }
 
 /// Предупреждает, если разброс способен «съесть» весь размер: при `minus` файл
@@ -479,7 +536,7 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
         flags.size_mode,
         &flags.sizes,
     )?
-    .with_names(flags.names);
+    .with_names(flags.names_value());
     let jitter = flags.jitter()?;
     let plan = plan.with_jitter(jitter);
     warn_jitter(jitter, &plan.targets);
@@ -669,7 +726,7 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
     let mut items = batch::plan_generate(
         &flags.base_name,
         flags.generated,
-        flags.names,
+        flags.names_value(),
         flags.out_dir.as_deref(),
         &spec,
         &flags.payloads,
@@ -697,7 +754,7 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
             "План: {} файл(ов), тип «{}», имена «{}»{}",
             items.len(),
             flags.generated.title(),
-            flags.names.label(),
+            names_label(flags),
             jitter_note(jitter)
         );
         for item in &items {
@@ -857,7 +914,7 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
             None => {
                 let suggested = payload::default_output_path(carrier);
                 let suggested = if flags.names == NameMode::Random {
-                    batch::with_random_stem(&suggested)
+                    batch::with_random_stem(&suggested, &flags.random)
                 } else {
                     suggested
                 };

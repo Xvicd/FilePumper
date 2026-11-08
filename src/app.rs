@@ -8,7 +8,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{
-    self, BatchItem, GenerateTargets, JitterMode, NameMode, PumpPlan, SizeJitter, TargetMode,
+    self, BatchItem, GenerateTargets, JitterMode, NameMode, Names, PumpPlan, RandomNames,
+    RandomStyle, SizeJitter, TargetMode,
 };
 use crate::payload::{self, ContainerOptions, PayloadSummary};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
@@ -21,6 +22,17 @@ const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb3, 0x71);
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x8a, 0x2f);
 /// Цвет ошибки.
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x53, 0x4f);
+/// Готовые наборы символов для случайного имени: кнопки под полем «Символы».
+const ALPHABET_PRESETS: [(&str, &str); 5] = [
+    ("a-z", "abcdefghijklmnopqrstuvwxyz"),
+    ("a-z0-9", "abcdefghijklmnopqrstuvwxyz0123456789"),
+    ("0-9", "0123456789"),
+    ("hex", "0123456789abcdef"),
+    (
+        "A-Za-z0-9",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    ),
+];
 
 enum WorkerMessage {
     Progress(f32, String),
@@ -103,6 +115,9 @@ struct Settings {
     embed_compress: bool,
     embed_copies: usize,
     names: usize,
+    random_style: usize,
+    random_length: usize,
+    random_alphabet: String,
     tab: usize,
     gen_kind: usize,
     gen_base: String,
@@ -126,6 +141,9 @@ impl Default for Settings {
             embed_compress: false,
             embed_copies: 1,
             names: 0,
+            random_style: 0,
+            random_length: batch::DEFAULT_RANDOM_LENGTH,
+            random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
             tab: 0,
             gen_kind: 0,
             gen_base: "file".to_owned(),
@@ -195,6 +213,11 @@ pub struct PumperApp {
     embed_password: String,
     embed_copies: usize,
     names: NameMode,
+    random_style: RandomStyle,
+    random_length: usize,
+    random_alphabet: String,
+    /// Зерно образца имени: пока его не меняют, пример в окне стоит на месте.
+    example_seed: u64,
     gen_kind: GeneratedKind,
     gen_base: String,
     gen_count: usize,
@@ -226,6 +249,10 @@ impl Default for PumperApp {
             embed_password: String::new(),
             embed_copies: 1,
             names: NameMode::Size,
+            random_style: RandomStyle::default(),
+            random_length: batch::DEFAULT_RANDOM_LENGTH,
+            random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
+            example_seed: batch::DEFAULT_SAMPLE_SEED,
             gen_kind: GeneratedKind::default(),
             gen_base: "file".to_owned(),
             gen_count: 1,
@@ -272,6 +299,12 @@ impl PumperApp {
                 .iter()
                 .position(|mode| *mode == self.names)
                 .unwrap_or(0),
+            random_style: RandomStyle::ALL
+                .iter()
+                .position(|style| *style == self.random_style)
+                .unwrap_or(0),
+            random_length: self.random_length,
+            random_alphabet: self.random_alphabet.clone(),
             tab: self.tab.index(),
             gen_kind: generated_kind_index(self.gen_kind),
             gen_base: self.gen_base.clone(),
@@ -306,6 +339,17 @@ impl PumperApp {
             .get(settings.names)
             .copied()
             .unwrap_or_default();
+        self.random_style = RandomStyle::ALL
+            .get(settings.random_style)
+            .copied()
+            .unwrap_or_default();
+        self.random_length = settings.random_length.clamp(
+            *batch::RANDOM_LENGTH_RANGE.start(),
+            *batch::RANDOM_LENGTH_RANGE.end(),
+        );
+        if !settings.random_alphabet.trim().is_empty() {
+            self.random_alphabet = settings.random_alphabet;
+        }
         self.tab = Tab::from_index(settings.tab);
         self.gen_kind = generated_kind_from_index(settings.gen_kind);
         if !settings.gen_base.trim().is_empty() {
@@ -315,28 +359,45 @@ impl PumperApp {
         self.gen_attach = settings.gen_attach;
     }
 
-    /// Как называть результаты: с размером в имени, без него или случайно.
-    fn name_mode(&self) -> NameMode {
-        self.names
+    /// Настройки случайных имён из полей окна: длина и алфавит поправляются.
+    fn random_names(&self) -> RandomNames {
+        RandomNames {
+            style: self.random_style,
+            length: self.random_length,
+            alphabet: self.random_alphabet.clone(),
+        }
+        .sanitized()
+    }
+
+    /// Режим имён вместе с настройками случайных имён — то, что видит batch.
+    fn naming(&self) -> Names {
+        Names::new(self.names).with_random(self.random_names())
     }
 
     /// Пример имени результата для текущих настроек (показывается под кнопками).
+    ///
+    /// Случайная основа берётся по зерну `example_seed`, а не заново каждый
+    /// кадр: иначе пример «перебирал» бы имена при любой перерисовке окна.
     fn example_name(&self) -> String {
-        let mb = self
-            .target_mb
-            .trim()
-            .replace(',', ".")
-            .parse::<f64>()
-            .ok()
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(10.0);
-        batch::result_name(
-            Path::new("photo.png"),
-            (mb * MIB as f64) as u64,
-            self.method,
-            self.animation_format,
-            self.name_mode(),
-        )
+        let target = (self.target_mb_value().unwrap_or(10.0) * MIB as f64) as u64;
+        let seed = self.example_seed;
+        match self.tab {
+            Tab::Generate => batch::sample_generated_name(
+                &self.gen_base,
+                target,
+                self.gen_kind,
+                self.naming(),
+                seed,
+            ),
+            _ => batch::sample_result_name(
+                Path::new("photo.png"),
+                target,
+                self.method,
+                self.animation_format,
+                self.naming(),
+                seed,
+            ),
+        }
     }
 
     /// Размер из поля «Размер» в мегабайтах (запятая тоже работает).
@@ -384,22 +445,12 @@ impl PumperApp {
         ))
     }
 
-    /// Пример имени файла, созданного «с нуля» (показывается под кнопкой).
-    fn generated_example_name(&self) -> String {
-        let target = (self.target_mb_value().unwrap_or(10.0) * MIB as f64) as u64;
-        match self.name_mode() {
-            // Случайное имя менялось бы каждый кадр, поэтому показываем образец.
-            NameMode::Random => format!("quiet-river-4821.{}", self.gen_kind.extension()),
-            names => batch::generated_name(&self.gen_base, target, self.gen_kind, names),
-        }
-    }
-
     /// Имя результата встраивания: `<носитель>_with_payload.<ext>`, а при
     /// включённых случайных именах — случайная основа с тем же расширением.
     fn embed_suggested_path(&self, carrier: &Path) -> PathBuf {
         let suggested = payload::default_output_path(carrier);
         if self.names == NameMode::Random {
-            batch::with_random_stem(&suggested)
+            batch::with_random_stem(&suggested, &self.random_names())
         } else {
             suggested
         }
@@ -470,7 +521,7 @@ impl PumperApp {
             }
         };
         let plan = match PumpPlan::new(method, format, out_dir.clone(), self.size_mode, &[mb]) {
-            Ok(plan) => plan.with_names(self.name_mode()).with_jitter(jitter),
+            Ok(plan) => plan.with_names(self.naming()).with_jitter(jitter),
             Err(message) => {
                 self.result_dialog = Some((false, message, None));
                 return;
@@ -628,7 +679,7 @@ impl PumperApp {
         let items = match batch::plan_generate(
             &self.gen_base,
             self.gen_kind,
-            self.name_mode(),
+            self.naming(),
             self.out_dir.as_deref(),
             &spec,
             &payloads,
@@ -1395,6 +1446,9 @@ impl PumperApp {
     }
 
     /// Как называть результаты: размер в имени, без размера или случайно.
+    ///
+    /// У случайного режима настраивается вид: два слова (`green-apple-4821`) или
+    /// набор символов заданной длины из выбранного алфавита.
     fn names_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Имена:");
@@ -1403,7 +1457,77 @@ impl PumperApp {
                     .on_hover_text(mode.title());
             }
         });
-        ui.weak(format!("Пример: {}", self.example_name()));
+        if self.names == NameMode::Random {
+            self.random_names_ui(ui);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!("Пример: {}", self.example_name()));
+            if self.names == NameMode::Random
+                && ui
+                    .add_enabled(!self.busy, egui::Button::new("другой пример").small())
+                    .on_hover_text("Показать ещё один вариант случайного имени")
+                    .clicked()
+            {
+                self.example_seed = self.example_seed.wrapping_add(1);
+            }
+        });
+    }
+
+    /// Вид случайного имени: слова или набор символов с длиной и алфавитом.
+    fn random_names_ui(&mut self, ui: &mut egui::Ui) {
+        ui.indent("random_names_ui", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Вид случайного имени:");
+                for style in RandomStyle::ALL {
+                    ui.radio_value(&mut self.random_style, style, style.label())
+                        .on_hover_text(style.title());
+                }
+            });
+            if self.random_style == RandomStyle::Words {
+                ui.weak(
+                    "green-apple-4821: прилагательное, существительное и четырёхзначное число.",
+                );
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Длина:");
+                ui.add_enabled(
+                    !self.busy,
+                    egui::DragValue::new(&mut self.random_length)
+                        .range(batch::RANDOM_LENGTH_RANGE)
+                        .suffix(" симв."),
+                );
+                ui.label("Символы:");
+                ui.add_enabled(
+                    !self.busy,
+                    egui::TextEdit::singleline(&mut self.random_alphabet)
+                        .hint_text(batch::DEFAULT_ALPHABET)
+                        .desired_width(240.0),
+                )
+                .on_hover_text("Из этих символов собирается имя: k7fq2mzp");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Готовый набор:");
+                for (label, alphabet) in ALPHABET_PRESETS {
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new(label).small())
+                        .clicked()
+                    {
+                        self.random_alphabet = alphabet.to_owned();
+                    }
+                }
+            });
+            let clean = batch::sanitize_alphabet(&self.random_alphabet);
+            if clean != self.random_alphabet {
+                ui.colored_label(
+                    WARN_COLOR,
+                    "В имени останутся только латинские буквы, цифры, «-» и «_» — без повторов.",
+                );
+            }
+            ui.weak(
+                "Короткое имя может совпасть с уже существующим — тогда файл получит суффикс -2, -3.",
+            );
+        });
     }
 
     /// Папка результатов: по умолчанию файлы ложатся рядом с исходными.
@@ -1568,7 +1692,6 @@ impl PumperApp {
             if action_button(ui, ready, "Создать файл") {
                 self.start_generate();
             }
-            ui.weak(format!("пример имени: {}", self.generated_example_name()));
         });
     }
 }

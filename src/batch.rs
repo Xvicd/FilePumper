@@ -32,7 +32,7 @@ impl BatchItem {
         method: Method,
         format: AnimationFormat,
         out_dir: Option<&Path>,
-        names: NameMode,
+        names: impl Into<Names>,
     ) -> Result<Self, String> {
         if !input.is_file() {
             return Err("файл не найден".to_owned());
@@ -74,7 +74,7 @@ impl TargetMode {
     pub const ALL: [TargetMode; 3] = [TargetMode::Exact, TargetMode::AtLeast, TargetMode::Add];
 
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "exact" | "точно" => Ok(TargetMode::Exact),
             "at-least" | "atleast" | "min" | "не-меньше" => Ok(TargetMode::AtLeast),
             "add" | "прибавить" => Ok(TargetMode::Add),
@@ -127,7 +127,7 @@ impl JitterMode {
     pub const ALL: [JitterMode; 3] = [JitterMode::Both, JitterMode::Plus, JitterMode::Minus];
 
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "both" | "plus-minus" | "±" | "обе" | "в-обе-стороны" => {
                 Ok(JitterMode::Both)
             }
@@ -258,7 +258,7 @@ impl NameMode {
     pub const ALL: [NameMode; 3] = [NameMode::Size, NameMode::Plain, NameMode::Random];
 
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        match value.trim().to_lowercase().as_str() {
             "size" | "with-size" | "размер" | "с-размером" => Ok(NameMode::Size),
             "plain" | "clean" | "no-size" | "без-размера" => Ok(NameMode::Plain),
             "random" | "случайно" | "случайное" => Ok(NameMode::Random),
@@ -286,6 +286,199 @@ impl NameMode {
     }
 }
 
+/// Как составляется случайная основа имени.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RandomStyle {
+    /// `quiet-river-4821`: прилагательное, существительное и четырёхзначное число.
+    #[default]
+    Words,
+    /// `k7fq2mzp`: символы из алфавита, длина задаётся отдельно.
+    Chars,
+}
+
+impl RandomStyle {
+    pub const ALL: [RandomStyle; 2] = [RandomStyle::Words, RandomStyle::Chars];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_lowercase().as_str() {
+            "words" | "word" | "слова" | "слово" => Ok(RandomStyle::Words),
+            "chars" | "characters" | "symbols" | "символы" | "набор" => {
+                Ok(RandomStyle::Chars)
+            }
+            other => Err(format!(
+                "Неизвестный способ случайного имени: {other}. Допустимо: words, chars."
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RandomStyle::Words => "слова",
+            RandomStyle::Chars => "набор символов",
+        }
+    }
+
+    /// Пример и пояснение способа для интерфейса и справки.
+    pub fn title(self) -> &'static str {
+        match self {
+            RandomStyle::Words => "green-apple-4821 — прилагательное, существительное и число",
+            RandomStyle::Chars => "k7fq2mzp — символы из алфавита заданной длины",
+        }
+    }
+}
+
+/// Алфавит случайных имён по умолчанию: строчная латиница и цифры.
+pub const DEFAULT_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+/// Длина имени из символов по умолчанию.
+pub const DEFAULT_RANDOM_LENGTH: usize = 10;
+/// Допустимая длина имени из символов: короче — будут совпадения, длиннее — неудобно.
+pub const RANDOM_LENGTH_RANGE: std::ops::RangeInclusive<usize> = 3..=48;
+/// Зерно образца по умолчанию: пример в окне не меняется, пока не нажали «другой».
+pub const DEFAULT_SAMPLE_SEED: u64 = 0x5EED_0523;
+
+/// Настройки случайных имён: способ, длина набора символов и сам алфавит.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RandomNames {
+    pub style: RandomStyle,
+    /// Сколько символов в основе (для [`RandomStyle::Words`] не используется).
+    pub length: usize,
+    /// Из каких символов выбирать; лишние отбрасываются при генерации.
+    pub alphabet: String,
+}
+
+impl Default for RandomNames {
+    fn default() -> Self {
+        Self {
+            style: RandomStyle::default(),
+            length: DEFAULT_RANDOM_LENGTH,
+            alphabet: DEFAULT_ALPHABET.to_owned(),
+        }
+    }
+}
+
+impl RandomNames {
+    /// Настройки с поправленными значениями: длина в пределах
+    /// [`RANDOM_LENGTH_RANGE`], алфавит — без символов, недопустимых в имени файла.
+    pub fn sanitized(&self) -> Self {
+        let alphabet = sanitize_alphabet(&self.alphabet);
+        Self {
+            style: self.style,
+            length: self
+                .length
+                .clamp(*RANDOM_LENGTH_RANGE.start(), *RANDOM_LENGTH_RANGE.end()),
+            alphabet: if alphabet.is_empty() {
+                DEFAULT_ALPHABET.to_owned()
+            } else {
+                alphabet
+            },
+        }
+    }
+
+    /// Короткое пояснение для справки и строки плана: «слова» или
+    /// «набор символов: 8 из «abcdef0123»».
+    pub fn label(&self) -> String {
+        let clean = self.sanitized();
+        match clean.style {
+            RandomStyle::Words => RandomStyle::Words.label().to_owned(),
+            RandomStyle::Chars => format!(
+                "{}: {} из «{}»",
+                RandomStyle::Chars.label(),
+                clean.length,
+                clean.alphabet
+            ),
+        }
+    }
+
+    /// Случайная основа имени по этим настройкам.
+    pub fn stem(&self) -> String {
+        self.stem_with(&mut rand::thread_rng())
+    }
+
+    /// Случайная основа имени с явным генератором: нужно тестам и образцу в окне.
+    pub fn stem_with(&self, rng: &mut impl rand::Rng) -> String {
+        let clean = self.sanitized();
+        match clean.style {
+            RandomStyle::Words => {
+                let adjective = NAME_ADJECTIVES[rng.gen_range(0..NAME_ADJECTIVES.len())];
+                let noun = NAME_NOUNS[rng.gen_range(0..NAME_NOUNS.len())];
+                let number: u32 = rng.gen_range(1000..10_000);
+                format!("{adjective}-{noun}-{number}")
+            }
+            RandomStyle::Chars => {
+                let symbols: Vec<char> = clean.alphabet.chars().collect();
+                (0..clean.length)
+                    .map(|_| symbols[rng.gen_range(0..symbols.len())])
+                    .collect()
+            }
+        }
+    }
+
+    /// Образец основы для интерфейса: при одинаковом зерне всегда одинаковый,
+    /// поэтому пример в окне не перебирается на каждом кадре.
+    pub fn sample(&self) -> String {
+        self.sample_with_seed(DEFAULT_SAMPLE_SEED)
+    }
+
+    /// Образец основы по зерну: кнопка «другой пример» меняет только зерно.
+    pub fn sample_with_seed(&self, seed: u64) -> String {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        self.stem_with(&mut rng)
+    }
+}
+
+/// Оставляет только символы, годные для имени файла в любой системе: латиницу,
+/// цифры, дефис и подчёркивание. Повторы выбрасываются, порядок сохраняется.
+pub fn sanitize_alphabet(value: &str) -> String {
+    let mut clean = String::new();
+    for symbol in value.chars() {
+        let allowed = symbol.is_ascii_alphanumeric() || symbol == '-' || symbol == '_';
+        let fresh = !clean.contains(symbol);
+        if allowed && fresh {
+            clean.push(symbol);
+        }
+    }
+    clean
+}
+
+/// Что попадёт в имя: режим [`NameMode`] вместе с настройками случайных имён.
+///
+/// Функции именования принимают `impl Into<Names>`, поэтому привычное
+/// `NameMode::Size` работает как раньше, а случайные настройки передаются явно:
+/// `Names::new(NameMode::Random).with_random(random)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    pub mode: NameMode,
+    pub random: RandomNames,
+}
+
+impl Names {
+    pub fn new(mode: NameMode) -> Self {
+        Self {
+            mode,
+            random: RandomNames::default(),
+        }
+    }
+
+    /// Настройки случайных имён: работают, когда режим — [`NameMode::Random`].
+    pub fn with_random(mut self, random: RandomNames) -> Self {
+        self.random = random;
+        self
+    }
+}
+
+impl From<NameMode> for Names {
+    fn from(mode: NameMode) -> Self {
+        Self::new(mode)
+    }
+}
+
+impl From<&Names> for Names {
+    fn from(names: &Names) -> Self {
+        names.clone()
+    }
+}
+
 /// Готовый план пакета: настройки, размеры и список входов.
 #[derive(Clone, Debug)]
 pub struct PumpPlan {
@@ -293,8 +486,8 @@ pub struct PumpPlan {
     pub format: AnimationFormat,
     pub out_dir: Option<PathBuf>,
     pub mode: TargetMode,
-    /// Как называть результаты пакета.
-    pub names: NameMode,
+    /// Как называть результаты пакета: режим и настройки случайных имён.
+    pub names: Names,
     /// Разброс размера: `None` — размер всегда ровно указанный.
     pub jitter: Option<SizeJitter>,
     /// Размеры в байтах, по одному на файл; последний повторяется.
@@ -314,15 +507,22 @@ impl PumpPlan {
             format,
             out_dir,
             mode,
-            names: NameMode::Size,
+            names: Names::default(),
             jitter: None,
             targets: targets_from_mb(sizes_mb)?,
         })
     }
 
     /// Как называть результаты: с размером, без него или случайно.
-    pub fn with_names(mut self, names: NameMode) -> Self {
-        self.names = names;
+    /// Принимает и [`NameMode`], и готовые [`Names`].
+    pub fn with_names(mut self, names: impl Into<Names>) -> Self {
+        self.names = names.into();
+        self
+    }
+
+    /// Настройки случайного имени: способ, длина и алфавит (для [`NameMode::Random`]).
+    pub fn with_random_names(mut self, random: RandomNames) -> Self {
+        self.names.random = random;
         self
     }
 
@@ -384,7 +584,7 @@ impl PumpPlan {
         }
         let input_len = fs::metadata(input).map_err(|err| err.to_string())?.len();
         let target = self.target_for(index, input_len);
-        let name = result_name(input, target, self.method, self.format, self.names);
+        let name = result_name(input, target, self.method, self.format, &self.names);
         let candidate = match self.out_dir.as_deref() {
             Some(directory) => directory.join(&name),
             None => input.with_file_name(&name),
@@ -516,21 +716,60 @@ pub fn size_label(target_bytes: u64) -> String {
 
 /// Имя результата: `photo.jpg` → `photo_10MB.png`. Расширение зависит от метода,
 /// а [`NameMode`] решает, попадёт ли в имя размер (`Size`), исчезнет ли он (`Plain`)
-/// или имя станет случайным (`Random`).
+/// или имя станет случайным (`Random`, вид задаёт [`RandomNames`]).
 pub fn result_name(
     input: &Path,
     target_bytes: u64,
     method: Method,
     format: AnimationFormat,
-    names: NameMode,
+    names: impl Into<Names>,
 ) -> String {
-    let stem = input
+    let names = names.into();
+    let stem = input_stem(input);
+    let extension = output_extension(method, format, input);
+    compose_name(&stem, &extension, target_bytes, names.mode, || {
+        names.random.stem()
+    })
+}
+
+/// Имя-образец для интерфейса: как [`result_name`], но случайная основа берётся
+/// по зерну, поэтому пример в окне не перебирается на каждом кадре.
+pub fn sample_result_name(
+    input: &Path,
+    target_bytes: u64,
+    method: Method,
+    format: AnimationFormat,
+    names: impl Into<Names>,
+    seed: u64,
+) -> String {
+    let names = names.into();
+    let stem = input_stem(input);
+    let extension = output_extension(method, format, input);
+    compose_name(&stem, &extension, target_bytes, names.mode, || {
+        names.random.sample_with_seed(seed)
+    })
+}
+
+/// Основа имени результата: имя исходника без расширения (`output` для пустого).
+fn input_stem(input: &Path) -> String {
+    input
         .file_stem()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
-        .unwrap_or("output");
-    let extension = output_extension(method, format, input);
-    match names {
+        .unwrap_or("output")
+        .to_owned()
+}
+
+/// Собирает имя файла: `Size` — с размером, `Plain` — только основа, `Random` —
+/// основа из `random_stem` (он вызывается только для случайного режима).
+fn compose_name(
+    stem: &str,
+    extension: &str,
+    target_bytes: u64,
+    mode: NameMode,
+    random_stem: impl FnOnce() -> String,
+) -> String {
+    match mode {
         NameMode::Size => format!("{stem}_{}.{extension}", size_label(target_bytes)),
         NameMode::Plain => format!("{stem}.{extension}"),
         NameMode::Random => format!("{}.{extension}", random_stem()),
@@ -552,24 +791,19 @@ const NAME_NOUNS: [&str; 24] = [
     "orchard", "pebble", "river", "sky",
 ];
 
-/// Случайная основа имени «в рамках приличия»: `quiet-river-4821`.
+/// Случайная основа имени «в рамках приличия» по умолчанию: `quiet-river-4821`.
 pub fn random_stem() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let adjective = NAME_ADJECTIVES[rng.gen_range(0..NAME_ADJECTIVES.len())];
-    let noun = NAME_NOUNS[rng.gen_range(0..NAME_NOUNS.len())];
-    let number: u32 = rng.gen_range(1000..10_000);
-    format!("{adjective}-{noun}-{number}")
+    RandomNames::default().stem()
 }
 
 /// Подставляет случайную основу, сохраняя расширение:
 /// `photo_with_payload.png` → `calm-bay-7314.png`.
-pub fn with_random_stem(path: &Path) -> PathBuf {
+pub fn with_random_stem(path: &Path, random: &RandomNames) -> PathBuf {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("bin");
-    path.with_file_name(format!("{}.{extension}", random_stem()))
+    path.with_file_name(format!("{}.{extension}", random.stem()))
 }
 
 /// Путь результата: рядом с исходником или в указанной папке, без перезаписи
@@ -580,7 +814,7 @@ pub fn output_path(
     method: Method,
     format: AnimationFormat,
     out_dir: Option<&Path>,
-    names: NameMode,
+    names: impl Into<Names>,
 ) -> Result<PathBuf, String> {
     let name = result_name(input, target_bytes, method, format, names);
     let candidate = match out_dir {
@@ -799,15 +1033,29 @@ pub fn generated_name(
     base: &str,
     target_bytes: u64,
     kind: GeneratedKind,
-    names: NameMode,
+    names: impl Into<Names>,
 ) -> String {
+    let names = names.into();
     let stem = generated_stem(base);
-    let extension = kind.extension();
-    match names {
-        NameMode::Size => format!("{stem}_{}.{extension}", size_label(target_bytes)),
-        NameMode::Plain => format!("{stem}.{extension}"),
-        NameMode::Random => format!("{}.{extension}", random_stem()),
-    }
+    compose_name(&stem, kind.extension(), target_bytes, names.mode, || {
+        names.random.stem()
+    })
+}
+
+/// Имя-образец для файла «с нуля»: случайная основа берётся по зерну, поэтому
+/// пример в окне не перебирается на каждом кадре.
+pub fn sample_generated_name(
+    base: &str,
+    target_bytes: u64,
+    kind: GeneratedKind,
+    names: impl Into<Names>,
+    seed: u64,
+) -> String {
+    let names = names.into();
+    let stem = generated_stem(base);
+    compose_name(&stem, kind.extension(), target_bytes, names.mode, || {
+        names.random.sample_with_seed(seed)
+    })
 }
 
 /// Путь для файла, созданного «с нуля»: папка результатов или текущая,
@@ -817,10 +1065,17 @@ pub fn generated_path(
     target_bytes: u64,
     kind: GeneratedKind,
     out_dir: Option<&Path>,
-    names: NameMode,
+    names: impl Into<Names>,
 ) -> Result<PathBuf, String> {
     let mut reservations = Reservations::new();
-    generated_path_in(base, target_bytes, kind, out_dir, names, &mut reservations)
+    generated_path_in(
+        base,
+        target_bytes,
+        kind,
+        out_dir,
+        &names.into(),
+        &mut reservations,
+    )
 }
 
 /// Общий набор занятых имён нужен серии файлов: два одинаковых размера не
@@ -830,7 +1085,7 @@ fn generated_path_in(
     target_bytes: u64,
     kind: GeneratedKind,
     out_dir: Option<&Path>,
-    names: NameMode,
+    names: &Names,
     reservations: &mut Reservations,
 ) -> Result<PathBuf, String> {
     let name = generated_name(base, target_bytes, kind, names);
@@ -866,7 +1121,7 @@ pub struct GenerateTargets {
 pub fn plan_generate(
     base: &str,
     kind: GeneratedKind,
-    names: NameMode,
+    names: impl Into<Names>,
     out_dir: Option<&Path>,
     targets: &GenerateTargets,
     payloads: &[PathBuf],
@@ -874,6 +1129,7 @@ pub fn plan_generate(
     if targets.sizes.is_empty() {
         return Err("Укажите размер файла.".to_owned());
     }
+    let names = names.into();
     let count = targets.count.clamp(1, 64);
     let mut reservations = Reservations::new();
     let mut items = Vec::with_capacity(targets.sizes.len() * count);
@@ -885,7 +1141,7 @@ pub fn plan_generate(
                 Some(jitter) => jitter.apply(*size),
                 None => *size,
             };
-            let output = generated_path_in(base, exact, kind, out_dir, names, &mut reservations)?;
+            let output = generated_path_in(base, exact, kind, out_dir, &names, &mut reservations)?;
             items.push(GenerateItem {
                 output,
                 target: exact,
@@ -1146,7 +1402,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("нет расширения: {name}"));
             assert!(is_tidy_random_stem(stem), "неприличное имя: {name}");
         }
-        let renamed = with_random_stem(Path::new("C:/photos/photo_with_payload.png"));
+        let renamed = with_random_stem(
+            Path::new("C:/photos/photo_with_payload.png"),
+            &RandomNames::default(),
+        );
         assert_eq!(renamed.extension().and_then(|v| v.to_str()), Some("png"));
         let stem = renamed.file_stem().and_then(|v| v.to_str()).unwrap();
         assert!(is_tidy_random_stem(stem), "имя: {stem}");
@@ -1162,6 +1421,155 @@ mod tests {
             && parts[2]
                 .parse::<u32>()
                 .is_ok_and(|value| (1000..10_000).contains(&value))
+    }
+
+    #[test]
+    fn random_style_parse_accepts_both_languages() {
+        assert_eq!(RandomStyle::parse("words"), Ok(RandomStyle::Words));
+        assert_eq!(RandomStyle::parse(" СЛОВА "), Ok(RandomStyle::Words));
+        assert_eq!(RandomStyle::parse("chars"), Ok(RandomStyle::Chars));
+        assert_eq!(RandomStyle::parse("символы"), Ok(RandomStyle::Chars));
+        assert!(RandomStyle::parse("мусор").is_err());
+        assert_eq!(RandomStyle::default(), RandomStyle::Words);
+    }
+
+    #[test]
+    fn random_names_sanitize_length_and_alphabet() {
+        let clean = RandomNames {
+            style: RandomStyle::Chars,
+            length: 999,
+            alphabet: "ab a/b*аб12".to_owned(),
+        }
+        .sanitized();
+        assert_eq!(clean.length, *RANDOM_LENGTH_RANGE.end());
+        // Остаются только латиница и цифры, повторы выброшены, порядок сохранён.
+        assert_eq!(clean.alphabet, "ab12");
+
+        let empty = RandomNames {
+            style: RandomStyle::Chars,
+            length: 1,
+            alphabet: "абв".to_owned(),
+        }
+        .sanitized();
+        assert_eq!(empty.length, *RANDOM_LENGTH_RANGE.start());
+        assert_eq!(empty.alphabet, DEFAULT_ALPHABET);
+    }
+
+    #[test]
+    fn charset_names_use_requested_length_and_symbols() {
+        use rand::SeedableRng;
+        let names = RandomNames {
+            style: RandomStyle::Chars,
+            length: 16,
+            alphabet: "ab".to_owned(),
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let stem = names.stem_with(&mut rng);
+        assert_eq!(stem.len(), 16);
+        assert!(
+            stem.chars().all(|symbol| symbol == 'a' || symbol == 'b'),
+            "имя: {stem}"
+        );
+    }
+
+    #[test]
+    fn charset_result_name_keeps_extension_and_length() {
+        let names = Names::new(NameMode::Random).with_random(RandomNames {
+            style: RandomStyle::Chars,
+            length: 8,
+            alphabet: "abcdef0123456789".to_owned(),
+        });
+        let name = result_name(
+            Path::new("C:/photos/photo.jpeg"),
+            10 * MIB,
+            Method::PngChunks,
+            AnimationFormat::Gif,
+            &names,
+        );
+        let stem = name.strip_suffix(".png").expect("расширение .png");
+        assert_eq!(stem.len(), 8, "имя: {name}");
+        assert!(
+            stem.chars().all(|symbol| symbol.is_ascii_hexdigit()),
+            "имя: {name}"
+        );
+    }
+
+    #[test]
+    fn sample_stem_is_stable_and_seed_changes_it() {
+        let names = RandomNames::default();
+        assert_eq!(names.sample(), names.sample());
+        assert_eq!(names.sample(), names.sample_with_seed(DEFAULT_SAMPLE_SEED));
+        assert_ne!(names.sample_with_seed(1), names.sample_with_seed(2));
+        // Образец — такое же «приличное» имя, как и настоящее.
+        assert!(is_tidy_random_stem(&names.sample()));
+
+        let chars = RandomNames {
+            style: RandomStyle::Chars,
+            length: 6,
+            alphabet: "abc".to_owned(),
+        };
+        let sample = chars.sample();
+        assert_eq!(sample.len(), 6);
+        assert_eq!(sample, chars.sample());
+    }
+
+    #[test]
+    fn sample_result_name_keeps_the_mode() {
+        let target = 10 * MIB;
+        let path = Path::new("photo.png");
+        assert_eq!(
+            sample_result_name(
+                path,
+                target,
+                Method::Padding,
+                AnimationFormat::Gif,
+                NameMode::Size,
+                1
+            ),
+            "photo_10MB.png"
+        );
+        assert_eq!(
+            sample_result_name(
+                path,
+                target,
+                Method::Padding,
+                AnimationFormat::Gif,
+                NameMode::Plain,
+                1
+            ),
+            "photo.png"
+        );
+        let first = sample_result_name(
+            path,
+            target,
+            Method::Padding,
+            AnimationFormat::Gif,
+            NameMode::Random,
+            1,
+        );
+        let again = sample_result_name(
+            path,
+            target,
+            Method::Padding,
+            AnimationFormat::Gif,
+            NameMode::Random,
+            1,
+        );
+        assert_eq!(first, again, "пример не должен меняться сам по себе");
+        assert!(is_tidy_random_stem(
+            first.strip_suffix(".png").expect(".png")
+        ));
+    }
+
+    #[test]
+    fn random_names_label_describes_the_style() {
+        assert_eq!(RandomNames::default().label(), "слова");
+        let chars = RandomNames {
+            style: RandomStyle::Chars,
+            length: 8,
+            alphabet: "ab".to_owned(),
+        };
+        assert_eq!(chars.label(), "набор символов: 8 из «ab»");
     }
 
     #[test]
