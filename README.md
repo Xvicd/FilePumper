@@ -7,7 +7,7 @@
 ![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)
 ![Windows | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![MIT](https://img.shields.io/badge/license-MIT-green)
-![Версия 0.5.1](https://img.shields.io/badge/version-0.5.1-lightgrey)
+![Версия 0.5.2](https://img.shields.io/badge/version-0.5.2-lightgrey)
 
 ## Содержание
 
@@ -95,7 +95,7 @@
 подгружаются динамически и нужны только окну:
 
 ```bash
-tar -xzf FilePumper-0.5.1-linux-x64.tar.gz
+tar -xzf FilePumper-0.5.2-linux-x64.tar.gz
 chmod +x linux/file-pumper linux/file-pumper-cli
 ./linux/file-pumper-cli --help
 ```
@@ -409,7 +409,8 @@ docs/
     ├── v0.3.0.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.4.0.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.5.0.md        описание релиза с плейсхолдерами SHA-256
-    └── v0.5.1.md        описание релиза с плейсхолдерами SHA-256
+    ├── v0.5.1.md        описание релиза с плейсхолдерами SHA-256
+    └── v0.5.2.md        описание релиза с плейсхолдерами SHA-256
 
 scripts/
 ├── check_linux_build.sh    проверка собранного Linux-бинарника
