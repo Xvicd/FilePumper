@@ -6,6 +6,7 @@ pub mod carrier;
 pub mod codes;
 pub mod format;
 pub mod gif;
+pub mod group;
 pub mod jpeg;
 pub mod png;
 pub mod raw;
@@ -20,7 +21,7 @@ pub use bundle::BundleEntry;
 pub use carrier::{detect_carrier, Carrier};
 pub use format::{
     ContainerOptions, HeaderInfo, ParsedContainer, PayloadInfo, MAX_CONTAINER_BYTES, MAX_COPIES,
-    MIN_COPIES,
+    MIN_COPIES, PAYLOAD_NOT_FOUND,
 };
 
 use crate::util::{hex_encode, same_file, sanitize_file_name, Job};
@@ -125,6 +126,34 @@ pub fn default_extract_path(carrier: &Path, name: &str) -> PathBuf {
         return carrier.with_file_name(format!("extracted_{safe}"));
     }
     candidate
+}
+
+/// Дописывает расширение нагрузки, если в выбранном имени его нет.
+///
+/// Расширение — единственная подсказка системе, чем открывать файл: без него
+/// извлечённый `song.mp3` превращается в безымянный набор байт. Поэтому имя
+/// `song` превращается в `song.mp3`, а `song.` — тоже в `song.mp3`.
+pub fn with_payload_extension(destination: &Path, payload_name: &str) -> PathBuf {
+    let has_extension = destination
+        .extension()
+        .map(|value| !value.is_empty())
+        .unwrap_or(false);
+    if has_extension {
+        return destination.to_path_buf();
+    }
+    let extension = Path::new(&sanitize_file_name(payload_name))
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let Some(extension) = extension else {
+        return destination.to_path_buf();
+    };
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("payload");
+    destination.with_file_name(format!("{stem}.{extension}"))
 }
 
 /// Встраивает файл в носитель, повторяя контейнер `copies` раз и проверяя результат.
@@ -446,18 +475,92 @@ pub fn extract_to(
     job.check()?;
     job.report(5.0, "Поиск полезной нагрузки...");
     let (parsed, copies, _kind) = extract_payload(carrier, password)?;
+    // Имя без расширения не даёт системе понять, чем открывать файл, поэтому
+    // расширение из контейнера возвращается на место.
+    let destination = with_payload_extension(destination, &parsed.name);
+    if same_file(carrier, &destination) {
+        return Err("Нельзя перезаписать файл-носитель результатом извлечения.".into());
+    }
     job.check()?;
     job.report(60.0, "Запись извлечённого файла...");
-    let mut writer = BufWriter::new(File::create(destination).map_err(|err| err.to_string())?);
+    if let Some(directory) = destination
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+    {
+        if !directory.is_dir() {
+            fs::create_dir_all(directory).map_err(|err| {
+                format!("Не удалось создать папку {}: {err}", directory.display())
+            })?;
+        }
+    }
+    let mut writer = BufWriter::new(File::create(&destination).map_err(|err| err.to_string())?);
     writer
         .write_all(&parsed.payload)
         .map_err(|err| err.to_string())?;
     writer.flush().map_err(|err| err.to_string())?;
     job.report(100.0, "Готово.");
     Ok(ExtractOutcome {
-        output: destination.to_path_buf(),
+        output: destination,
         name: sanitize_file_name(&parsed.name),
         size: parsed.payload.len() as u64,
         copies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_extension_is_restored_when_name_has_none() {
+        assert_eq!(
+            with_payload_extension(Path::new("C:/out/song"), "song.mp3"),
+            PathBuf::from("C:/out/song.mp3")
+        );
+        assert_eq!(
+            with_payload_extension(Path::new("C:/out/song."), "song.mp3"),
+            PathBuf::from("C:/out/song.mp3")
+        );
+        // Выбранное расширение не подменяется: пользователь мог попросить .bin.
+        assert_eq!(
+            with_payload_extension(Path::new("C:/out/song.bin"), "song.mp3"),
+            PathBuf::from("C:/out/song.bin")
+        );
+        // У нагрузки расширения нет — имя остаётся как есть.
+        assert_eq!(
+            with_payload_extension(Path::new("C:/out/payload"), "payload"),
+            PathBuf::from("C:/out/payload")
+        );
+    }
+
+    #[test]
+    fn extraction_keeps_the_payload_extension_without_one_in_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let carrier = dir.path().join("photo.png");
+        image::RgbImage::from_fn(8, 8, |x, y| image::Rgb([x as u8, y as u8, 5]))
+            .save(&carrier)
+            .unwrap();
+        let payload = dir.path().join("song.mp3");
+        fs::write(&payload, b"id3 fake audio").unwrap();
+        let hidden = dir.path().join("hidden.png");
+        embed_file(
+            &carrier,
+            &payload,
+            &hidden,
+            &ContainerOptions::default(),
+            1,
+            &Job::quiet(),
+        )
+        .unwrap();
+
+        // Сохраняем под именем без расширения — как это делает диалог сохранения.
+        let target = dir.path().join("song");
+        let outcome = extract_to(&hidden, &target, None, &Job::quiet()).unwrap();
+        assert_eq!(outcome.output, dir.path().join("song.mp3"));
+        assert_eq!(
+            fs::read(dir.path().join("song.mp3")).unwrap(),
+            b"id3 fake audio"
+        );
+        assert!(!target.exists(), "файл без расширения создавать не нужно");
+    }
 }

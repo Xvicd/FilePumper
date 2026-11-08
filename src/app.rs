@@ -38,6 +38,10 @@ enum WorkerMessage {
     Progress(f32, String),
     Finished(Result<(String, PathBuf), String>),
     Inspected(Result<PayloadSummary, String>),
+    Scanned(Vec<payload::group::ScanItem>),
+    Extracted(Result<payload::group::ExtractBatch, String>),
+    /// Готова одна пара группового встраивания: номер и короткая заметка.
+    PairDone(usize, Result<String, String>),
     BatchItemStarted(usize),
     BatchItemDone(usize, Result<u64, String>),
     BatchFinished {
@@ -53,6 +57,28 @@ struct BatchRow {
     input: PathBuf,
     status: String,
     ok: Option<bool>,
+}
+
+/// Пара группового встраивания: куда спрятать, что спрятать и свой пароль.
+struct PairRow {
+    carrier: PathBuf,
+    payload: PathBuf,
+    /// Пустая строка — использовать общий пароль из блока «Что спрятать».
+    password: String,
+    ok: Option<bool>,
+    note: String,
+}
+
+impl PairRow {
+    fn new(carrier: PathBuf, payload: PathBuf, password: String) -> Self {
+        Self {
+            carrier,
+            payload,
+            password,
+            ok: None,
+            note: String::new(),
+        }
+    }
 }
 
 struct Preview {
@@ -87,7 +113,9 @@ impl Tab {
     fn hint(self) -> &'static str {
         match self {
             Tab::Pump => "Добавьте файлы, задайте размер и метод — получите файлы нужного объёма, которые продолжают открываться.",
-            Tab::Payload => "Спрячьте любой файл внутрь картинки и достаньте его обратно: данные лежат в структуре файла, картинка остаётся рабочей.",
+            Tab::Payload => {
+                "Спрячьте любой файл внутрь картинки и достаньте его обратно: данные лежат в структуре файла, картинка остаётся рабочей. Файлов может быть много: «Проверить все» покажет, что где спрятано, «Извлечь всё в папку» достанет сразу всё, а пары разложат нагрузки по носителям с разными паролями."
+            }
             Tab::Generate => "Файл нужного размера без исходника: внутри криптослучайные байты, поэтому zip, gzip и 7z его не сожмут.",
         }
     }
@@ -223,6 +251,12 @@ pub struct PumperApp {
     gen_count: usize,
     gen_attach: bool,
     preview: Option<Preview>,
+    /// Пары «носитель ← нагрузка» для группового встраивания.
+    pairs: Vec<PairRow>,
+    /// Результат обзора носителей: в каком файле что спрятано.
+    scan: Vec<payload::group::ScanItem>,
+    /// Пароль для проверки и извлечения: может отличаться от пароля встраивания.
+    extract_password: String,
 }
 
 impl Default for PumperApp {
@@ -258,6 +292,9 @@ impl Default for PumperApp {
             gen_count: 1,
             gen_attach: false,
             preview: None,
+            pairs: Vec::new(),
+            scan: Vec::new(),
+            extract_password: String::new(),
         }
     }
 }
@@ -987,16 +1024,20 @@ impl PumperApp {
         }
 
         let suggested = payload::default_extract_path(&carrier, &summary.info.name);
-        let Some(destination) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .set_directory(carrier.parent().unwrap_or_else(|| Path::new(".")))
             .set_file_name(
                 suggested
                     .file_name()
                     .and_then(|value| value.to_str())
                     .unwrap_or("payload.bin"),
-            )
-            .save_file()
-        else {
+            );
+        // Фильтр по расширению нагрузки: Windows сам подставляет это расширение,
+        // поэтому извлечённый файл не теряет формат.
+        if let Some(extension) = payload_extension(&summary.info.name) {
+            dialog = dialog.add_filter(format!("Файл нагрузки (*.{extension})"), &[extension]);
+        }
+        let Some(destination) = dialog.save_file() else {
             return;
         };
         let (sender, cancel) = self.begin_job();
@@ -1015,15 +1056,240 @@ impl PumperApp {
                 .map(|outcome| {
                     (
                         format!(
-                            "Файл извлечён.\nИмя: {}\nРазмер: {:.2} КБ\nЦелых копий: {}",
+                            "Файл извлечён.\nИмя: {}\nРазмер: {:.2} КБ\nЦелых копий: {}\nКуда: {}",
                             outcome.name,
                             outcome.size as f64 / 1024.0,
-                            outcome.copies
+                            outcome.copies,
+                            outcome.output.display()
                         ),
                         outcome.output,
                     )
                 });
             let _ = sender.send(WorkerMessage::Finished(result));
+        });
+    }
+
+    /// Сопоставляет носители и нагрузки по порядку: первый носитель получает
+    /// первую нагрузку и так далее.
+    fn fill_pairs(&mut self) {
+        if self.carriers.is_empty() || self.payloads.is_empty() {
+            self.result_dialog = Some((
+                false,
+                "Для пар нужны и носители, и нагрузка: заполните первые два списка.".to_owned(),
+                None,
+            ));
+            return;
+        }
+        let carriers = self.carriers.clone();
+        let payloads = self.payloads.clone();
+        let shared = self.embed_password.trim().to_owned();
+        self.pairs = carriers
+            .iter()
+            .enumerate()
+            .map(|(index, carrier)| {
+                let payload = payloads[index % payloads.len()].clone();
+                PairRow::new(carrier.clone(), payload, shared.clone())
+            })
+            .collect();
+        self.status = format!("Пар готово: {}.", self.pairs.len());
+    }
+
+    /// Групповое встраивание: каждая пара даёт свой файл-носитель.
+    fn start_embed_pairs(&mut self) {
+        if self.pairs.is_empty() {
+            self.result_dialog = Some((false, "Сначала сопоставьте пары.".to_owned(), None));
+            return;
+        }
+        if let Some(bad) = self
+            .pairs
+            .iter()
+            .flat_map(|pair| [pair.carrier.clone(), pair.payload.clone()])
+            .find(|path| !path.is_file())
+        {
+            self.result_dialog = Some((false, format!("Файл не найден: {}", bad.display()), None));
+            return;
+        }
+        if let Some(directory) = self.out_dir.as_ref() {
+            if !directory.is_dir() && std::fs::create_dir_all(directory).is_err() {
+                self.result_dialog = Some((
+                    false,
+                    "Не удалось создать папку результатов.".to_owned(),
+                    None,
+                ));
+                return;
+            }
+        }
+
+        let mut reservations = Reservations::new();
+        let mut plan: Vec<(payload::group::EmbedPair, PathBuf)> =
+            Vec::with_capacity(self.pairs.len());
+        for row in &self.pairs {
+            let mut spec =
+                payload::group::EmbedPair::single(row.carrier.clone(), row.payload.clone());
+            spec.password = password_or_none(&row.password);
+            let suggested = self.embed_suggested_path(&row.carrier);
+            let candidate = match self.out_dir.as_ref() {
+                Some(directory) => directory.join(
+                    suggested
+                        .file_name()
+                        .map(Path::new)
+                        .unwrap_or_else(|| Path::new("carrier_with_payload")),
+                ),
+                None => suggested,
+            };
+            plan.push((spec, reservations.reserve(&candidate)));
+        }
+
+        let base_options = ContainerOptions {
+            compress: self.embed_compress,
+            password: password_or_none(&self.embed_password),
+            bundle: false,
+        };
+        let copies = self.embed_copies.clamp(1, 3);
+        let (sender, cancel) = self.begin_job();
+        self.status = "Групповое встраивание...".to_owned();
+        for row in self.pairs.iter_mut() {
+            row.ok = None;
+            row.note.clear();
+        }
+        thread::spawn(move || {
+            let total = plan.len().max(1) as f32;
+            let mut notes: Vec<String> = Vec::new();
+            let mut done = 0_usize;
+            let mut failed = 0_usize;
+            let mut last_output: Option<PathBuf> = None;
+            for (index, (spec, output)) in plan.iter().enumerate() {
+                let progress_sender = sender.clone();
+                let progress = move |percent: f32, text: &str| {
+                    let within = percent.clamp(0.0, 100.0) / 100.0;
+                    let overall = ((index as f32 + within) / total).clamp(0.0, 1.0);
+                    let _ = progress_sender.send(WorkerMessage::Progress(overall, text.to_owned()));
+                };
+                let job = Job::new(&progress, &cancel);
+                let options = spec.options(&base_options);
+                let result = match spec.payloads.first() {
+                    Some(payload) => {
+                        payload::embed_file(&spec.carrier, payload, output, &options, copies, &job)
+                    }
+                    None => Err("Не указан файл нагрузки.".to_owned()),
+                };
+                match result {
+                    Ok(outcome) => {
+                        done += 1;
+                        last_output = Some(outcome.output.clone());
+                        let written = outcome
+                            .output
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("файл")
+                            .to_owned();
+                        let note = format!(
+                            "записано {written} ({:.2} МБ)",
+                            outcome.output_len as f64 / MIB as f64
+                        );
+                        notes.push(format!("{} — {note}", spec.label()));
+                        let _ = sender.send(WorkerMessage::PairDone(index, Ok(note)));
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        notes.push(format!("{} — ошибка: {error}", spec.label()));
+                        let _ = sender.send(WorkerMessage::PairDone(index, Err(error)));
+                    }
+                }
+            }
+            let mut text = format!("Готово пар: {done} из {}.", plan.len());
+            if failed > 0 {
+                text.push_str(&format!("\nНе удалось: {failed}."));
+            }
+            for note in &notes {
+                text.push_str("\n  ");
+                text.push_str(note);
+            }
+            let folder = last_output.unwrap_or_else(|| PathBuf::from("."));
+            let result = if done == 0 {
+                Err(text)
+            } else {
+                Ok((text, folder))
+            };
+            let _ = sender.send(WorkerMessage::Finished(result));
+        });
+    }
+
+    /// Пароли для проверки и извлечения: несколько можно перечислить через запятую.
+    fn extract_passwords(&self) -> Vec<String> {
+        self.extract_password
+            .split([',', ';'])
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
+    /// Проверяет все выбранные носители и показывает, что в них спрятано.
+    fn start_scan(&mut self) {
+        if self.carriers.is_empty() {
+            self.result_dialog = Some((false, "Выберите файлы для проверки.".to_owned(), None));
+            return;
+        }
+        if let Some(bad) = self.carriers.iter().find(|path| !path.is_file()) {
+            self.result_dialog = Some((false, format!("Файл не найден: {}", bad.display()), None));
+            return;
+        }
+        let carriers = self.carriers.clone();
+        let passwords = self.extract_passwords();
+        let (sender, cancel) = self.begin_job();
+        self.status = "Проверка файлов...".to_owned();
+        self.scan.clear();
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let progress = move |percent: f32, text: &str| {
+                let _ = progress_sender.send(WorkerMessage::Progress(
+                    (percent / 100.0).clamp(0.0, 1.0),
+                    text.to_owned(),
+                ));
+            };
+            let job = Job::new(&progress, &cancel);
+            let items = payload::group::scan_many(&carriers, &passwords, &job);
+            let _ = sender.send(WorkerMessage::Scanned(items));
+        });
+    }
+
+    /// Извлекает всё найденное из всех носителей в выбранную папку.
+    fn start_extract_all(&mut self) {
+        if self.carriers.is_empty() {
+            self.result_dialog = Some((false, "Выберите файлы-носители.".to_owned(), None));
+            return;
+        }
+        if let Some(bad) = self.carriers.iter().find(|path| !path.is_file()) {
+            self.result_dialog = Some((false, format!("Файл не найден: {}", bad.display()), None));
+            return;
+        }
+        let start_dir = self
+            .out_dir
+            .clone()
+            .or_else(|| self.carriers[0].parent().map(Path::to_path_buf));
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(directory) = start_dir.as_ref() {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(directory) = dialog.pick_folder() else {
+            return;
+        };
+        let carriers = self.carriers.clone();
+        let passwords = self.extract_passwords();
+        let (sender, cancel) = self.begin_job();
+        self.status = "Извлечение из всех носителей...".to_owned();
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let progress = move |percent: f32, text: &str| {
+                let _ = progress_sender.send(WorkerMessage::Progress(
+                    (percent / 100.0).clamp(0.0, 1.0),
+                    text.to_owned(),
+                ));
+            };
+            let job = Job::new(&progress, &cancel);
+            let result =
+                payload::group::extract_many(&carriers, Some(&directory), &passwords, &job);
+            let _ = sender.send(WorkerMessage::Extracted(result));
         });
     }
 
@@ -1073,6 +1339,47 @@ impl PumperApp {
                     self.progress = 0.0;
                     self.status = "Полезная нагрузка не найдена.".to_owned();
                     self.result_dialog = Some((false, error, None));
+                }
+                WorkerMessage::Scanned(items) => {
+                    self.busy = false;
+                    self.worker = None;
+                    self.progress = 1.0;
+                    self.status = format!("Проверка: {}", payload::group::scan_summary(&items));
+                    self.scan = items;
+                }
+                WorkerMessage::Extracted(Ok(batch)) => {
+                    self.busy = false;
+                    self.worker = None;
+                    self.progress = 1.0;
+                    self.status = format!("Извлечение: {}", batch.summary());
+                    let folder = batch.out_dir.clone().or_else(|| {
+                        self.carriers
+                            .first()
+                            .and_then(|path| path.parent())
+                            .map(Path::to_path_buf)
+                    });
+                    self.result_dialog = Some((true, batch.report(), folder));
+                }
+                WorkerMessage::Extracted(Err(error)) => {
+                    self.busy = false;
+                    self.worker = None;
+                    self.progress = 0.0;
+                    self.status = "Извлечение не удалось.".to_owned();
+                    self.result_dialog = Some((false, error, None));
+                }
+                WorkerMessage::PairDone(index, result) => {
+                    if let Some(row) = self.pairs.get_mut(index) {
+                        match result {
+                            Ok(note) => {
+                                row.ok = Some(true);
+                                row.note = note;
+                            }
+                            Err(error) => {
+                                row.ok = Some(false);
+                                row.note = format!("ошибка: {error}");
+                            }
+                        }
+                    }
                 }
                 WorkerMessage::BatchItemStarted(index) => {
                     if let Some(row) = self.rows.get_mut(index) {
@@ -1134,18 +1441,22 @@ impl PumperApp {
         if dropped.is_empty() {
             return;
         }
-        // Папки раскрываются рекурсивно; все файлы попадают в пакет, а первые два
-        // дополнительно занимают слоты «носитель» и «нагрузка» для встраивания.
+        // Папки раскрываются рекурсивно. Все файлы попадают в пакет и в список
+        // носителей: так их сразу можно проверить и извлечь. Что спрятать —
+        // выбирается отдельно, чтобы случайный файл не стал нагрузкой.
         let expanded = scan::expand_dropped(&dropped);
         for path in expanded.iter() {
-            if self.carriers.is_empty() {
+            if !self
+                .carriers
+                .iter()
+                .any(|existing| crate::util::same_file(existing, path))
+            {
                 self.carriers.push(path.clone());
-            } else if self.payloads.is_empty() {
-                self.payloads.push(path.clone());
             }
         }
+        let count = self.carriers.len();
         self.add_files(expanded);
-        self.status = "Файлы добавлены перетаскиванием.".to_owned();
+        self.status = format!("Файлы добавлены перетаскиванием: носителей {count}.");
     }
 }
 
@@ -1555,11 +1866,11 @@ impl PumperApp {
         });
     }
 
-    /// Вкладка «Спрятать / извлечь»: носители, нагрузка, опции контейнера.
+    /// Вкладка «Спрятать / извлечь»: носители, нагрузка, пары и опции контейнера.
     fn payload_tab_ui(&mut self, ui: &mut egui::Ui) {
         group_ui(
             ui,
-            "1. Носители (картинки и другие файлы)",
+            "1. Носители: в них прячем или из них достаём",
             |ui| {
                 path_list_ui(
                     ui,
@@ -1569,6 +1880,47 @@ impl PumperApp {
                     self.busy,
                     &mut self.carriers,
                 );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.carriers.is_empty(),
+                            egui::Button::new("Проверить все"),
+                        )
+                        .clicked()
+                    {
+                        self.start_scan();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.carriers.is_empty(),
+                            egui::Button::new("Извлечь всё в папку..."),
+                        )
+                        .clicked()
+                    {
+                        self.start_extract_all();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && self.carriers.len() == 1,
+                            egui::Button::new("Один файл: сохранить как..."),
+                        )
+                        .clicked()
+                    {
+                        self.start_inspect();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Пароль для проверки и извлечения:");
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::TextEdit::singleline(&mut self.extract_password)
+                            .password(true)
+                            .hint_text("несколько паролей — через запятую")
+                            .desired_width(260.0),
+                    );
+                });
+                self.scan_ui(ui);
             },
         );
         group_ui(ui, "2. Что спрятать (нагрузка)", |ui| {
@@ -1606,26 +1958,125 @@ impl PumperApp {
                 );
             });
         });
-        group_ui(ui, "3. Имена файлов результата", |ui| {
+        group_ui(
+            ui,
+            "3. Что во что: пары для группы файлов",
+            |ui| self.pairs_ui(ui),
+        );
+        group_ui(ui, "4. Имена файлов результата", |ui| {
             self.names_ui(ui)
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let can_embed = !self.busy && !self.carriers.is_empty() && !self.payloads.is_empty();
             if action_button(ui, can_embed, "Спрятать файл") {
                 self.start_embed();
             }
             if action_button(
                 ui,
-                !self.busy && !self.carriers.is_empty(),
-                "Проверить и извлечь",
+                !self.busy && !self.pairs.is_empty(),
+                "Спрятать по парам",
             ) {
-                self.start_inspect();
+                self.start_embed_pairs();
             }
         });
         ui.add_space(4.0);
         ui.weak(
+            "«Спрятать файл» кладёт все нагрузки во все носители (несколько — бандлом). «Спрятать по парам» — свой файл в каждый носитель и со своим паролем.",
+        );
+        ui.weak(
             "Данные кладутся внутрь структуры файла: чанки PNG, сегменты APP15 JPEG, комментарий GIF, RIFF-чанк WebP, metadata SVG. Картинка остаётся рабочей, поэтому сервер принимает файл целиком.",
         );
+    }
+
+    /// Отчёт «Проверить все»: что нашлось в каждом носителе.
+    fn scan_ui(&mut self, ui: &mut egui::Ui) {
+        if self.scan.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(payload::group::scan_summary(&self.scan)).strong());
+        for item in &self.scan {
+            let color = match &item.result {
+                payload::group::ScanResult::Found(_) => OK_COLOR,
+                payload::group::ScanResult::Empty => WARN_COLOR,
+                payload::group::ScanResult::Error(_) => ERROR_COLOR,
+            };
+            ui.colored_label(color, item.describe());
+        }
+        ui.weak(
+            "«Извлечь всё в папку» сохранит найденное: одиночные файлы — под именем из контейнера (с расширением), бандлы — в подпапку по имени носителя.",
+        );
+    }
+
+    /// Список пар «носитель ← нагрузка» и кнопки управления ими.
+    fn pairs_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy && !self.carriers.is_empty() && !self.payloads.is_empty(),
+                    egui::Button::new("Сопоставить по порядку"),
+                )
+                .clicked()
+            {
+                self.fill_pairs();
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.pairs.is_empty(),
+                    egui::Button::new("Очистить пары"),
+                )
+                .clicked()
+            {
+                self.pairs.clear();
+                self.status = "Пары очищены.".to_owned();
+            }
+            match self.pairs.len() {
+                0 => ui.weak("пар нет: сопоставьте списки выше"),
+                count => ui.weak(format!("пар: {count}")),
+            };
+        });
+        if self.pairs.is_empty() {
+            ui.weak("Пара задаёт, что попадёт в конкретный носитель и с каким паролем.");
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        for (index, row) in self.pairs.iter_mut().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!self.busy, egui::Button::new("✕")).clicked() {
+                    remove = Some(index);
+                }
+                ui.monospace(
+                    row.carrier
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("носитель"),
+                )
+                .on_hover_text(row.carrier.display().to_string());
+                ui.label("←");
+                ui.monospace(
+                    row.payload
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("нагрузка"),
+                )
+                .on_hover_text(row.payload.display().to_string());
+                ui.add_enabled(
+                    !self.busy,
+                    egui::TextEdit::singleline(&mut row.password)
+                        .password(true)
+                        .hint_text("пароль пары")
+                        .desired_width(130.0),
+                );
+                match row.ok {
+                    Some(true) => ui.colored_label(OK_COLOR, &row.note),
+                    Some(false) => ui.colored_label(ERROR_COLOR, &row.note),
+                    None => ui.weak(""),
+                };
+            });
+        }
+        if let Some(index) = remove {
+            self.pairs.remove(index);
+        }
     }
 
     /// Вкладка «Создать файл»: размер, тип, имена и необязательное второе дно.
@@ -1811,6 +2262,15 @@ fn password_or_none(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_owned())
     }
+}
+
+/// Расширение из имени нагрузки: нужно фильтру диалога сохранения, чтобы
+/// Windows дописывал его к выбранному имени и файл не терял формат.
+fn payload_extension(name: &str) -> Option<&str> {
+    Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty() && value.len() <= 16)
 }
 
 /// Список путей с кнопками «добавить» и «✕»: используется для носителей и

@@ -11,9 +11,7 @@ use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::report;
 use crate::scan;
-use crate::util::{
-    sanitize_file_name, unique_path, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB,
-};
+use crate::util::{CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB};
 
 const HELP: &str = "\
 FilePumper
@@ -99,19 +97,32 @@ FilePumper
   file-pumper-cli embed <носитель>... --payload <файл> [--payload <файл>...]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--copies 1..3] [--compress] [--password ПАРОЛЬ]
+                                   [--pair] [--pair-password ПАРОЛЬ]...
                                    [--names random]
                                    [--dry-run] [--report ОТЧЁТ.csv|ОТЧЁТ.json]
   Несколько --payload упаковываются в один ZIP-бандл внутри контейнера.
+  --pair сопоставляет носители и нагрузки по порядку: первая нагрузка идёт в
+  первый носитель, вторая во второй и так далее (нагрузок меньше — повторяются,
+  больше — делятся поровну и попадают в носитель бандлом).
+  --pair-password задаёт пароль пары; флаг можно повторять, последний пароль
+  достаётся всем оставшимся парам. Без него работает общий --password.
   --names random даёт результатам случайные имена (quiet-river-4821.png);
   вид задают --random-style, --random-length и --random-alphabet.
 
 Извлечь файлы из картинки (можно несколько носителей):
   file-pumper-cli extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--password ПАРОЛЬ]
-  Бандл распаковывается в папку по одному файлу.
+  Извлечённый файл сохраняет расширение из имени нагрузки, поэтому система
+  знает, чем его открывать. Бандл распаковывается в папку по одному файлу.
+  Файлы без нагрузки в пакете не считаются ошибкой: в отчёте видно, что
+  можно извлечь и из какого файла. Код выхода 1 — только при реальных ошибках.
+  --password можно повторять: пароли перебираются по порядку, поэтому пачка
+  файлов с разными паролями извлекается одной командой.
 
 Проверить, что лежит внутри (можно несколько носителей):
-  file-pumper-cli inspect <носитель>... [--password ПАРОЛЬ]
+  file-pumper-cli inspect <носитель>... [--password ПАРОЛЬ]...
+  По каждому файлу печатается отчёт, в конце — итог вида
+  «с нагрузкой 2 из 3» и список «что можно извлечь».
 
 Проверить целостность и контрольные суммы:
   file-pumper-cli verify <носитель>... [--password ПАРОЛЬ]
@@ -139,7 +150,14 @@ struct Flags {
     copies: usize,
     compress: bool,
     password: Option<String>,
+    /// Все пароли из `--password` (флаг можно повторять): для проверки и
+    /// извлечения они перебираются по порядку — в пачке бывают разные пароли.
+    passwords: Vec<String>,
     payloads: Vec<PathBuf>,
+    /// Групповое встраивание: сопоставить носители и нагрузки по порядку.
+    pair: bool,
+    /// Пароли пар: `--pair-password` можно повторять, лишние пары берут последний.
+    pair_passwords: Vec<String>,
     out_dir: Option<PathBuf>,
     output: Option<PathBuf>,
     from_dir: Option<PathBuf>,
@@ -222,7 +240,10 @@ impl Flags {
             copies: 1,
             compress: false,
             password: None,
+            passwords: Vec::new(),
             payloads: Vec::new(),
+            pair: false,
+            pair_passwords: Vec::new(),
             out_dir: None,
             output: None,
             from_dir: None,
@@ -304,10 +325,22 @@ impl Flags {
                         .map_err(|_| format!("Неверное число копий: {raw}"))?
                         .clamp(1, 3);
                 }
-                "--password" => flags.password = Some(next("--password", &mut iterator)?),
+                "--password" => {
+                    let raw = next("--password", &mut iterator)?;
+                    if flags.passwords.is_empty() {
+                        flags.password = Some(raw.clone());
+                    }
+                    flags.passwords.push(raw);
+                }
                 "--payload" => flags
                     .payloads
                     .push(PathBuf::from(next("--payload", &mut iterator)?)),
+                "--pair" | "--pairs" | "--pair-by-order" => flags.pair = true,
+                "--pair-password" | "--pair-passwords" => {
+                    flags
+                        .pair_passwords
+                        .push(next("--pair-password", &mut iterator)?);
+                }
                 "--out-dir" => {
                     flags.out_dir = Some(PathBuf::from(next("--out-dir", &mut iterator)?));
                 }
@@ -423,6 +456,15 @@ impl Flags {
 
     fn password(&self) -> Option<String> {
         self.options().password
+    }
+
+    /// Все пароли для перебора: `--password` можно повторять.
+    fn password_candidates(&self) -> Vec<String> {
+        self.passwords
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect()
     }
 
     /// Разброс размера из `--vary` и `--vary-mode`; `None` — разброс выключен.
@@ -907,8 +949,36 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
     }
 
     let mut reservations = Reservations::new();
-    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(carriers.len());
-    for carrier in &carriers {
+    let passwords: Vec<Option<String>> = flags
+        .pair_passwords
+        .iter()
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        })
+        .collect();
+    // Пары «носитель ← нагрузка». Без --pair каждый носитель получает все
+    // нагрузки бандлом, с --pair — по порядку и со своим паролем.
+    let specs = if flags.pair {
+        payload::group::pair_by_order(&carriers, &payloads, &passwords)?
+    } else {
+        carriers
+            .iter()
+            .map(|carrier| payload::group::EmbedPair {
+                carrier: carrier.clone(),
+                payloads: payloads.clone(),
+                password: None,
+            })
+            .collect()
+    };
+
+    let mut plan: Vec<(payload::group::EmbedPair, PathBuf)> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let carrier = &spec.carrier;
         let output = match explicit_output.clone() {
             Some(path) => path,
             None => {
@@ -936,7 +1006,7 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
                 carrier.display()
             ));
         }
-        plan.push((carrier.clone(), output));
+        plan.push((spec, output));
     }
 
     if flags.dry_run {
@@ -944,19 +1014,25 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
             "План встраивания: носителей {}, нагрузок {}{}",
             plan.len(),
             payloads.len(),
-            if payloads.len() > 1 {
+            if payloads.len() > 1 && !flags.pair {
                 " (бандл)"
+            } else if flags.pair {
+                " (по парам)"
             } else {
                 ""
             }
         );
-        for (carrier, output) in &plan {
-            println!("  {} -> {}", carrier.display(), output.display());
+        for (spec, output) in &plan {
+            let password = match spec.password.as_deref() {
+                Some(_) => ", свой пароль",
+                None => "",
+            };
+            println!("  {} -> {}{password}", spec.label(), output.display());
         }
         return Ok(());
     }
 
-    let options = flags.options();
+    let base_options = flags.options();
     let copies = flags.copies;
     let token = CancelToken::new();
     let progress = progress_printer();
@@ -964,16 +1040,22 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
     let total = plan.len().max(1) as f32;
     let mut batch_report = BatchReport::default();
 
-    for (index, (carrier, output)) in plan.iter().enumerate() {
+    for (index, (spec, output)) in plan.iter().enumerate() {
+        let carrier = &spec.carrier;
         let local = |percent: f32, text: &str| {
             let overall = (index as f32 + percent.clamp(0.0, 100.0) / 100.0) / total * 100.0;
             progress(overall, text);
         };
         let item_job = job.child(&local);
-        let result = if payloads.len() > 1 {
-            payload::embed_bundle(carrier, &payloads, output, &options, copies, &item_job)
-        } else {
-            payload::embed_file(carrier, &payloads[0], output, &options, copies, &item_job)
+        let options = spec.options(&base_options);
+        let result = match spec.payloads.first() {
+            Some(first) if !spec.bundle() => {
+                payload::embed_file(carrier, first, output, &options, copies, &item_job)
+            }
+            Some(_) => {
+                payload::embed_bundle(carrier, &spec.payloads, output, &options, copies, &item_job)
+            }
+            None => Err("Не указан ни один файл нагрузки.".to_owned()),
         };
         eprintln!();
         match result {
@@ -1042,76 +1124,22 @@ fn command_extract(flags: &Flags) -> Result<(), String> {
         }
     }
 
-    let password = flags.password();
+    let passwords = flags.password_candidates();
     let progress = progress_printer();
     let token = CancelToken::new();
     let job = Job::new(&progress, &token);
-    let total = carriers.len().max(1) as f32;
-    let mut failed = 0_usize;
 
-    for (index, carrier) in carriers.iter().enumerate() {
-        let local = |percent: f32, text: &str| {
-            let overall = (index as f32 + percent.clamp(0.0, 100.0) / 100.0) / total * 100.0;
-            progress(overall, text);
-        };
-        let item_job = job.child(&local);
-
-        let summary = match payload::inspect_file(carrier, password.as_deref()) {
-            Ok(summary) => summary,
-            Err(error) => {
-                failed += 1;
-                eprintln!("Ошибка: {} — {error}", carrier.display());
-                continue;
-            }
-        };
-
+    // Точное имя результата задаётся только для одного носителя и одного файла.
+    if let Some(output) = explicit_output {
+        let carrier = &carriers[0];
+        let (summary, password) = payload::group::probe(carrier, &passwords)?;
         if summary.info.bundle {
-            if explicit_output.is_some() {
-                failed += 1;
-                eprintln!(
-                    "Ошибка: {} — внутри бандл, он распаковывается в папку (--out-dir), а не в один файл.",
-                    carrier.display()
-                );
-                continue;
-            }
-            let target_dir = flags.out_dir.clone().unwrap_or_else(|| {
-                carrier
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
-            match payload::extract_bundle_to(carrier, &target_dir, password.as_deref(), &item_job) {
-                Ok(files) => {
-                    eprintln!();
-                    println!(
-                        "Готово: {} -> {} (файлов: {})",
-                        carrier.display(),
-                        target_dir.display(),
-                        files.len()
-                    );
-                    for (path, size) in &files {
-                        println!("  {} ({} байт)", path.display(), size);
-                    }
-                }
-                Err(error) => {
-                    failed += 1;
-                    eprintln!("Ошибка: {} — {error}", carrier.display());
-                }
-            }
-            continue;
+            return Err(format!(
+                "{} — внутри бандл, он распаковывается в папку (--out-dir), а не в один файл.",
+                carrier.display()
+            ));
         }
-
-        let output = match explicit_output.clone() {
-            Some(path) => path,
-            None => {
-                let candidate = match flags.out_dir.as_deref() {
-                    Some(directory) => directory.join(sanitize_file_name(&summary.info.name)),
-                    None => payload::default_extract_path(carrier, &summary.info.name),
-                };
-                unique_path(&candidate)
-            }
-        };
-        match payload::extract_to(carrier, &output, password.as_deref(), &item_job) {
+        return match payload::extract_to(carrier, &output, password.as_deref(), &job) {
             Ok(outcome) => {
                 eprintln!();
                 println!(
@@ -1121,22 +1149,92 @@ fn command_extract(flags: &Flags) -> Result<(), String> {
                     outcome.size,
                     outcome.copies
                 );
+                Ok(())
             }
-            Err(error) => {
-                failed += 1;
-                eprintln!("Ошибка: {} — {error}", carrier.display());
+            Err(error) => Err(format!("{} — {error}", carrier.display())),
+        };
+    }
+
+    command_extract_many(&carriers, flags.out_dir.as_deref(), &passwords, &job)
+}
+
+/// Извлечение из нескольких носителей сразу: обычные файлы не считаются ошибкой,
+/// в отчёте видно, что можно извлечь и из какого файла.
+fn command_extract_many(
+    carriers: &[PathBuf],
+    out_dir: Option<&Path>,
+    passwords: &[String],
+    job: &Job<'_>,
+) -> Result<(), String> {
+    let batch = payload::group::extract_many(carriers, out_dir, passwords, job)?;
+    eprintln!();
+
+    let mut failed: Vec<String> = Vec::new();
+    for item in &batch.items {
+        match &item.result {
+            payload::group::ExtractResult::File(outcome) => println!(
+                "Готово: {} -> {} ({} байт, целых копий: {})",
+                item.carrier.display(),
+                outcome.output.display(),
+                outcome.size,
+                outcome.copies
+            ),
+            payload::group::ExtractResult::Bundle(files) => {
+                let folder = files
+                    .first()
+                    .and_then(|(path, _)| path.parent())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "папка".to_owned());
+                println!(
+                    "Готово: {} -> {} (файлов: {})",
+                    item.carrier.display(),
+                    folder,
+                    files.len()
+                );
+                for (path, size) in files {
+                    println!("  {} ({} байт)", path.display(), size);
+                }
+            }
+            payload::group::ExtractResult::Empty => {
+                if carriers.len() > 1 {
+                    println!("Нагрузки нет: {} — обычный файл", item.carrier.display());
+                } else {
+                    failed.push(format!(
+                        "{} — {}",
+                        item.carrier.display(),
+                        payload::PAYLOAD_NOT_FOUND
+                    ));
+                }
+            }
+            payload::group::ExtractResult::Error(error) => {
+                failed.push(format!("{} — {error}", item.carrier.display()));
             }
         }
     }
 
-    eprintln!();
-    if failed > 0 {
-        return Err(format!(
-            "Не удалось обработать {failed} из {} носителей.",
-            carriers.len()
-        ));
+    if carriers.len() > 1 {
+        println!();
+        println!("Итог: {}", batch.summary());
+        println!("Что где нашлось:");
+        for item in &batch.items {
+            println!("  {}", item.describe());
+        }
     }
-    Ok(())
+
+    if failed.is_empty() {
+        return Ok(());
+    }
+    for line in &failed {
+        eprintln!("Ошибка: {line}");
+    }
+    if carriers.len() == 1 {
+        return Err(failed.join("\n"));
+    }
+    Err(format!(
+        "Не удалось обработать {} из {} носителей.",
+        failed.len(),
+        carriers.len()
+    ))
 }
 
 fn command_inspect(flags: &Flags) -> Result<(), String> {
@@ -1144,59 +1242,84 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
     if carriers.is_empty() {
         return Err("Укажите путь: носитель.".to_owned());
     }
-    let password = flags.password();
+    let items = payload::group::scan_many(&carriers, &flags.password_candidates(), &Job::quiet());
     let multiple = carriers.len() > 1;
-    let mut failed = 0_usize;
-    for carrier in &carriers {
+    for item in &items {
         if multiple {
-            println!("=== {} ===", carrier.display());
+            println!("=== {} ===", item.path.display());
         }
-        let summary = match payload::inspect_file(carrier, password.as_deref()) {
-            Ok(summary) => summary,
-            Err(error) => {
-                failed += 1;
-                eprintln!("Ошибка: {} — {error}", carrier.display());
-                continue;
-            }
-        };
-        let info = &summary.info;
-        println!("Носитель: {}", summary.carrier.label());
-        println!("Имя нагрузки: {}", info.name);
-        println!("Размер: {} байт", info.size);
-        println!("Целых копий: {}", info.copies);
-        println!(
-            "Сжатие: {}",
-            if info.compressed {
-                "да (deflate)"
-            } else {
-                "нет"
-            }
-        );
-        println!("Шифрование: {}", if info.encrypted { "да" } else { "нет" });
-        if info.bundle {
-            println!("Содержимое: бандл, несколько файлов (ZIP внутри контейнера)");
-            match payload::payload_entries(carrier, password.as_deref()) {
-                Ok(entries) => {
-                    for entry in &entries {
-                        println!("  {} — {} байт", entry.name, entry.size);
+        match &item.result {
+            payload::group::ScanResult::Found(summary) => {
+                let info = &summary.info;
+                println!("Носитель: {}", summary.carrier.label());
+                println!("Имя нагрузки: {}", info.name);
+                println!("Размер: {} байт", info.size);
+                println!("Целых копий: {}", info.copies);
+                println!(
+                    "Сжатие: {}",
+                    if info.compressed {
+                        "да (deflate)"
+                    } else {
+                        "нет"
+                    }
+                );
+                println!("Шифрование: {}", if info.encrypted { "да" } else { "нет" });
+                if info.bundle {
+                    println!("Содержимое: бандл, несколько файлов (ZIP внутри контейнера)");
+                    let mut entries = payload::payload_entries(&item.path, None);
+                    for candidate in flags.password_candidates() {
+                        if entries.is_ok() {
+                            break;
+                        }
+                        entries = payload::payload_entries(&item.path, Some(candidate.as_str()));
+                    }
+                    match entries {
+                        Ok(entries) => {
+                            for entry in &entries {
+                                println!("  {} — {} байт", entry.name, entry.size);
+                            }
+                        }
+                        Err(error) => println!("  оглавление недоступно: {error}"),
                     }
                 }
-                Err(error) => println!("  оглавление недоступно: {error}"),
+                if info.legacy {
+                    println!("Формат: контейнер версии 1");
+                }
+                println!(
+                    "Устойчивость к загрузке: {}",
+                    summary.carrier.survives_upload()
+                );
+            }
+            payload::group::ScanResult::Empty => {
+                println!("Нагрузки нет: {} — обычный файл", item.path.display());
+            }
+            payload::group::ScanResult::Error(error) => {
+                eprintln!("Ошибка: {} — {error}", item.path.display());
             }
         }
-        if info.legacy {
-            println!("Формат: контейнер версии 1");
-        }
-        println!(
-            "Устойчивость к загрузке: {}",
-            summary.carrier.survives_upload()
-        );
     }
+
+    if multiple {
+        println!();
+        println!("Итог: {}", payload::group::scan_summary(&items));
+        println!("Что можно извлечь:");
+        for item in &items {
+            println!("  {}", item.describe());
+        }
+    }
+
+    let failed = items
+        .iter()
+        .filter(|item| matches!(item.result, payload::group::ScanResult::Error(_)))
+        .count();
     if failed > 0 {
         return Err(format!(
             "Не удалось проверить {failed} из {} файлов.",
             carriers.len()
         ));
+    }
+    if !multiple && !items.iter().any(|item| item.is_found()) {
+        return Err(payload::PAYLOAD_NOT_FOUND.to_owned());
     }
     Ok(())
 }
