@@ -126,3 +126,35 @@ jobs:
               --title "FilePumper $GITHUB_REF_NAME" \
               --generate-notes
           gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+
+      # Тело релиза берётся из docs/release-notes/<тег>.md: в заметках стоят
+      # плейсхолдеры {{WIN_SHA}} и {{LINUX_SHA}}, здесь они заменяются на реальные
+      # SHA-256 залитых архивов, чтобы описание всегда совпадало с файлами.
+      # Нет заметок — остаётся автоматическое описание от gh.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            docs/release-notes
+          sparse-checkout-cone-mode: false
+
+      - name: Тело релиза из заметок версии
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          notes="docs/release-notes/$GITHUB_REF_NAME.md"
+          if [ ! -f "$notes" ]; then
+            echo "Заметок нет ($notes) — остаётся автоматическое описание"
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          win="artifacts/FilePumper-$version-windows-x64.zip"
+          linux="artifacts/FilePumper-$version-linux-x64.tar.gz"
+          for file in "$win" "$linux"; do
+            [ -f "$file" ] || { echo "Нет архива $file"; exit 1; }
+          done
+          win_sha=$(sha256sum "$win" | awk '{print $1}')
+          linux_sha=$(sha256sum "$linux" | awk '{print $1}')
+          echo "$win_sha  $(basename "$win")"
+          echo "$linux_sha  $(basename "$linux")"
+          sed -e "s/{{WIN_SHA}}/$win_sha/" -e "s/{{LINUX_SHA}}/$linux_sha/" "$notes" > body.md
+          gh release edit "$GITHUB_REF_NAME" --notes-file body.md
