@@ -1,4 +1,4 @@
-FilePumper 0.4.0 — готовые сборки
+FilePumper 0.5.0 — готовые сборки
 ===========================================
 
 windows\
@@ -9,16 +9,28 @@ windows\
     FilePumper-cli.exe --help
     FilePumper-cli.exe --version
     FilePumper-cli.exe pump <вход>... --size <МБ>[,<МБ>...]
-                        [--size-mode exact|at-least|add] [--out-dir ПАПКА]
-                        [--output ФАЙЛ] [--method ...] [--jobs N] [--dry-run]
-                        [--report отчёт.csv|.json] [--skip-unsupported]
+                        [--size-mode exact|at-least|add] [--names size|plain|random]
+                        [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--jobs N]
+                        [--dry-run] [--report отчёт.csv|.json] [--skip-unsupported]
     FilePumper-cli.exe pump --from-dir ПАПКА [--recursive] [--ext png,jpg] --size 10
     FilePumper-cli.exe pump --from-file список.txt --size 10
+    FilePumper-cli.exe generate --size 10 --type png [--count N] [--name ОСНОВА]
+                        [--names size|plain|random] [--payload <файл> ...] [--out-dir ПАПКА]
+                        [--dry-run] [--verify]
     FilePumper-cli.exe embed <носитель>... --payload <файл> [--payload <файл>...]
                         [--out-dir ПАПКА] [--copies 1..3] [--compress] [--password ПАРОЛЬ]
     FilePumper-cli.exe extract <носитель>... [--out-dir ПАПКА] [--password ПАРОЛЬ]
     FilePumper-cli.exe inspect <носитель>...
     FilePumper-cli.exe verify <носитель>...
+
+  Файлы с нуля: generate (алиас make) создаёт файл нужного размера без исходника —
+  внутри криптослучайные байты, поэтому zip/gzip/7z его не сожмут. Тип задаётся
+  --type bin|png|gif|jpg|webp: картиночные типы остаются открывающимися файлами.
+  С --payload внутрь прячется нагрузка, но размер остаётся ровно целевым.
+  Пример: .\FilePumper-cli.exe generate --size 5,10 --count 2 --type png --out-dir .\big
+
+  Имена результатов: --names size (по умолчанию, размер в имени), --names plain
+  (photo.png), --names random (quiet-river-4821.png). Занятое имя получает суффикс.
 
   Пакетная накачка: можно передать сразу несколько файлов. Ошибка одного файла
   не прерывает остальные, в конце печатается сводка. Результаты получают имя
