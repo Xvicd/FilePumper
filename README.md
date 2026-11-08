@@ -68,16 +68,16 @@
 
 | Платформа | Файл | Размер | Требования |
 | --- | --- | ---: | --- |
-| **Windows 10/11 x64** | `FilePumper.exe` — окно приложения, консоль не открывается | 11,4 МБ | DirectX 12 или Vulkan для интерфейса; при ошибке про DLL — [Visual C++ 2015-2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
-| | `FilePumper-cli.exe` — только командная строка | 1,7 МБ | — |
-| **Linux x86_64** | `file-pumper` — окно приложения | 16,7 МБ | glibc ≥ 2.17, X11 или Wayland, драйвер Vulkan/Mesa |
-| | `file-pumper-cli` — только командная строка | 2,9 МБ | glibc ≥ 2.17 |
+| **Windows 10/11 x64** | `FilePumper.exe` — окно приложения, консоль не открывается | 12,1 МБ | DirectX 12 или Vulkan для интерфейса; при ошибке про DLL — [Visual C++ 2015-2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| | `FilePumper-cli.exe` — только командная строка | 2,0 МБ | — |
+| **Linux x86_64** | `file-pumper` — окно приложения | 17,4 МБ | glibc ≥ 2.17, X11 или Wayland, драйвер Vulkan/Mesa |
+| | `file-pumper-cli` — только командная строка | 3,1 МБ | glibc ≥ 2.17 |
 
 На Linux CLI-версии не нужно ничего, кроме `libc` — все графические библиотеки
 подгружаются динамически и нужны только окну:
 
 ```bash
-tar -xzf FilePumper-0.3.0-linux-x64.tar.gz
+tar -xzf FilePumper-0.4.0-linux-x64.tar.gz
 chmod +x linux/file-pumper linux/file-pumper-cli
 ./linux/file-pumper-cli --help
 ```
