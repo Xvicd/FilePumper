@@ -7,7 +7,7 @@
 ![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)
 ![Windows | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![MIT](https://img.shields.io/badge/license-MIT-green)
-![Версия 0.5.2](https://img.shields.io/badge/version-0.5.2-lightgrey)
+![Версия 0.5.3](https://img.shields.io/badge/version-0.5.3-lightgrey)
 
 ## Содержание
 
@@ -56,10 +56,12 @@
   умолчанию). Разброс считается отдельно для каждого файла пакета и работает и в
   `pump`, и в `generate`; файл всё равно создаётся ровно того размера, который
   выпал. В окне это поля «Разброс» и «Направление».
-- **Имена результатов на выбор** — размер в имени (`photo_10MB.png`) убирается
-  кнопкой «Убрать размер из имени» или флагом `--names plain`, а галочка «Случайное
-  имя файла» (`--names random`) даёт нейтральные имена вида `quiet-river-4821.png`.
-  Работает и для пакета: имена получает каждый файл списка.
+- **Имена результатов на выбор** — радио «Имена» в разделе «Имена и папка
+  результатов»: с размером (`photo_10MB.png`), без него (`photo.png`, `--names
+  plain`) или случайное (`--names random`). У случайного имени два вида: два слова
+  и число (`green-apple-4821.png`) либо набор символов заданной длины и алфавита
+  (`--random-style chars --random-length 8 --random-alphabet abcdef0123456789` →
+  `a41f0c7d.png`). Работает и для пакета: имена получает каждый файл списка.
 - **Папки и списки** — `--from-dir ПАПКА [--recursive] [--ext png,jpg]` и
   `--from-file список.txt`; в окне папку можно просто перетащить.
 - **План и отчёт** — `--dry-run` показывает, что и куда будет записано, ничего не
@@ -95,7 +97,7 @@
 подгружаются динамически и нужны только окну:
 
 ```bash
-tar -xzf FilePumper-0.5.2-linux-x64.tar.gz
+tar -xzf FilePumper-0.5.3-linux-x64.tar.gz
 chmod +x linux/file-pumper linux/file-pumper-cli
 ./linux/file-pumper-cli --help
 ```
@@ -115,7 +117,9 @@ chmod +x linux/file-pumper linux/file-pumper-cli
    каждого файла, а под полями размера видно, в какой диапазон попадёт размер.
    Настройки запоминаются между запусками.
    Имена результатов выбираются тут же: с размером (`photo_10MB.png`), без
-   размера (`photo.png`) или случайные (`quiet-river-4821.png`).
+   размера (`photo.png`) или случайные — двумя словами (`green-apple-4821.png`)
+   либо набором символов заданной длины (`k7fq2mzp.png`). Пример под переключателем
+   не меняется сам по себе, а кнопка «другой пример» показывает ещё вариант.
 3. **Спрятать файл (вкладка «Спрятать / извлечь»):** выбрать один или несколько
    носителей и один или несколько файлов нагрузки (или перетащить их в окно;
    папку можно перетащить целиком) → задать копии/сжатие/пароль → «Спрятать
@@ -132,9 +136,9 @@ chmod +x linux/file-pumper linux/file-pumper-cli
 
 | Команда | Назначение |
 | --- | --- |
-| `pump <вход>... --size <МБ[,МБ]> [--size-mode exact\|at-least\|add] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--names size\|plain\|random] [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--format gif\|png\|webp] [--from-dir ПАПКА [--recursive] [--ext ...]] [--from-file СПИСОК] [--skip-unsupported] [--jobs N] [--dry-run] [--verify] [--report ФАЙЛ]` | накачать один или несколько файлов до размера |
-| `generate [--size <МБ[,МБ]>] [--type bin\|png\|gif\|jpg\|webp] [--name ОСНОВА] [--count N] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--payload <файл> [--payload ...]] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--names size\|plain\|random] [--out-dir ПАПКА] [--dry-run] [--verify] [--report ФАЙЛ]` | создать файл нужного размера без исходника (алиас `make`) |
-| `embed <носитель>... --payload <файл> [--payload ...] [--out-dir ПАПКА] [--output ФАЙЛ] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--names random] [--dry-run] [--report ФАЙЛ]` | спрятать файл (или несколько) в одном либо нескольких носителях |
+| `pump <вход>... --size <МБ[,МБ]> [--size-mode exact\|at-least\|add] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--names size\|plain\|random] [--random-style words\|chars] [--random-length N] [--random-alphabet НАБОР] [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--format gif\|png\|webp] [--from-dir ПАПКА [--recursive] [--ext ...]] [--from-file СПИСОК] [--skip-unsupported] [--jobs N] [--dry-run] [--verify] [--report ФАЙЛ]` | накачать один или несколько файлов до размера |
+| `generate [--size <МБ[,МБ]>] [--type bin\|png\|gif\|jpg\|webp] [--name ОСНОВА] [--count N] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--payload <файл> [--payload ...]] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--names size\|plain\|random] [--random-style words\|chars] [--random-length N] [--random-alphabet НАБОР] [--out-dir ПАПКА] [--dry-run] [--verify] [--report ФАЙЛ]` | создать файл нужного размера без исходника (алиас `make`) |
+| `embed <носитель>... --payload <файл> [--payload ...] [--out-dir ПАПКА] [--output ФАЙЛ] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--names random [--random-style words\|chars]] [--dry-run] [--report ФАЙЛ]` | спрятать файл (или несколько) в одном либо нескольких носителях |
 | `extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ] [--password ПАРОЛЬ]` | извлечь спрятанный файл (бандл распаковывается в папку) |
 | `inspect <носитель>... [--password ПАРОЛЬ]` | показать, что лежит внутри, включая оглавление бандла |
 | `verify <носитель>... [--password ПАРОЛЬ]` | перечитать файл и проверить контрольные суммы |
@@ -156,6 +160,9 @@ file-pumper-cli pump --from-dir .\photos --recursive --size 10 --dry-run
 # имена без размера или случайные — сразу для всего пакета
 file-pumper-cli pump .\photos\*.jpg --size 5 --names plain
 file-pumper-cli pump --from-dir .\docs --size 1 --method padding --names random
+
+# случайные имена из символов: длина 8, только цифры и буквы a-f
+file-pumper-cli pump --from-dir .\photos --size 10 --names random --random-style chars --random-length 8 --random-alphabet 0123456789abcdef
 
 # создать файл с нуля: 10 МБ, внутри случайные байты (архив его не сожмёт)
 file-pumper-cli generate --size 10 --type bin --out-dir .\made
@@ -205,11 +212,19 @@ file-pumper-cli extract .\out\photo_with_payload.png --out-dir .\restored --pass
 имя результата для одного файла.
 
 `--names` меняет только имя, не содержимое: `size` — размер в имени (по умолчанию),
-`plain` — без него (`photo.png`), `random` — нейтральное случайное имя из двух слов и
-числа (`quiet-river-4821.png`). Режим действует на весь пакет и на пакетный `embed`
-(там имеют смысл `size`/`plain` — имя и так без размера — и `random`). Если результат
-пишется рядом с исходником, `plain` и `random` всё равно не трогают оригинал: занятое
-имя получает суффикс (`photo-2.png`).
+`plain` — без него (`photo.png`), `random` — нейтральное случайное имя (по умолчанию
+два слова и число: `green-apple-4821.png`). Режим действует на весь пакет и на
+пакетный `embed` (там имеют смысл `size`/`plain` — имя и так без размера — и
+`random`). Если результат пишется рядом с исходником, `plain` и `random` всё равно
+не трогают оригинал: занятое имя получает суффикс (`photo-2.png`).
+
+Вид случайного имени задают три флага: `--random-style words|chars` — слова
+(`green-apple-4821`) или набор символов (`k7fq2mzp`), `--random-length N` — длина
+набора (3…48, по умолчанию 10) и `--random-alphabet НАБОР` — из каких символов
+собирать имя (по умолчанию `a-z0-9`; годятся латиница, цифры, `-` и `_`, остальное
+отбрасывается). В окне это переключатель «Вид случайного имени», поле «Длина»,
+поле «Символы» и готовые наборы рядом с ним. Короткие имена иногда совпадают —
+тогда файл получает суффикс `-2`, `-3`, как и любой другой результат.
 
 `--vary` делает размер не фиксированным, а случайным в заданных пределах:
 `--size 400 --vary 5` даёт файл на 395…405 МБ, и у каждого файла пакета отклонение
@@ -399,7 +414,7 @@ tests/
 ├── robustness.rs        устойчивость к обрезанию и повреждённым данным
 ├── cli_batch.rs         пакетные команды CLI: список файлов, папка результатов, коды выхода
 ├── cli_extras.rs        план, папки и списки, режимы размера, --jobs, отчёты, бандлы, verify
-├── cli_names.rs         режимы имён результатов: с размером, без него и случайные
+├── cli_names.rs         режимы имён: с размером, без него, случайные слова и набор символов
 ├── cli_generate.rs      создание файлов «с нуля»: точный размер, несжимаемость, второе дно
 └── cli_jitter.rs        разброс размера: --vary и --vary-mode (диапазоны, имя, ошибки)
 
@@ -410,7 +425,8 @@ docs/
     ├── v0.4.0.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.5.0.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.5.1.md        описание релиза с плейсхолдерами SHA-256
-    └── v0.5.2.md        описание релиза с плейсхолдерами SHA-256
+    ├── v0.5.2.md        описание релиза с плейсхолдерами SHA-256
+    └── v0.5.3.md        описание релиза с плейсхолдерами SHA-256
 
 scripts/
 ├── check_linux_build.sh    проверка собранного Linux-бинарника
@@ -459,7 +475,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 --bins
 ### Тесты и линтеры
 
 ```powershell
-cargo test                        # 126 тестов: юнит, сквозные, разброс и на устойчивость
+cargo test                        # 137 тестов: юнит, сквозные, разброс, имена и на устойчивость
 cargo clippy --all-targets
 cargo fmt --check
 bash scripts/check_linux_build.sh # проверка Linux-бинарника (в Linux или WSL)

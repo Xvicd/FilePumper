@@ -1,4 +1,4 @@
-FilePumper 0.5.2 — готовые сборки
+FilePumper 0.5.3 — готовые сборки
 ===========================================
 
 windows\
@@ -11,14 +11,16 @@ windows\
     FilePumper-cli.exe pump <вход>... --size <МБ>[,<МБ>...]
                         [--size-mode exact|at-least|add]
                         [--vary <МБ> [--vary-mode plus|minus|both]]
-                        [--names size|plain|random]
+                        [--names size|plain|random] [--random-style words|chars]
+                        [--random-length N] [--random-alphabet НАБОР]
                         [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--jobs N]
                         [--dry-run] [--report отчёт.csv|.json] [--skip-unsupported]
     FilePumper-cli.exe pump --from-dir ПАПКА [--recursive] [--ext png,jpg] --size 10
     FilePumper-cli.exe pump --from-file список.txt --size 10
     FilePumper-cli.exe generate --size 10 --type png [--count N] [--name ОСНОВА]
                         [--vary <МБ> [--vary-mode plus|minus|both]]
-                        [--names size|plain|random] [--payload <файл> ...] [--out-dir ПАПКА]
+                        [--names size|plain|random] [--random-style words|chars]
+                        [--payload <файл> ...] [--out-dir ПАПКА]
                         [--dry-run] [--verify]
     FilePumper-cli.exe embed <носитель>... --payload <файл> [--payload <файл>...]
                         [--out-dir ПАПКА] [--copies 1..3] [--compress] [--password ПАРОЛЬ]
@@ -40,7 +42,11 @@ windows\
   Пример: .\FilePumper-cli.exe generate --size 5,10 --count 2 --type png --out-dir .\big
 
   Имена результатов: --names size (по умолчанию, размер в имени), --names plain
-  (photo.png), --names random (quiet-river-4821.png). Занятое имя получает суффикс.
+  (photo.png), --names random (green-apple-4821.png). Занятое имя получает суффикс.
+  Вид случайного имени: --random-style words|chars (слова или набор символов),
+  --random-length N (3…48, по умолчанию 10) и --random-alphabet НАБОР (например
+  0123456789abcdef; годятся латиница, цифры, «-» и «_»). Пример:
+  .\FilePumper-cli.exe pump .\photos\* --size 5 --names random --random-style chars --random-length 8
 
   Пакетная накачка: можно передать сразу несколько файлов. Ошибка одного файла
   не прерывает остальные, в конце печатается сводка. Результаты получают имя
