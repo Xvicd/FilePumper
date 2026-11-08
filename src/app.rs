@@ -365,6 +365,15 @@ impl PumperApp {
     fn size_range_hint(&self) -> Option<String> {
         let mb = self.target_mb_value()?;
         let jitter = self.jitter().ok().flatten()?;
+        // При «не меньше» и «прибавить» база зависит от исходного файла, поэтому
+        // точный диапазон в мегабайтах показать нельзя — только напомнить правило.
+        if self.size_mode != TargetMode::Exact {
+            return Some(format!(
+                "Разброс {} применится к размеру, который получится после режима «{}».",
+                jitter.label(),
+                self.size_mode.label()
+            ));
+        }
         let base = (mb * MIB as f64) as u64;
         let (low, high) = jitter.range(base);
         Some(format!(
@@ -1354,7 +1363,11 @@ impl PumperApp {
                     ui.weak(hint);
                 }
                 if jitter.mode != JitterMode::Plus {
-                    if let Some(base) = self.target_mb_value().map(|mb| (mb * MIB as f64) as u64) {
+                    if let Some(base) = self
+                        .target_mb_value()
+                        .filter(|_| self.size_mode == TargetMode::Exact)
+                        .map(|mb| (mb * MIB as f64) as u64)
+                    {
                         if jitter.spread >= base {
                             ui.colored_label(
                                 WARN_COLOR,
