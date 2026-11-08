@@ -1,4 +1,4 @@
-FilePumper 0.5.0 — готовые сборки
+FilePumper 0.5.1 — готовые сборки
 ===========================================
 
 windows\
@@ -9,12 +9,15 @@ windows\
     FilePumper-cli.exe --help
     FilePumper-cli.exe --version
     FilePumper-cli.exe pump <вход>... --size <МБ>[,<МБ>...]
-                        [--size-mode exact|at-least|add] [--names size|plain|random]
+                        [--size-mode exact|at-least|add]
+                        [--vary <МБ> [--vary-mode plus|minus|both]]
+                        [--names size|plain|random]
                         [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--jobs N]
                         [--dry-run] [--report отчёт.csv|.json] [--skip-unsupported]
     FilePumper-cli.exe pump --from-dir ПАПКА [--recursive] [--ext png,jpg] --size 10
     FilePumper-cli.exe pump --from-file список.txt --size 10
     FilePumper-cli.exe generate --size 10 --type png [--count N] [--name ОСНОВА]
+                        [--vary <МБ> [--vary-mode plus|minus|both]]
                         [--names size|plain|random] [--payload <файл> ...] [--out-dir ПАПКА]
                         [--dry-run] [--verify]
     FilePumper-cli.exe embed <носитель>... --payload <файл> [--payload <файл>...]
@@ -22,6 +25,13 @@ windows\
     FilePumper-cli.exe extract <носитель>... [--out-dir ПАПКА] [--password ПАРОЛЬ]
     FilePumper-cli.exe inspect <носитель>...
     FilePumper-cli.exe verify <носитель>...
+
+  Разброс размера: --vary 5 делает размер случайным в пределах ±5 МБ
+  (--size 400 --vary 5 → файл на 395…405 МБ). Направление задаёт
+  --vary-mode: both — в обе стороны (по умолчанию), plus — только прибавлять,
+  minus — только убавлять. Отклонение считается для каждого файла отдельно, а
+  файл записывается ровно того размера, который выпал (--verify это проверяет).
+  Пример: .\FilePumper-cli.exe generate --size 400 --vary 5 --type png --out-dir .\big
 
   Файлы с нуля: generate (алиас make) создаёт файл нужного размера без исходника —
   внутри криптослучайные байты, поэтому zip/gzip/7z его не сожмут. Тип задаётся
