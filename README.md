@@ -7,7 +7,7 @@
 ![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)
 ![Windows | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![MIT](https://img.shields.io/badge/license-MIT-green)
-![Версия 0.5.6](https://img.shields.io/badge/version-0.5.6-lightgrey)
+![Версия 0.5.7](https://img.shields.io/badge/version-0.5.7-lightgrey)
 
 ## Содержание
 
@@ -84,6 +84,19 @@
   извлечением, показ результата в проводнике, окно свободно масштабируется,
   настройки (вкладка, метод, размер, разброс, имена, папка, копии) сохраняются
   между запусками.
+- **CLI для скриптов** — `--quiet`, `--no-progress`, `--json` (машинный вывод у
+  всех команд и `--dry-run`), `--password-file`, `--password-stdin`,
+  `--jobs 0` (по числу ядер), скорость и ETA в прогресс-баре; дополнения для
+  bash/zsh/fish/PowerShell — `file-pumper-cli completions <shell>`.
+- **Пары по именам** — `--pair-by name` или кнопка «Сопоставить по именам»:
+  `photo.png` получает `photo.zip` и `photo.mp3`, `report.pdf` — `report.*`.
+  Несколько файлов с одной основой упаковываются в бандл.
+- **Профили и пресеты** — сохраните текущие настройки под именем и загружайте
+  одним нажатием; быстрые размеры 2/5/10/20/50/100 МБ.
+- **Пароли в окне** — переключатель «Показать пароли» и подсказка о надёжности
+  (слабый/средний/сильный).
+- **Разные зоны drag & drop** — на вкладке «Спрятать / извлечь» файлы,
+  брошенные на носители, не попадают в нагрузку, и наоборот.
 - **CLI** — `pump`, `embed`, `extract`, `inspect`, `verify`, коды выхода `0`/`1`,
   `--help`, `--version`.
 
@@ -108,7 +121,7 @@ workflow подставляет сам — по фактически залит�
 подгружаются динамически и нужны только окну:
 
 ```bash
-tar -xzf FilePumper-0.5.6-linux-x64.tar.gz
+tar -xzf FilePumper-0.5.7-linux-x64.tar.gz
 chmod +x linux/file-pumper linux/file-pumper-cli
 ./linux/file-pumper-cli --help
 ```
@@ -160,6 +173,12 @@ chmod +x linux/file-pumper linux/file-pumper-cli
 | `inspect <носитель>... [--password ПАРОЛЬ]` | показать, что лежит внутри каждого файла, с итогом «что можно извлечь» |
 | `verify <носитель>... [--password ПАРОЛЬ]` | перечитать файл и проверить контрольные суммы |
 | `--help`, `--version` | справка и версия |
+
+Для скриптов у команд есть `--quiet` (без прогресса и служебного текста),
+`--no-progress` (только без полосы прогресса), `--json` (машинный вывод),
+`--password-file` (пароль из файла, по строке на пароль), `--password-stdin` и
+`--jobs 0` (число потоков по числу ядер). Ошибки по-прежнему пишутся в stderr,
+код выхода — `0`/`1`.
 
 ```powershell
 # накачать до 25 МБ методом png-chunks (методы: animation, png-chunks, upscale, svg, office, padding)
@@ -217,6 +236,12 @@ file-pumper-cli embed .\one.png .\two.png --payload .\secret.zip --out-dir .\out
 
 # своя нагрузка в свой носитель и со своим паролем
 file-pumper-cli embed .\one.png .\two.png --payload .\a.mp3 --payload .\b.pdf --pair --pair-password первый --pair-password второй --out-dir .\out
+
+# сопоставить пары по основе имени: photo.png ← photo.zip, report.pdf ← report.mp3
+file-pumper-cli embed .\photo.png .\report.pdf --payload .\photo.zip --payload .\report.mp3 --pair-by name --out-dir .\out
+
+# машинный вывод для скрипта: JSON без прогресса
+file-pumper-cli pump .\photo.jpg --size 10 --json --quiet
 
 # проверить целостность и извлечь обратно
 file-pumper-cli verify .\out\photo_with_payload.png --password пароль
@@ -514,7 +539,8 @@ docs/
     ├── v0.5.3.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.5.4.md        описание релиза, SHA-256 подставлены
     ├── v0.5.5.md        описание релиза с плейсхолдерами SHA-256
-    └── v0.5.6.md        описание релиза с плейсхолдерами SHA-256
+    ├── v0.5.6.md        описание релиза с плейсхолдерами SHA-256
+    └── v0.5.7.md        описание релиза с плейсхолдерами SHA-256
 
 scripts/
 ├── check_linux_build.sh    проверка собранного Linux-бинарника
@@ -563,7 +589,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 --bins
 ### Тесты и линтеры
 
 ```powershell
-cargo test                        # 168 тестов: юнит, сквозные, разброс, имена и на устойчивость
+cargo test                        # 177 тестов: юнит, сквозные, разброс, имена и на устойчивость
 cargo clippy --all-targets
 cargo fmt --check
 bash scripts/check_linux_build.sh # проверка Linux-бинарника (в Linux или WSL)

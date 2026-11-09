@@ -1,4 +1,4 @@
-FilePumper 0.5.6 — готовые сборки
+FilePumper 0.5.7 — готовые сборки
 ===========================================
 
 windows\
@@ -27,8 +27,13 @@ windows\
                         [--out-dir ПАПКА] [--copies 1..3] [--compress] [--password ПАРОЛЬ]
                         [--pair [--pair-password ПАРОЛЬ ...]]
     FilePumper-cli.exe extract <носитель>... [--out-dir ПАПКА] [--password ПАРОЛЬ]
-    FilePumper-cli.exe inspect <носитель>...
-    FilePumper-cli.exe verify <носитель>...
+    FilePumper-cli.exe inspect <носитель>... [--json]
+    FilePumper-cli.exe verify <носитель>... [--json]
+
+  Для скриптов: --quiet (без прогресса и служебного текста), --no-progress,
+  --json (машинный вывод), --password-file ФАЙЛ, --password-stdin и --jobs 0
+  (число потоков по числу ядер). Пары можно сопоставлять по именам:
+  --pair-by name (photo.png ← photo.zip, report.pdf ← report.mp3).
 
   Разброс размера: --vary 5 делает размер случайным в пределах ±5 МБ
   (--size 400 --vary 5 → файл на 395…405 МБ). Направление задаёт

@@ -77,6 +77,44 @@ fn pair_password(passwords: &[Option<String>], index: usize) -> Option<String> {
     }
 }
 
+/// Как сопоставлять носители и нагрузки при групповом встраивании.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PairMode {
+    /// Первый носитель получает первую нагрузку, второй — вторую и так далее.
+    #[default]
+    Order,
+    /// Носитель и нагрузка совпадают по основе имени: `photo.png` ↔ `photo.zip`.
+    Name,
+}
+
+impl PairMode {
+    pub const ALL: [PairMode; 2] = [PairMode::Order, PairMode::Name];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_lowercase().as_str() {
+            "order" | "по-порядку" | "порядок" => Ok(PairMode::Order),
+            "name" | "names" | "по-именам" | "имя" => Ok(PairMode::Name),
+            other => Err(format!(
+                "Неизвестный способ сопоставления пар: {other}. Допустимо: order, name."
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PairMode::Order => "по порядку",
+            PairMode::Name => "по именам",
+        }
+    }
+}
+
+/// Основа имени для сопоставления: `photo.png` и `Photo.zip` дают `photo`.
+fn match_key(path: &Path) -> Option<String> {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().trim().to_lowercase())
+        .filter(|stem| !stem.is_empty())
+}
+
 /// Делит нагрузки между носителями: поровну и без пустых групп.
 ///
 /// Нагрузок не больше, чем носителей — каждая идёт в свой носитель, лишние
@@ -125,6 +163,82 @@ pub fn pair_by_order(
             password: pair_password(passwords, index),
         })
         .collect())
+}
+
+/// Сопоставляет носители и нагрузки по основе имени.
+///
+/// `photo.png` получает `photo.zip` и `photo.mp3` (несколько файлов — бандл),
+/// `report.pdf` — `report.txt`. Регистр не важен. Если хотя бы одному файлу
+/// не нашлось пары, возвращается ошибка со списком таких файлов — лучше
+/// показать её сразу, чем молча разложить данные не туда.
+pub fn pair_by_name(
+    carriers: &[PathBuf],
+    payloads: &[PathBuf],
+    passwords: &[Option<String>],
+) -> Result<Vec<EmbedPair>, String> {
+    if carriers.is_empty() {
+        return Err("Не указан ни один носитель.".to_owned());
+    }
+    if payloads.is_empty() {
+        return Err("Не указан ни один файл нагрузки.".to_owned());
+    }
+    let mut remaining: std::collections::HashMap<String, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for payload in payloads {
+        let key = match_key(payload).ok_or_else(|| {
+            format!(
+                "У файла нагрузки нет имени для сопоставления: {}",
+                payload.display()
+            )
+        })?;
+        remaining.entry(key).or_default().push(payload.clone());
+    }
+
+    let mut pairs = Vec::with_capacity(carriers.len());
+    let mut missing = Vec::new();
+    for (index, carrier) in carriers.iter().enumerate() {
+        let Some(key) = match_key(carrier) else {
+            missing.push(format!("{} (нет имени)", carrier.display()));
+            continue;
+        };
+        match remaining.remove(&key) {
+            Some(group) => pairs.push(EmbedPair {
+                carrier: carrier.clone(),
+                payloads: group,
+                password: pair_password(passwords, index),
+            }),
+            None => missing.push(format!("{} (нет нагрузки «{key}»)", carrier.display())),
+        }
+    }
+    if !missing.is_empty() {
+        let mut details = vec![format!("не найдены пары для: {}", missing.join(", "))];
+        if !remaining.is_empty() {
+            let mut leftovers: Vec<String> = remaining
+                .into_values()
+                .flatten()
+                .map(|path| file_label(&path))
+                .collect();
+            leftovers.sort();
+            details.push(format!("лишние нагрузки: {}", leftovers.join(", ")));
+        }
+        return Err(format!(
+            "Не удалось сопоставить по именам: {}.",
+            details.join("; ")
+        ));
+    }
+    if !remaining.is_empty() {
+        let mut leftovers: Vec<String> = remaining
+            .into_values()
+            .flatten()
+            .map(|path| file_label(&path))
+            .collect();
+        leftovers.sort();
+        return Err(format!(
+            "Эти файлы нагрузки остались без носителя: {}.",
+            leftovers.join(", ")
+        ));
+    }
+    Ok(pairs)
 }
 
 /// Что нашлось в одном файле при обзоре группы.
@@ -503,6 +617,51 @@ mod tests {
         assert!(pairs
             .iter()
             .all(|pair| pair.payloads == paths(&["secret.pdf"])));
+    }
+
+    #[test]
+    fn pairs_by_name_match_stems_and_ignore_case() {
+        let pairs = pair_by_name(
+            &paths(&["Photo.PNG", "report.pdf"]),
+            &paths(&["photo.zip", "REPORT.txt"]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].payloads, paths(&["photo.zip"]));
+        assert_eq!(pairs[1].payloads, paths(&["REPORT.txt"]));
+    }
+
+    #[test]
+    fn pairs_by_name_bundle_equal_stems() {
+        let pairs = pair_by_name(
+            &paths(&["photo.png"]),
+            &paths(&["photo.zip", "photo.mp3"]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].bundle());
+        assert_eq!(pairs[0].payloads.len(), 2);
+    }
+
+    #[test]
+    fn pairs_by_name_report_missing_matches() {
+        let error = pair_by_name(
+            &paths(&["photo.png", "report.pdf"]),
+            &paths(&["photo.zip", "other.mp3"]),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("report.pdf"), "{error}");
+        assert!(error.contains("other.mp3"), "{error}");
+    }
+
+    #[test]
+    fn pair_mode_parses_russian_and_english_names() {
+        assert_eq!(PairMode::parse("order").unwrap(), PairMode::Order);
+        assert_eq!(PairMode::parse("по-именам").unwrap(), PairMode::Name);
+        assert!(PairMode::parse("что-то").is_err());
     }
 
     #[test]

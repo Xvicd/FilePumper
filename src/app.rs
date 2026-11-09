@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Instant;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -11,10 +12,14 @@ use crate::batch::{
     self, BatchItem, GenerateTargets, JitterMode, MixMode, NameMode, Names, PumpPlan, RandomNames,
     RandomStyle, SizeJitter, TargetMode,
 };
+use crate::payload::group::PairMode;
 use crate::payload::{self, ContainerOptions, PayloadSummary};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::scan;
-use crate::util::{reveal_in_explorer, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB};
+use crate::util::{
+    format_duration, format_speed, password_strength, reveal_in_explorer, CancelToken, Job,
+    PasswordStrength, Reservations, CANCELLED_MESSAGE, MIB,
+};
 
 /// Цвет успешного результата в списке файлов.
 const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb3, 0x71);
@@ -43,6 +48,7 @@ enum WorkerMessage {
     /// Готова одна пара группового встраивания: номер и короткая заметка.
     PairDone(usize, Result<String, String>),
     BatchItemStarted(usize),
+    BatchItemProgress(usize, f32, String),
     BatchItemDone(usize, Result<u64, String>),
     BatchFinished {
         ok: bool,
@@ -57,12 +63,14 @@ struct BatchRow {
     input: PathBuf,
     status: String,
     ok: Option<bool>,
+    progress: f32,
 }
 
 /// Пара группового встраивания: куда спрятать, что спрятать и свой пароль.
 struct PairRow {
     carrier: PathBuf,
-    payload: PathBuf,
+    /// Один файл — обычное встраивание, несколько — бандл внутри контейнера.
+    payloads: Vec<PathBuf>,
     /// Пустая строка — использовать общий пароль из блока «Что спрятать».
     password: String,
     ok: Option<bool>,
@@ -70,13 +78,25 @@ struct PairRow {
 }
 
 impl PairRow {
-    fn new(carrier: PathBuf, payload: PathBuf, password: String) -> Self {
+    fn new(carrier: PathBuf, payloads: Vec<PathBuf>, password: String) -> Self {
         Self {
             carrier,
-            payload,
+            payloads,
             password,
             ok: None,
             note: String::new(),
+        }
+    }
+
+    fn payloads_label(&self) -> String {
+        match self.payloads.as_slice() {
+            [] => "пусто".to_owned(),
+            [only] => only
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("файл")
+                .to_owned(),
+            many => format!("{} файла (бандл)", many.len()),
         }
     }
 }
@@ -153,6 +173,15 @@ struct Settings {
     gen_count: usize,
     gen_attach: bool,
 }
+
+/// Сохранённый набор настроек окна: метод, размер, имена, папка и прочее.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Profile {
+    name: String,
+    settings: Settings,
+}
+
+const PROFILES_KEY: &str = "file_pumper_profiles";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -262,6 +291,15 @@ pub struct PumperApp {
     scan: Vec<payload::group::ScanItem>,
     /// Пароль для проверки и извлечения: может отличаться от пароля встраивания.
     extract_password: String,
+    /// Показывать пароли открытым текстом (общий переключатель для всех полей).
+    show_passwords: bool,
+    /// Профили настроек, сохраняемые между запусками.
+    profiles: Vec<Profile>,
+    profile_name: String,
+    selected_profile: Option<usize>,
+    /// Прямоугольники зон drag & drop на вкладке «Спрятать / извлечь».
+    carrier_drop_rect: Option<egui::Rect>,
+    payload_drop_rect: Option<egui::Rect>,
 }
 
 impl Default for PumperApp {
@@ -301,6 +339,12 @@ impl Default for PumperApp {
             pairs: Vec::new(),
             scan: Vec::new(),
             extract_password: String::new(),
+            show_passwords: false,
+            profiles: Vec::new(),
+            profile_name: String::new(),
+            selected_profile: None,
+            carrier_drop_rect: None,
+            payload_drop_rect: None,
         }
     }
 }
@@ -316,6 +360,9 @@ impl PumperApp {
         if let Some(storage) = cc.storage {
             if let Some(settings) = eframe::get_value::<Settings>(storage, eframe::APP_KEY) {
                 app.apply_settings(settings);
+            }
+            if let Some(profiles) = eframe::get_value::<Vec<Profile>>(storage, PROFILES_KEY) {
+                app.profiles = profiles;
             }
         }
         app
@@ -424,6 +471,128 @@ impl PumperApp {
         }
         self.gen_count = settings.gen_count.clamp(1, 64);
         self.gen_attach = settings.gen_attach;
+    }
+
+    /// Сохранить текущие настройки как профиль (или обновить выбранный).
+    fn save_profile(&mut self) {
+        let name = self.profile_name.trim();
+        let name = if name.is_empty() {
+            format!("Профиль {}", self.profiles.len() + 1)
+        } else {
+            name.to_owned()
+        };
+        let profile = Profile {
+            name: name.clone(),
+            settings: self.settings(),
+        };
+        // Совпало имя — обновляем его; новое имя создаёт отдельный профиль,
+        // даже если в списке был выбран другой.
+        let existing = self
+            .profiles
+            .iter()
+            .position(|item| item.name.eq_ignore_ascii_case(&name));
+        match existing {
+            Some(index) => {
+                self.profiles[index] = profile;
+                self.selected_profile = Some(index);
+            }
+            None => {
+                self.profiles.push(profile);
+                self.selected_profile = Some(self.profiles.len() - 1);
+            }
+        }
+        self.profile_name = name.clone();
+        self.status = format!("Профиль «{name}» сохранён.");
+    }
+
+    fn load_profile(&mut self) {
+        let Some(profile) = self
+            .selected_profile
+            .and_then(|index| self.profiles.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        self.apply_settings(profile.settings);
+        self.profile_name = profile.name.clone();
+        self.status = format!("Загружен профиль «{}».", profile.name);
+    }
+
+    fn delete_profile(&mut self) {
+        let Some(index) = self.selected_profile else {
+            return;
+        };
+        if index >= self.profiles.len() {
+            self.selected_profile = None;
+            return;
+        }
+        let removed = self.profiles.remove(index);
+        self.selected_profile = if self.profiles.is_empty() {
+            None
+        } else {
+            Some(index.min(self.profiles.len() - 1))
+        };
+        self.status = format!("Профиль «{}» удалён.", removed.name);
+    }
+
+    /// Компактная строка профилей над вкладками.
+    fn profiles_ui(&mut self, ui: &mut egui::Ui) {
+        let names: Vec<String> = self
+            .profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Профиль:");
+            let selected = self
+                .selected_profile
+                .and_then(|index| names.get(index))
+                .cloned()
+                .unwrap_or_else(|| "—".to_owned());
+            egui::ComboBox::from_id_salt("profile_select")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (index, name) in names.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.selected_profile == Some(index), name)
+                            .clicked()
+                        {
+                            self.selected_profile = Some(index);
+                        }
+                    }
+                });
+            if ui
+                .add_enabled(
+                    !self.busy && self.selected_profile.is_some(),
+                    egui::Button::new("Загрузить"),
+                )
+                .clicked()
+            {
+                self.load_profile();
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Сохранить"))
+                .on_hover_text("Сохранить текущие настройки в выбранный или новый профиль")
+                .clicked()
+            {
+                self.save_profile();
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && self.selected_profile.is_some(),
+                    egui::Button::new("Удалить"),
+                )
+                .clicked()
+            {
+                self.delete_profile();
+            }
+            ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::singleline(&mut self.profile_name)
+                    .hint_text("название профиля")
+                    .desired_width(180.0),
+            );
+        });
     }
 
     /// Настройки случайных имён из полей окна: длина и алфавит поправляются.
@@ -565,6 +734,7 @@ impl PumperApp {
                 input: path,
                 status: "Ожидает".to_owned(),
                 ok: None,
+                progress: 0.0,
             });
             added += 1;
         }
@@ -610,6 +780,7 @@ impl PumperApp {
         for row in self.rows.iter_mut() {
             row.ok = None;
             row.status = "Ожидает".to_owned();
+            row.progress = 0.0;
         }
         for (input, message) in &planned.rejected {
             if let Some(row) = self.rows.iter_mut().find(|row| &row.input == input) {
@@ -627,11 +798,24 @@ impl PumperApp {
             self.result_dialog = Some((false, "Ни один файл не подошёл.".to_owned(), None));
             return;
         }
+        let total_target: u64 = work.iter().map(|(_, item)| item.target).sum();
+        if let Some(directory) = work
+            .first()
+            .and_then(|(_, item)| item.output.parent())
+            .filter(|value| !value.as_os_str().is_empty())
+        {
+            if let Some(warning) = crate::util::disk_space_warning(directory, total_target) {
+                self.result_dialog = Some((false, warning, None));
+                return;
+            }
+        }
 
         let (sender, cancel) = self.begin_job();
         self.status = "Подготовка...".to_owned();
+        let total_bytes: u64 = work.iter().map(|(_, item)| item.target).sum();
         thread::spawn(move || {
             let total = work.len();
+            let started = Instant::now();
             let mut created = 0_usize;
             let mut failed = 0_usize;
             let mut cancelled = false;
@@ -648,12 +832,26 @@ impl PumperApp {
                 }
                 let _ = sender.send(WorkerMessage::BatchItemStarted(row_index));
                 let progress_sender = sender.clone();
+                let row_sender = sender.clone();
                 let progress = move |percent: f32, text: &str| {
                     let within = percent.clamp(0.0, 100.0) / 100.0;
                     let overall = ((position as f32 + within) / total as f32).clamp(0.0, 1.0);
-                    let _ = progress_sender.send(WorkerMessage::Progress(
-                        overall,
-                        format!("Файл {}/{}: {text}", position + 1, total),
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let mut message = format!("Файл {}/{}: {text}", position + 1, total);
+                    if elapsed > 0.25 && overall > 0.0 {
+                        message.push_str("  ");
+                        message
+                            .push_str(&format_speed(total_bytes as f64 * overall as f64 / elapsed));
+                    }
+                    if overall > 0.005 && overall < 0.999 {
+                        let eta = elapsed * (1.0 - overall as f64) / overall as f64;
+                        message.push_str(&format!("  ETA {}", format_duration(eta)));
+                    }
+                    let _ = progress_sender.send(WorkerMessage::Progress(overall, message));
+                    let _ = row_sender.send(WorkerMessage::BatchItemProgress(
+                        row_index,
+                        percent,
+                        text.to_owned(),
                     ));
                 };
                 let item_job = job.child(&progress);
@@ -778,6 +976,17 @@ impl PumperApp {
             self.result_dialog = Some((false, "Нечего создавать.".to_owned(), None));
             return;
         }
+        let total_target: u64 = items.iter().map(|item| item.target).sum();
+        if let Some(directory) = items
+            .first()
+            .and_then(|item| item.output.parent())
+            .filter(|value| !value.as_os_str().is_empty())
+        {
+            if let Some(warning) = crate::util::disk_space_warning(directory, total_target) {
+                self.result_dialog = Some((false, warning, None));
+                return;
+            }
+        }
 
         let options = ContainerOptions {
             compress: self.embed_compress,
@@ -787,8 +996,10 @@ impl PumperApp {
         let copies = self.embed_copies.clamp(1, 3);
         let (sender, cancel) = self.begin_job();
         self.status = "Создание файлов...".to_owned();
+        let total_bytes: u64 = items.iter().map(|item| item.target).sum();
         thread::spawn(move || {
             let total = items.len();
+            let started = Instant::now();
             let mut created = 0_usize;
             let mut failed = 0_usize;
             let mut cancelled = false;
@@ -808,10 +1019,18 @@ impl PumperApp {
                 let progress = move |percent: f32, text: &str| {
                     let within = percent.clamp(0.0, 100.0) / 100.0;
                     let overall = ((position as f32 + within) / total as f32).clamp(0.0, 1.0);
-                    let _ = progress_sender.send(WorkerMessage::Progress(
-                        overall,
-                        format!("Файл {}/{}: {text}", position + 1, total),
-                    ));
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let mut message = format!("Файл {}/{}: {text}", position + 1, total);
+                    if elapsed > 0.25 && overall > 0.0 {
+                        message.push_str("  ");
+                        message
+                            .push_str(&format_speed(total_bytes as f64 * overall as f64 / elapsed));
+                    }
+                    if overall > 0.005 && overall < 0.999 {
+                        let eta = elapsed * (1.0 - overall as f64) / overall as f64;
+                        message.push_str(&format!("  ETA {}", format_duration(eta)));
+                    }
+                    let _ = progress_sender.send(WorkerMessage::Progress(overall, message));
                 };
                 let item_job = job.child(&progress);
                 match batch::generate_one(item, &options, copies, &item_job) {
@@ -1118,7 +1337,7 @@ impl PumperApp {
 
     /// Сопоставляет носители и нагрузки по порядку: первый носитель получает
     /// первую нагрузку и так далее.
-    fn fill_pairs(&mut self) {
+    fn fill_pairs(&mut self, mode: PairMode) {
         if self.carriers.is_empty() || self.payloads.is_empty() {
             self.result_dialog = Some((
                 false,
@@ -1130,15 +1349,28 @@ impl PumperApp {
         let carriers = self.carriers.clone();
         let payloads = self.payloads.clone();
         let shared = self.embed_password.trim().to_owned();
-        self.pairs = carriers
-            .iter()
-            .enumerate()
-            .map(|(index, carrier)| {
-                let payload = payloads[index % payloads.len()].clone();
-                PairRow::new(carrier.clone(), payload, shared.clone())
-            })
-            .collect();
-        self.status = format!("Пар готово: {}.", self.pairs.len());
+        let rows: Vec<PairRow> = match mode {
+            PairMode::Order => carriers
+                .iter()
+                .enumerate()
+                .map(|(index, carrier)| {
+                    let payload = payloads[index % payloads.len()].clone();
+                    PairRow::new(carrier.clone(), vec![payload], shared.clone())
+                })
+                .collect(),
+            PairMode::Name => match payload::group::pair_by_name(&carriers, &payloads, &[]) {
+                Ok(specs) => specs
+                    .into_iter()
+                    .map(|spec| PairRow::new(spec.carrier, spec.payloads, shared.clone()))
+                    .collect(),
+                Err(message) => {
+                    self.result_dialog = Some((false, message, None));
+                    return;
+                }
+            },
+        };
+        self.pairs = rows;
+        self.status = format!("Пар готово: {} ({}).", self.pairs.len(), mode.label());
     }
 
     /// Групповое встраивание: каждая пара даёт свой файл-носитель.
@@ -1150,7 +1382,9 @@ impl PumperApp {
         if let Some(bad) = self
             .pairs
             .iter()
-            .flat_map(|pair| [pair.carrier.clone(), pair.payload.clone()])
+            .flat_map(|pair| {
+                std::iter::once(pair.carrier.clone()).chain(pair.payloads.iter().cloned())
+            })
             .find(|path| !path.is_file())
         {
             self.result_dialog = Some((false, format!("Файл не найден: {}", bad.display()), None));
@@ -1171,8 +1405,11 @@ impl PumperApp {
         let mut plan: Vec<(payload::group::EmbedPair, PathBuf)> =
             Vec::with_capacity(self.pairs.len());
         for row in &self.pairs {
-            let mut spec =
-                payload::group::EmbedPair::single(row.carrier.clone(), row.payload.clone());
+            let mut spec = payload::group::EmbedPair {
+                carrier: row.carrier.clone(),
+                payloads: row.payloads.clone(),
+                password: None,
+            };
             spec.password = password_or_none(&row.password);
             let suggested = self.embed_suggested_path(&row.carrier);
             let candidate = match self.out_dir.as_ref() {
@@ -1432,18 +1669,29 @@ impl PumperApp {
                     if let Some(row) = self.rows.get_mut(index) {
                         row.status = "Обработка...".to_owned();
                         row.ok = None;
+                        row.progress = 0.0;
+                    }
+                }
+                WorkerMessage::BatchItemProgress(index, percent, text) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.progress = (percent / 100.0).clamp(0.0, 1.0);
+                        if row.ok.is_none() {
+                            row.status = text;
+                        }
                     }
                 }
                 WorkerMessage::BatchItemDone(index, Ok(size)) => {
                     if let Some(row) = self.rows.get_mut(index) {
                         row.status = format!("Готово: {:.2} МБ", size as f64 / MIB as f64);
                         row.ok = Some(true);
+                        row.progress = 1.0;
                     }
                 }
                 WorkerMessage::BatchItemDone(index, Err(error)) => {
                     if let Some(row) = self.rows.get_mut(index) {
                         row.status = format!("Ошибка: {error}");
                         row.ok = Some(false);
+                        row.progress = 1.0;
                     }
                 }
                 WorkerMessage::BatchFinished {
@@ -1476,6 +1724,44 @@ impl PumperApp {
         }
     }
 
+    fn add_carriers(&mut self, paths: &[PathBuf]) -> usize {
+        let mut added = 0_usize;
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            if self
+                .carriers
+                .iter()
+                .any(|existing| crate::util::same_file(existing, path))
+            {
+                continue;
+            }
+            self.carriers.push(path.clone());
+            added += 1;
+        }
+        added
+    }
+
+    fn add_payloads(&mut self, paths: &[PathBuf]) -> usize {
+        let mut added = 0_usize;
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            if self
+                .payloads
+                .iter()
+                .any(|existing| crate::util::same_file(existing, path))
+            {
+                continue;
+            }
+            self.payloads.push(path.clone());
+            added += 1;
+        }
+        added
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
@@ -1488,10 +1774,45 @@ impl PumperApp {
         if dropped.is_empty() {
             return;
         }
-        // Папки раскрываются рекурсивно. Все файлы попадают в пакет и в список
-        // носителей: так их сразу можно проверить и извлечь. Что спрятать —
-        // выбирается отдельно, чтобы случайный файл не стал нагрузкой.
         let expanded = scan::expand_dropped(&dropped);
+        if expanded.is_empty() {
+            return;
+        }
+
+        // На вкладке «Спрятать / извлечь» зоны различаются: файл, брошенный
+        // на блок носителей, не станет нагрузкой, и наоборот. Вне зон ничего
+        // не добавляем, чтобы случайное перетаскивание не путало списки.
+        if self.tab == Tab::Payload {
+            let pointer = ctx.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .or_else(|| input.pointer.latest_pos())
+            });
+            let over_carriers = pointer.is_some_and(|position| {
+                self.carrier_drop_rect
+                    .is_some_and(|rect| rect.contains(position))
+            });
+            let over_payloads = pointer.is_some_and(|position| {
+                self.payload_drop_rect
+                    .is_some_and(|rect| rect.contains(position))
+            });
+            if over_carriers {
+                let added = self.add_carriers(&expanded);
+                self.status = format!("Носителей добавлено: {added}.");
+                return;
+            }
+            if over_payloads {
+                let added = self.add_payloads(&expanded);
+                self.status = format!("Файлов нагрузки добавлено: {added}.");
+                return;
+            }
+            self.status = "Перетащите файлы в зону «Носители» или «Что спрятать».".to_owned();
+            return;
+        }
+
+        // На остальных вкладках прежнее поведение: файлы попадают в пакет
+        // накачки, а также в список носителей — их можно сразу проверить.
         for path in expanded.iter() {
             if !self
                 .carriers
@@ -1510,9 +1831,12 @@ impl PumperApp {
 impl eframe::App for PumperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_worker_messages();
-        self.handle_dropped_files(ctx);
         if ctx.input(|input| input.viewport().close_requested()) {
             self.cancel.cancel();
+        }
+        if self.tab != Tab::Payload {
+            self.carrier_drop_rect = None;
+            self.payload_drop_rect = None;
         }
 
         egui::TopBottomPanel::bottom("file_pumper_status").show(ctx, |ui| {
@@ -1553,6 +1877,7 @@ impl eframe::App for PumperApp {
                 }
             });
             ui.weak(self.tab.hint());
+            self.profiles_ui(ui);
             ui.separator();
 
             egui::ScrollArea::vertical()
@@ -1564,6 +1889,9 @@ impl eframe::App for PumperApp {
                 });
         });
 
+        // Зоны drop-а уже известны после отрисовки вкладки: обрабатываем
+        // перетаскивание здесь, чтобы файл попал именно в нужный список.
+        self.handle_dropped_files(ctx);
         self.show_result_dialog(ctx);
         self.show_preview_dialog(ctx);
     }
@@ -1571,17 +1899,52 @@ impl eframe::App for PumperApp {
     /// Сохраняет настройки между запусками (пароль не сохраняется).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings());
+        eframe::set_value(storage, PROFILES_KEY, &self.profiles);
     }
 }
 
 /// Рамка-группа с заголовком: одинаковое оформление всех блоков окна.
-fn group_ui(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.group(|ui| {
+fn group_ui(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
+    let response = ui.group(|ui| {
         ui.set_width(ui.available_width());
         ui.label(egui::RichText::new(title).strong());
         add(ui);
     });
     ui.add_space(6.0);
+    response.response.rect
+}
+
+/// Подсказка о надёжности пароля под полем ввода.
+fn password_strength_ui(ui: &mut egui::Ui, value: &str) {
+    let Some(strength) = password_strength(value) else {
+        return;
+    };
+    let color = match strength {
+        PasswordStrength::Weak => ERROR_COLOR,
+        PasswordStrength::Medium => WARN_COLOR,
+        PasswordStrength::Strong => OK_COLOR,
+    };
+    ui.colored_label(color, format!("Надёжность пароля: {}", strength.label()));
+}
+
+/// Подсвечивает зону, над которой сейчас находится перетаскиваемый файл.
+fn paint_drop_zones(ui: &egui::Ui, carriers: Option<egui::Rect>, payloads: Option<egui::Rect>) {
+    let dragging = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
+    if !dragging {
+        return;
+    }
+    let pointer = ui.ctx().input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .or_else(|| input.pointer.latest_pos())
+    });
+    for rect in [carriers, payloads].into_iter().flatten() {
+        if pointer.is_some_and(|position| rect.contains(position)) {
+            ui.painter()
+                .rect_stroke(rect, 6.0, egui::Stroke::new(2.0_f32, OK_COLOR));
+        }
+    }
 }
 
 /// Кнопка-действие: крупная, чтобы её было видно сразу.
@@ -1718,6 +2081,13 @@ impl PumperApp {
                                 ui.weak(&row.status);
                             }
                         }
+                        if row.ok.is_none() && self.busy {
+                            ui.add(
+                                egui::ProgressBar::new(row.progress)
+                                    .desired_width(90.0)
+                                    .show_percentage(),
+                            );
+                        }
                     });
                 }
             });
@@ -1745,6 +2115,17 @@ impl PumperApp {
                         ui.selectable_value(&mut self.size_mode, mode, mode.title());
                     }
                 });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Быстро:");
+            for mb in [2_u64, 5, 10, 20, 50, 100] {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new(format!("{mb} МБ")).small())
+                    .clicked()
+                {
+                    self.target_mb = mb.to_string();
+                }
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Разброс:");
@@ -1915,10 +2296,17 @@ impl PumperApp {
 
     /// Вкладка «Спрятать / извлечь»: носители, нагрузка, пары и опции контейнера.
     fn payload_tab_ui(&mut self, ui: &mut egui::Ui) {
-        group_ui(
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut self.show_passwords, "👁 Показать пароли");
+        });
+        ui.add_space(4.0);
+        self.carrier_drop_rect = Some(group_ui(
             ui,
             "1. Носители: в них прячем или из них достаём",
             |ui| {
+                ui.weak(
+                    "⬇ Зона носителей: перетащите сюда PNG, JPEG, GIF, WebP, SVG или любой файл",
+                );
                 path_list_ui(
                     ui,
                     "Выбрать носители...",
@@ -1962,49 +2350,57 @@ impl PumperApp {
                     ui.add_enabled(
                         !self.busy,
                         egui::TextEdit::singleline(&mut self.extract_password)
-                            .password(true)
+                            .password(!self.show_passwords)
                             .hint_text("несколько паролей — через запятую")
                             .desired_width(260.0),
                     );
                 });
+                password_strength_ui(ui, &self.extract_password);
                 self.scan_ui(ui);
             },
-        );
-        group_ui(ui, "2. Что спрятать (нагрузка)", |ui| {
-            path_list_ui(
-                ui,
-                "Выбрать нагрузку...",
-                "файлы, которые нужно спрятать (несколько — упакуются в бандл)",
-                &[],
-                self.busy,
-                &mut self.payloads,
-            );
-            ui.add_space(4.0);
-            ui.add_enabled(
-                !self.busy,
-                egui::Checkbox::new(
-                    &mut self.embed_compress,
-                    "Сжимать нагрузку (deflate) перед встраиванием",
-                ),
-            );
-            ui.horizontal(|ui| {
-                ui.label("Копий внутри (устойчивость к обрезке):");
+        ));
+        self.payload_drop_rect = Some(group_ui(
+            ui,
+            "2. Что спрятать (нагрузка)",
+            |ui| {
+                ui.weak("⬇ Зона нагрузки: перетащите сюда файлы, которые нужно спрятать");
+                path_list_ui(
+                    ui,
+                    "Выбрать нагрузку...",
+                    "файлы, которые нужно спрятать (несколько — упакуются в бандл)",
+                    &[],
+                    self.busy,
+                    &mut self.payloads,
+                );
+                ui.add_space(4.0);
                 ui.add_enabled(
                     !self.busy,
-                    egui::DragValue::new(&mut self.embed_copies).range(1..=3),
+                    egui::Checkbox::new(
+                        &mut self.embed_compress,
+                        "Сжимать нагрузку (deflate) перед встраиванием",
+                    ),
                 );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Пароль (необязательно):");
-                ui.add_enabled(
-                    !self.busy,
-                    egui::TextEdit::singleline(&mut self.embed_password)
-                        .password(true)
-                        .hint_text("Argon2id + ChaCha20-Poly1305")
-                        .desired_width(240.0),
-                );
-            });
-        });
+                ui.horizontal(|ui| {
+                    ui.label("Копий внутри (устойчивость к обрезке):");
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.embed_copies).range(1..=3),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Пароль (необязательно):");
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::TextEdit::singleline(&mut self.embed_password)
+                            .password(!self.show_passwords)
+                            .hint_text("Argon2id + ChaCha20-Poly1305")
+                            .desired_width(240.0),
+                    );
+                });
+                password_strength_ui(ui, &self.embed_password);
+            },
+        ));
+        paint_drop_zones(ui, self.carrier_drop_rect, self.payload_drop_rect);
         group_ui(
             ui,
             "3. Что во что: пары для группы файлов",
@@ -2065,7 +2461,17 @@ impl PumperApp {
                 )
                 .clicked()
             {
-                self.fill_pairs();
+                self.fill_pairs(PairMode::Order);
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.carriers.is_empty() && !self.payloads.is_empty(),
+                    egui::Button::new("Сопоставить по именам"),
+                )
+                .on_hover_text("photo.png ← photo.zip, report.pdf ← report.mp3")
+                .clicked()
+            {
+                self.fill_pairs(PairMode::Name);
             }
             if ui
                 .add_enabled(
@@ -2100,20 +2506,22 @@ impl PumperApp {
                 )
                 .on_hover_text(row.carrier.display().to_string());
                 ui.label("←");
-                ui.monospace(
-                    row.payload
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("нагрузка"),
-                )
-                .on_hover_text(row.payload.display().to_string());
+                let payload_hover = row
+                    .payloads
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.monospace(row.payloads_label())
+                    .on_hover_text(payload_hover);
                 ui.add_enabled(
                     !self.busy,
                     egui::TextEdit::singleline(&mut row.password)
-                        .password(true)
+                        .password(!self.show_passwords)
                         .hint_text("пароль пары")
                         .desired_width(130.0),
                 );
+                password_strength_ui(ui, &row.password);
                 match row.ok {
                     Some(true) => ui.colored_label(OK_COLOR, &row.note),
                     Some(false) => ui.colored_label(ERROR_COLOR, &row.note),
@@ -2316,6 +2724,7 @@ impl PumperApp {
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
+        let show_passwords = self.show_passwords;
         egui::Window::new("Найдена полезная нагрузка")
             .collapsible(false)
             .resizable(false)
@@ -2354,10 +2763,11 @@ impl PumperApp {
                         ui.label("Пароль:");
                         ui.add(
                             egui::TextEdit::singleline(&mut preview.password)
-                                .password(true)
+                                .password(!show_passwords)
                                 .desired_width(180.0),
                         );
                     });
+                    password_strength_ui(ui, &preview.password);
                 }
                 if let Some(message) = preview.error.as_ref() {
                     ui.colored_label(egui::Color32::RED, message);

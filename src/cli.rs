@@ -1,17 +1,63 @@
 //! Командная строка: накачка, встраивание, извлечение, проверка и отчёты без GUI.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use serde_json::{json, Value};
 
 use crate::batch::{
     self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, MixMode, NameMode,
     Names, PumpPlan, RandomNames, RandomStyle, SizeJitter, TargetMode,
 };
+use crate::payload::group::PairMode;
 use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::report;
 use crate::scan;
-use crate::util::{CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB};
+use crate::util::{
+    format_duration, format_speed, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB,
+};
+
+/// Обычная строка результата: в quiet/json-режиме её не печатаем.
+macro_rules! say {
+    ($flags:expr, $($arg:tt)*) => {
+        if !$flags.quiet && !$flags.json {
+            println!($($arg)*);
+        }
+    };
+}
+
+/// Предупреждение: тоже не мешает машинному выводу.
+macro_rules! note {
+    ($flags:expr, $($arg:tt)*) => {
+        if !$flags.quiet && !$flags.json {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+fn print_json(value: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned())
+    );
+}
+
+fn batch_report_json(command: &str, report: &BatchReport) -> Value {
+    let mut value: Value =
+        serde_json::from_str(&report::json(report)).unwrap_or_else(|_| json!({}));
+    value["command"] = json!(command);
+    value["ok"] = json!(
+        !report.cancelled
+            && report
+                .items
+                .iter()
+                .all(|(_, result)| !matches!(result, ItemResult::Failed { .. }))
+    );
+    value
+}
 
 const HELP: &str = "\
 FilePumper
@@ -34,8 +80,9 @@ FilePumper
                                    [--format gif|png|webp]
                                    [--from-dir ПАПКА [--recursive] [--ext png,jpg]]
                                    [--from-file СПИСОК] [--skip-unsupported]
-                                   [--jobs N] [--dry-run] [--verify]
+                                   [--jobs N|0] [--dry-run] [--verify]
                                    [--report ОТЧЁТ.csv|ОТЧЁТ.json]
+                                   [--quiet] [--no-progress] [--json]
 
   --size         размер; список через запятую задаёт размер каждому файлу
                  (дробную часть пишите через точку: 1.5)
@@ -60,7 +107,7 @@ FilePumper
   --ext          фильтр расширений для --from-dir (например png,jpg)
   --from-file    текстовый список путей (по одному в строке, # — комментарий)
   --skip-unsupported  молча пропускать файлы, которые метод не поддерживает
-  --jobs N       обрабатывать N файлов одновременно (1..16)
+  --jobs N       обрабатывать N файлов одновременно (1..16); 0 — по числу ядер
   --dry-run      показать план и ничего не записывать
   --verify       после записи проверить размер результата
   --report       сохранить отчёт CSV или JSON (формат по расширению)
@@ -78,6 +125,7 @@ FilePumper
                                    [--compress] [--password ПАРОЛЬ]
                                    [--dry-run] [--verify]
                                    [--report ОТЧЁТ.csv|ОТЧЁТ.json]
+                                   [--quiet] [--no-progress] [--json]
 
   Содержимое — криптослучайные байты, поэтому архиватор файл не сожмёт:
   zip, gzip и 7z вернут примерно тот же объём.
@@ -106,13 +154,17 @@ FilePumper
   file-pumper-cli embed <носитель>... --payload <файл> [--payload <файл>...]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--copies 1..3] [--compress] [--password ПАРОЛЬ]
-                                   [--pair] [--pair-password ПАРОЛЬ]...
+                                   [--pair] [--pair-by order|name]
+                                   [--pair-password ПАРОЛЬ]...
                                    [--names random]
                                    [--dry-run] [--report ОТЧЁТ.csv|ОТЧЁТ.json]
+                                   [--quiet] [--no-progress] [--json]
   Несколько --payload упаковываются в один ZIP-бандл внутри контейнера.
   --pair сопоставляет носители и нагрузки по порядку: первая нагрузка идёт в
   первый носитель, вторая во второй и так далее (нагрузок меньше — повторяются,
   больше — делятся поровну и попадают в носитель бандлом).
+  --pair-by name сопоставляет по основе имени: photo.png ← photo.zip, а
+  report.pdf ← report.mp3. Если пары не нашлись, команда сообщит об этом.
   --pair-password задаёт пароль пары; флаг можно повторять, последний пароль
   достаётся всем оставшимся парам. Без него работает общий --password.
   --names random даёт результатам случайные имена (quiet-river-4821.png);
@@ -121,6 +173,7 @@ FilePumper
 Извлечь файлы из картинки (можно несколько носителей):
   file-pumper-cli extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--password ПАРОЛЬ]
+                                   [--quiet] [--no-progress] [--json]
   Извлечённый файл сохраняет расширение из имени нагрузки, поэтому система
   знает, чем его открывать. Бандл распаковывается в папку по одному файлу.
   Файлы без нагрузки в пакете не считаются ошибкой: в отчёте видно, что
@@ -129,16 +182,27 @@ FilePumper
   файлов с разными паролями извлекается одной командой.
 
 Проверить, что лежит внутри (можно несколько носителей):
-  file-pumper-cli inspect <носитель>... [--password ПАРОЛЬ]...
+  file-pumper-cli inspect <носитель>... [--password ПАРОЛЬ]... [--json]
   По каждому файлу печатается отчёт, в конце — итог вида
   «с нагрузкой 2 из 3» и список «что можно извлечь».
 
 Проверить целостность и контрольные суммы:
-  file-pumper-cli verify <носитель>... [--password ПАРОЛЬ]
+  file-pumper-cli verify <носитель>... [--password ПАРОЛЬ] [--json]
+
+Дополнения для shell:
+  file-pumper-cli completions bash|zsh|fish|powershell
 
 Пакетная обработка: файлы обрабатываются по очереди (или параллельно с --jobs),
 ошибка одного файла не прерывает остальные. Код выхода 1, если хоть один файл
 не удался.
+
+Для скриптов:
+  --quiet        не печатать прогресс и служебные сообщения (ошибки — в stderr)
+  --no-progress  оставить итоговые строки, но без полосы прогресса
+  --json         машинный вывод в JSON (прогресс и человеческий текст отключены)
+  --password-file ФАЙЛ   пароль из файла; можно повторять, по паролю на строку
+  --password-stdin       прочитать пароль из stdin (не попадёт в историю shell)
+  --jobs 0       автоматически выбрать число потоков по числу ядер
 
 Те же команды принимает и графическая сборка, но у неё нет консоли:
 ошибки она показывает диалогом, поэтому для терминала используйте
@@ -163,10 +227,22 @@ struct Flags {
     /// извлечения они перебираются по порядку — в пачке бывают разные пароли.
     passwords: Vec<String>,
     payloads: Vec<PathBuf>,
-    /// Групповое встраивание: сопоставить носители и нагрузки по порядку.
+    /// Групповое встраивание: сопоставить носители и нагрузки.
     pair: bool,
+    /// Как именно сопоставлять пары: по порядку или по основе имени.
+    pair_mode: PairMode,
     /// Пароли пар: `--pair-password` можно повторять, лишние пары берут последний.
     pair_passwords: Vec<String>,
+    /// Пароли из файлов: по одному на строку, чтобы не светить их в истории shell.
+    password_files: Vec<PathBuf>,
+    /// Прочитать пароль из stdin (для скриптов и CI).
+    password_stdin: bool,
+    /// Не печатать прогресс и служебные сообщения.
+    quiet: bool,
+    /// Не печатать только прогресс; итог и отчёт остаются.
+    no_progress: bool,
+    /// Машинный вывод в JSON вместо человеческого текста.
+    json: bool,
     out_dir: Option<PathBuf>,
     output: Option<PathBuf>,
     from_dir: Option<PathBuf>,
@@ -253,7 +329,13 @@ impl Flags {
             passwords: Vec::new(),
             payloads: Vec::new(),
             pair: false,
+            pair_mode: PairMode::Order,
             pair_passwords: Vec::new(),
+            password_files: Vec::new(),
+            password_stdin: false,
+            quiet: false,
+            no_progress: false,
+            json: false,
             out_dir: None,
             output: None,
             from_dir: None,
@@ -347,11 +429,23 @@ impl Flags {
                     .payloads
                     .push(PathBuf::from(next("--payload", &mut iterator)?)),
                 "--pair" | "--pairs" | "--pair-by-order" => flags.pair = true,
+                "--pair-by" | "--pair-mode" => {
+                    let raw = next("--pair-by", &mut iterator)?;
+                    flags.pair = true;
+                    flags.pair_mode = PairMode::parse(&raw)?;
+                }
                 "--pair-password" | "--pair-passwords" => {
                     flags
                         .pair_passwords
                         .push(next("--pair-password", &mut iterator)?);
                 }
+                "--password-file" => flags
+                    .password_files
+                    .push(PathBuf::from(next("--password-file", &mut iterator)?)),
+                "--password-stdin" => flags.password_stdin = true,
+                "--quiet" | "-q" => flags.quiet = true,
+                "--no-progress" => flags.no_progress = true,
+                "--json" => flags.json = true,
                 "--out-dir" => {
                     flags.out_dir = Some(PathBuf::from(next("--out-dir", &mut iterator)?));
                 }
@@ -370,10 +464,11 @@ impl Flags {
                 }
                 "--jobs" => {
                     let raw = next("--jobs", &mut iterator)?;
-                    flags.jobs = raw
+                    let jobs = raw
                         .parse::<usize>()
-                        .map_err(|_| format!("Неверное число потоков: {raw}"))?
-                        .clamp(1, 16);
+                        .map_err(|_| format!("Неверное число потоков: {raw}"))?;
+                    // 0 — автоматически по числу доступных ядер.
+                    flags.jobs = if jobs == 0 { 0 } else { jobs.clamp(1, 16) };
                 }
                 "--report" => {
                     flags.report_path = Some(PathBuf::from(next("--report", &mut iterator)?));
@@ -461,6 +556,62 @@ impl Flags {
         inputs.pop()
     }
 
+    /// Пароли из `--password-file` и `--password-stdin` добавляются к обычным
+    /// `--password`; порядок проверки сохраняется.
+    fn resolve_password_inputs(&mut self) -> Result<(), String> {
+        let mut extra = Vec::new();
+        for file in &self.password_files {
+            let text = std::fs::read_to_string(file)
+                .map_err(|err| format!("Не удалось прочитать {}: {err}", file.display()))?;
+            let mut found = 0_usize;
+            for line in text.lines() {
+                let password = line.trim();
+                if !password.is_empty() {
+                    extra.push(password.to_owned());
+                    found += 1;
+                }
+            }
+            if found == 0 {
+                return Err(format!(
+                    "В файле пароля {} нет непустых строк.",
+                    file.display()
+                ));
+            }
+        }
+        if self.password_stdin {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|err| format!("Не удалось прочитать пароль из stdin: {err}"))?;
+            let password = text.trim();
+            if password.is_empty() {
+                return Err("Из stdin не получен пароль.".to_owned());
+            }
+            extra.push(password.to_owned());
+        }
+        for password in extra {
+            if self.password.is_none() {
+                self.password = Some(password.clone());
+            }
+            self.passwords.push(password);
+        }
+        Ok(())
+    }
+
+    fn jobs(&self) -> usize {
+        if self.jobs > 0 {
+            return self.jobs;
+        }
+        std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4)
+            .clamp(1, 16)
+    }
+
+    fn progress_enabled(&self) -> bool {
+        !self.quiet && !self.no_progress && !self.json
+    }
+
     fn options(&self) -> ContainerOptions {
         ContainerOptions {
             compress: self.compress,
@@ -533,7 +684,10 @@ fn mix_note(kinds: &[GeneratedKind], mix: MixMode) -> String {
 
 /// Предупреждает, если разброс способен «съесть» весь размер: при `minus` файл
 /// может получиться совсем маленьким, а для картинок — меньше служебного минимума.
-fn warn_jitter(jitter: Option<SizeJitter>, targets: &[u64]) {
+fn warn_jitter(flags: &Flags, jitter: Option<SizeJitter>, targets: &[u64]) {
+    if flags.quiet || flags.json {
+        return;
+    }
     let Some(jitter) = jitter else {
         return;
     };
@@ -585,7 +739,16 @@ pub fn execute(args: &[String]) -> Result<(), String> {
         println!("FilePumper {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let flags = Flags::parse(rest)?;
+    if command == "completions" {
+        let shell = rest
+            .first()
+            .map(String::as_str)
+            .ok_or_else(|| "Укажите shell: bash, zsh, fish или powershell.".to_owned())?;
+        print!("{}", completion_script(shell)?);
+        return Ok(());
+    }
+    let mut flags = Flags::parse(rest)?;
+    flags.resolve_password_inputs()?;
     match command.as_str() {
         "pump" => command_pump(&flags),
         "generate" | "make" => command_generate(&flags),
@@ -597,10 +760,50 @@ pub fn execute(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn progress_printer() -> impl Fn(f32, &str) {
-    |percent: f32, text: &str| {
-        eprint!("\r{percent:5.1}% {text:<70}");
+struct ProgressState {
+    enabled: bool,
+    started: Instant,
+    total_bytes: Option<u64>,
+}
+
+impl ProgressState {
+    fn new(enabled: bool, total_bytes: Option<u64>) -> Self {
+        Self {
+            enabled,
+            started: Instant::now(),
+            total_bytes,
+        }
+    }
+
+    fn print(&mut self, percent: f32, text: &str) {
+        if !self.enabled {
+            return;
+        }
+        let percent = percent.clamp(0.0, 100.0);
+        let fraction = (percent as f64 / 100.0).clamp(0.0, 1.0);
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let mut extra = String::new();
+        if let Some(total) = self.total_bytes {
+            if elapsed > 0.25 && fraction > 0.0 {
+                extra.push_str("  ");
+                extra.push_str(&format_speed(total as f64 * fraction / elapsed));
+            }
+        }
+        if fraction > 0.005 && fraction < 0.999 {
+            let eta = elapsed * (1.0 - fraction) / fraction;
+            extra.push_str(&format!("  ETA {}", format_duration(eta)));
+        }
+        eprint!("\r{percent:5.1}% {text:<70}{extra}");
         let _ = std::io::stderr().flush();
+    }
+}
+
+fn progress_printer(enabled: bool, total_bytes: Option<u64>) -> impl Fn(f32, &str) + Sync {
+    let state = Mutex::new(ProgressState::new(enabled, total_bytes));
+    move |percent: f32, text: &str| {
+        if let Ok(mut state) = state.lock() {
+            state.print(percent, text);
+        }
     }
 }
 
@@ -626,7 +829,7 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
     .with_names(flags.names_value());
     let jitter = flags.jitter()?;
     let plan = plan.with_jitter(jitter);
-    warn_jitter(jitter, &plan.targets);
+    warn_jitter(flags, jitter, &plan.targets);
     plan.ensure_sizes_match(inputs.len())?;
 
     let mut planned = match explicit_output {
@@ -672,12 +875,55 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
 
     if let Some(target) = planned.items.iter().map(|item| item.target).max() {
         for warning in scan::limits_warnings(target, flags.method) {
-            eprintln!("Предупреждение: {warning}");
+            note!(flags, "Предупреждение: {warning}");
+        }
+    }
+    let total_target: u64 = planned.items.iter().map(|item| item.target).sum();
+    if let Some(item) = planned.items.first() {
+        let directory = item
+            .output
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if let Some(warning) = crate::util::disk_space_warning(directory, total_target) {
+            note!(flags, "Предупреждение: {warning}");
         }
     }
 
     if flags.dry_run {
-        println!(
+        if flags.json {
+            let items: Vec<Value> = planned
+                .items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "input": item.input,
+                        "output": item.output,
+                        "target": item.target,
+                        "target_label": batch::size_label(item.target),
+                        "supported": batch::support_error(flags.method, &item.input),
+                    })
+                })
+                .collect();
+            let rejected: Vec<Value> = planned
+                .rejected
+                .iter()
+                .chain(skipped.iter())
+                .map(|(path, reason)| json!({"input": path, "reason": reason}))
+                .collect();
+            print_json(&json!({
+                "ok": true,
+                "dry_run": true,
+                "command": "pump",
+                "method": flags.method.title(),
+                "mode": flags.size_mode.label(),
+                "items": items,
+                "rejected": rejected,
+            }));
+            return Ok(());
+        }
+        say!(
+            flags,
             "План: {} файл(ов), метод «{}», режим «{}»{}",
             planned.items.len(),
             flags.method.title(),
@@ -689,7 +935,8 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
                 Some(reason) => format!(" — внимание: {reason}"),
                 None => String::new(),
             };
-            println!(
+            say!(
+                flags,
                 "  {} -> {} ({}){note}",
                 item.input.display(),
                 item.output.display(),
@@ -697,7 +944,7 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
             );
         }
         for (input, reason) in planned.rejected.iter().chain(skipped.iter()) {
-            println!("  пропуск {} — {reason}", input.display());
+            say!(flags, "  пропуск {} — {reason}", input.display());
         }
         return Ok(());
     }
@@ -707,13 +954,14 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
     }
 
     let token = CancelToken::new();
-    let progress = progress_printer();
-    let mut batch_report = if flags.jobs > 1 {
+    let progress = progress_printer(flags.progress_enabled(), Some(total_target));
+    let jobs = flags.jobs();
+    let mut batch_report = if jobs > 1 {
         batch::pump_parallel(
             &planned.items,
             flags.method,
             flags.format,
-            flags.jobs,
+            jobs,
             &progress,
             &token,
         )
@@ -721,7 +969,9 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
         let job = Job::new(&progress, &token);
         batch::pump(&planned.items, flags.method, flags.format, &job)
     };
-    eprintln!();
+    if flags.progress_enabled() {
+        eprintln!();
+    }
 
     if flags.verify {
         for (input, result) in batch_report.items.iter_mut() {
@@ -749,9 +999,37 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
     items.extend(std::mem::take(&mut batch_report.items));
     batch_report.items = items;
 
+    if let Some(path) = flags.report_path.as_deref() {
+        report::write_report(path, &batch_report)?;
+        say!(flags, "Отчёт: {}", path.display());
+    }
+
+    let failed = batch_report.failed() + planned.rejected.len();
+    if flags.json {
+        let mut value = batch_report_json("pump", &batch_report);
+        value["ok"] = json!(!batch_report.cancelled && failed == 0);
+        value["rejected"] = json!(planned
+            .rejected
+            .iter()
+            .map(|(path, reason)| json!({"input": path, "reason": reason}))
+            .collect::<Vec<_>>());
+        print_json(&value);
+        if batch_report.cancelled {
+            return Err(CANCELLED_MESSAGE.to_owned());
+        }
+        if failed > 0 {
+            return Err(format!(
+                "Не удалось обработать {failed} из {} файлов.",
+                inputs.len()
+            ));
+        }
+        return Ok(());
+    }
+
     for (input, result) in &batch_report.items {
         match result {
-            ItemResult::Created { output, size } => println!(
+            ItemResult::Created { output, size } => say!(
+                flags,
                 "Готово: {} -> {} ({:.2} МБ)",
                 input.display(),
                 output.display(),
@@ -769,15 +1047,9 @@ fn command_pump(flags: &Flags) -> Result<(), String> {
         eprintln!("Пропущено: {} — {reason}", input.display());
     }
 
-    if let Some(path) = flags.report_path.as_deref() {
-        report::write_report(path, &batch_report)?;
-        println!("Отчёт: {}", path.display());
-    }
-
     if batch_report.cancelled {
         return Err(CANCELLED_MESSAGE.to_owned());
     }
-    let failed = batch_report.failed() + planned.rejected.len();
     if failed > 0 {
         return Err(format!(
             "Не удалось обработать {failed} из {} файлов.",
@@ -804,7 +1076,7 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
     }
     let targets = batch::targets_from_mb(&flags.sizes)?;
     let jitter = flags.jitter()?;
-    warn_jitter(jitter, &targets);
+    warn_jitter(flags, jitter, &targets);
     let kinds = flags.generate_kinds();
     let spec = GenerateTargets {
         sizes: targets,
@@ -839,7 +1111,31 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
     }
 
     if flags.dry_run {
-        println!(
+        if flags.json {
+            let plan: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "output": item.output,
+                        "target": item.target,
+                        "target_label": batch::size_label(item.target),
+                        "kind": item.kind.extension(),
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "ok": true,
+                "dry_run": true,
+                "command": "generate",
+                "kinds": kinds_label(&kinds),
+                "mix": flags.mix.label(),
+                "items": plan,
+                "payloads": flags.payloads,
+            }));
+            return Ok(());
+        }
+        say!(
+            flags,
             "План: {} файл(ов), типы: {}, имена «{}»{}{}",
             items.len(),
             kinds_label(&kinds),
@@ -848,7 +1144,8 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
             mix_note(&kinds, flags.mix)
         );
         for item in &items {
-            println!(
+            say!(
+                flags,
                 "  {} ({}){}",
                 item.output.display(),
                 batch::size_label(item.target),
@@ -859,13 +1156,24 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
                 }
             );
         }
-        println!("  внутрь: {}", payloads_label(&flags.payloads));
+        say!(flags, "  внутрь: {}", payloads_label(&flags.payloads));
         return Ok(());
     }
 
     let total = items.len();
+    let total_target: u64 = items.iter().map(|item| item.target).sum();
+    if let Some(item) = items.first() {
+        let directory = item
+            .output
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if let Some(warning) = crate::util::disk_space_warning(directory, total_target) {
+            note!(flags, "Предупреждение: {warning}");
+        }
+    }
     let token = CancelToken::new();
-    let progress = progress_printer();
+    let progress = progress_printer(flags.progress_enabled(), Some(total_target));
     let options = flags.options();
     let mut results: Vec<(PathBuf, ItemResult)> = Vec::with_capacity(total);
     for (index, item) in items.iter().enumerate() {
@@ -887,7 +1195,9 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
         };
         results.push((item.output.clone(), result));
     }
-    eprintln!();
+    if flags.progress_enabled() {
+        eprintln!();
+    }
 
     if flags.verify {
         for (index, (path, result)) in results.iter_mut().enumerate() {
@@ -911,6 +1221,23 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
         items: results,
     };
 
+    if let Some(path) = flags.report_path.as_deref() {
+        report::write_report(path, &batch_report)?;
+        say!(flags, "Отчёт: {}", path.display());
+    }
+
+    let failed = batch_report.failed();
+    if flags.json {
+        print_json(&batch_report_json("generate", &batch_report));
+        if batch_report.cancelled {
+            return Err(CANCELLED_MESSAGE.to_owned());
+        }
+        if failed > 0 {
+            return Err(format!("Не удалось создать {failed} из {total} файлов."));
+        }
+        return Ok(());
+    }
+
     for (path, result) in &batch_report.items {
         match result {
             ItemResult::Created { output, size } => {
@@ -919,7 +1246,8 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
                 } else {
                     format!(", внутрь: {}", payloads_label(&flags.payloads))
                 };
-                println!(
+                say!(
+                    flags,
                     "Готово: {} ({:.2} МБ{note})",
                     output.display(),
                     *size as f64 / MIB as f64
@@ -934,15 +1262,9 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
         }
     }
 
-    if let Some(path) = flags.report_path.as_deref() {
-        report::write_report(path, &batch_report)?;
-        println!("Отчёт: {}", path.display());
-    }
-
     if batch_report.cancelled {
         return Err(CANCELLED_MESSAGE.to_owned());
     }
-    let failed = batch_report.failed();
     if failed > 0 {
         return Err(format!("Не удалось создать {failed} из {total} файлов."));
     }
@@ -1012,7 +1334,10 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
     // Пары «носитель ← нагрузка». Без --pair каждый носитель получает все
     // нагрузки бандлом, с --pair — по порядку и со своим паролем.
     let specs = if flags.pair {
-        payload::group::pair_by_order(&carriers, &payloads, &passwords)?
+        match flags.pair_mode {
+            PairMode::Order => payload::group::pair_by_order(&carriers, &payloads, &passwords)?,
+            PairMode::Name => payload::group::pair_by_name(&carriers, &payloads, &passwords)?,
+        }
     } else {
         carriers
             .iter()
@@ -1058,24 +1383,52 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
     }
 
     if flags.dry_run {
-        println!(
-            "План встраивания: носителей {}, нагрузок {}{}",
+        let mode = if flags.pair {
+            format!(" (пары {})", flags.pair_mode.label())
+        } else if payloads.len() > 1 {
+            " (бандл)".to_owned()
+        } else {
+            String::new()
+        };
+        if flags.json {
+            let pairs: Vec<Value> = plan
+                .iter()
+                .map(|(spec, output)| {
+                    json!({
+                        "carrier": spec.carrier,
+                        "payloads": spec.payloads,
+                        "bundle": spec.bundle(),
+                        "output": output,
+                        "password": spec.password.is_some(),
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "ok": true,
+                "dry_run": true,
+                "command": "embed",
+                "mode": flags.pair_mode.label(),
+                "pairs": pairs,
+            }));
+            return Ok(());
+        }
+        say!(
+            flags,
+            "План встраивания: носителей {}, нагрузок {}{mode}",
             plan.len(),
-            payloads.len(),
-            if payloads.len() > 1 && !flags.pair {
-                " (бандл)"
-            } else if flags.pair {
-                " (по парам)"
-            } else {
-                ""
-            }
+            payloads.len()
         );
         for (spec, output) in &plan {
             let password = match spec.password.as_deref() {
                 Some(_) => ", свой пароль",
                 None => "",
             };
-            println!("  {} -> {}{password}", spec.label(), output.display());
+            say!(
+                flags,
+                "  {} -> {}{password}",
+                spec.label(),
+                output.display()
+            );
         }
         return Ok(());
     }
@@ -1083,7 +1436,7 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
     let base_options = flags.options();
     let copies = flags.copies;
     let token = CancelToken::new();
-    let progress = progress_printer();
+    let progress = progress_printer(flags.progress_enabled(), None);
     let job = Job::new(&progress, &token);
     let total = plan.len().max(1) as f32;
     let mut batch_report = BatchReport::default();
@@ -1105,10 +1458,13 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
             }
             None => Err("Не указан ни один файл нагрузки.".to_owned()),
         };
-        eprintln!();
+        if flags.progress_enabled() {
+            eprintln!();
+        }
         match result {
             Ok(outcome) => {
-                println!(
+                say!(
+                    flags,
                     "Готово: {} -> {} ({}), копий: {}, опции: {}, декодер: {}",
                     carrier.display(),
                     outcome.output.display(),
@@ -1138,11 +1494,24 @@ fn command_embed(flags: &Flags) -> Result<(), String> {
         }
     }
 
+    if flags.progress_enabled() {
+        eprintln!();
+    }
     if let Some(path) = flags.report_path.as_deref() {
         report::write_report(path, &batch_report)?;
-        println!("Отчёт: {}", path.display());
+        say!(flags, "Отчёт: {}", path.display());
     }
     let failed = batch_report.failed();
+    if flags.json {
+        print_json(&batch_report_json("embed", &batch_report));
+        if failed > 0 {
+            return Err(format!(
+                "Не удалось обработать {failed} из {} носителей.",
+                plan.len()
+            ));
+        }
+        return Ok(());
+    }
     if failed > 0 {
         return Err(format!(
             "Не удалось обработать {failed} из {} носителей.",
@@ -1173,7 +1542,7 @@ fn command_extract(flags: &Flags) -> Result<(), String> {
     }
 
     let passwords = flags.password_candidates();
-    let progress = progress_printer();
+    let progress = progress_printer(flags.progress_enabled(), None);
     let token = CancelToken::new();
     let job = Job::new(&progress, &token);
 
@@ -1189,38 +1558,101 @@ fn command_extract(flags: &Flags) -> Result<(), String> {
         }
         return match payload::extract_to(carrier, &output, password.as_deref(), &job) {
             Ok(outcome) => {
-                eprintln!();
-                println!(
-                    "Готово: {} -> {} ({} байт, целых копий: {})",
-                    carrier.display(),
-                    outcome.output.display(),
-                    outcome.size,
-                    outcome.copies
-                );
+                if flags.progress_enabled() {
+                    eprintln!();
+                }
+                if flags.json {
+                    print_json(&json!({
+                        "ok": true,
+                        "command": "extract",
+                        "carrier": carrier,
+                        "output": outcome.output,
+                        "name": outcome.name,
+                        "size": outcome.size,
+                        "copies": outcome.copies,
+                    }));
+                } else {
+                    say!(
+                        flags,
+                        "Готово: {} -> {} ({} байт, целых копий: {})",
+                        carrier.display(),
+                        outcome.output.display(),
+                        outcome.size,
+                        outcome.copies
+                    );
+                }
                 Ok(())
             }
             Err(error) => Err(format!("{} — {error}", carrier.display())),
         };
     }
 
-    command_extract_many(&carriers, flags.out_dir.as_deref(), &passwords, &job)
+    command_extract_many(flags, &carriers, flags.out_dir.as_deref(), &passwords, &job)
+}
+
+fn extract_batch_json(batch: &payload::group::ExtractBatch) -> Value {
+    let items: Vec<Value> = batch
+        .items
+        .iter()
+        .map(|item| match &item.result {
+            payload::group::ExtractResult::File(outcome) => json!({
+                "carrier": item.carrier,
+                "status": "file",
+                "output": outcome.output,
+                "name": outcome.name,
+                "size": outcome.size,
+                "copies": outcome.copies,
+            }),
+            payload::group::ExtractResult::Bundle(files) => {
+                let entries: Vec<Value> = files
+                    .iter()
+                    .map(|(path, size)| json!({"path": path, "size": size}))
+                    .collect();
+                json!({
+                    "carrier": item.carrier,
+                    "status": "bundle",
+                    "files": entries,
+                })
+            }
+            payload::group::ExtractResult::Empty => json!({
+                "carrier": item.carrier,
+                "status": "empty",
+            }),
+            payload::group::ExtractResult::Error(error) => json!({
+                "carrier": item.carrier,
+                "status": "error",
+                "error": error,
+            }),
+        })
+        .collect();
+    json!({
+        "ok": batch.items.iter().all(|item| !matches!(item.result, payload::group::ExtractResult::Error(_))),
+        "command": "extract",
+        "summary": batch.summary(),
+        "out_dir": batch.out_dir,
+        "items": items,
+    })
 }
 
 /// Извлечение из нескольких носителей сразу: обычные файлы не считаются ошибкой,
 /// в отчёте видно, что можно извлечь и из какого файла.
 fn command_extract_many(
+    flags: &Flags,
     carriers: &[PathBuf],
     out_dir: Option<&Path>,
     passwords: &[String],
     job: &Job<'_>,
 ) -> Result<(), String> {
     let batch = payload::group::extract_many(carriers, out_dir, passwords, job)?;
-    eprintln!();
+    if flags.progress_enabled() {
+        eprintln!();
+    }
 
     let mut failed: Vec<String> = Vec::new();
     for item in &batch.items {
         match &item.result {
-            payload::group::ExtractResult::File(outcome) => println!(
+            payload::group::ExtractResult::File(outcome) => say!(
+                flags,
                 "Готово: {} -> {} ({} байт, целых копий: {})",
                 item.carrier.display(),
                 outcome.output.display(),
@@ -1233,19 +1665,24 @@ fn command_extract_many(
                     .and_then(|(path, _)| path.parent())
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "папка".to_owned());
-                println!(
+                say!(
+                    flags,
                     "Готово: {} -> {} (файлов: {})",
                     item.carrier.display(),
                     folder,
                     files.len()
                 );
                 for (path, size) in files {
-                    println!("  {} ({} байт)", path.display(), size);
+                    say!(flags, "  {} ({} байт)", path.display(), size);
                 }
             }
             payload::group::ExtractResult::Empty => {
                 if carriers.len() > 1 {
-                    println!("Нагрузки нет: {} — обычный файл", item.carrier.display());
+                    say!(
+                        flags,
+                        "Нагрузки нет: {} — обычный файл",
+                        item.carrier.display()
+                    );
                 } else {
                     failed.push(format!(
                         "{} — {}",
@@ -1261,12 +1698,16 @@ fn command_extract_many(
     }
 
     if carriers.len() > 1 {
-        println!();
-        println!("Итог: {}", batch.summary());
-        println!("Что где нашлось:");
+        say!(flags, "");
+        say!(flags, "Итог: {}", batch.summary());
+        say!(flags, "Что где нашлось:");
         for item in &batch.items {
-            println!("  {}", item.describe());
+            say!(flags, "  {}", item.describe());
         }
+    }
+
+    if flags.json {
+        print_json(&extract_batch_json(&batch));
     }
 
     if failed.is_empty() {
@@ -1285,25 +1726,70 @@ fn command_extract_many(
     ))
 }
 
+fn scan_items_json(items: &[payload::group::ScanItem]) -> Value {
+    let entries: Vec<Value> = items
+        .iter()
+        .map(|item| match &item.result {
+            payload::group::ScanResult::Found(summary) => {
+                let info = &summary.info;
+                json!({
+                    "path": item.path,
+                    "status": "found",
+                    "carrier": summary.carrier.label(),
+                    "name": info.name,
+                    "size": info.size,
+                    "copies": info.copies,
+                    "compressed": info.compressed,
+                    "encrypted": info.encrypted,
+                    "bundle": info.bundle,
+                    "legacy": info.legacy,
+                })
+            }
+            payload::group::ScanResult::Empty => json!({
+                "path": item.path,
+                "status": "empty",
+            }),
+            payload::group::ScanResult::Error(error) => json!({
+                "path": item.path,
+                "status": "error",
+                "error": error,
+            }),
+        })
+        .collect();
+    json!({
+        "ok": items.iter().all(|item| !matches!(item.result, payload::group::ScanResult::Error(_))),
+        "command": "inspect",
+        "summary": payload::group::scan_summary(items),
+        "items": entries,
+    })
+}
+
 fn command_inspect(flags: &Flags) -> Result<(), String> {
     let carriers = flags.paths();
     if carriers.is_empty() {
         return Err("Укажите путь: носитель.".to_owned());
     }
-    let items = payload::group::scan_many(&carriers, &flags.password_candidates(), &Job::quiet());
+    let token = CancelToken::new();
+    let progress = progress_printer(flags.progress_enabled(), None);
+    let job = Job::new(&progress, &token);
+    let items = payload::group::scan_many(&carriers, &flags.password_candidates(), &job);
+    if flags.progress_enabled() {
+        eprintln!();
+    }
     let multiple = carriers.len() > 1;
     for item in &items {
         if multiple {
-            println!("=== {} ===", item.path.display());
+            say!(flags, "=== {} ===", item.path.display());
         }
         match &item.result {
             payload::group::ScanResult::Found(summary) => {
                 let info = &summary.info;
-                println!("Носитель: {}", summary.carrier.label());
-                println!("Имя нагрузки: {}", info.name);
-                println!("Размер: {} байт", info.size);
-                println!("Целых копий: {}", info.copies);
-                println!(
+                say!(flags, "Носитель: {}", summary.carrier.label());
+                say!(flags, "Имя нагрузки: {}", info.name);
+                say!(flags, "Размер: {} байт", info.size);
+                say!(flags, "Целых копий: {}", info.copies);
+                say!(
+                    flags,
                     "Сжатие: {}",
                     if info.compressed {
                         "да (deflate)"
@@ -1311,9 +1797,16 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
                         "нет"
                     }
                 );
-                println!("Шифрование: {}", if info.encrypted { "да" } else { "нет" });
+                say!(
+                    flags,
+                    "Шифрование: {}",
+                    if info.encrypted { "да" } else { "нет" }
+                );
                 if info.bundle {
-                    println!("Содержимое: бандл, несколько файлов (ZIP внутри контейнера)");
+                    say!(
+                        flags,
+                        "Содержимое: бандл, несколько файлов (ZIP внутри контейнера)"
+                    );
                     let mut entries = payload::payload_entries(&item.path, None);
                     for candidate in flags.password_candidates() {
                         if entries.is_ok() {
@@ -1324,22 +1817,27 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
                     match entries {
                         Ok(entries) => {
                             for entry in &entries {
-                                println!("  {} — {} байт", entry.name, entry.size);
+                                say!(flags, "  {} — {} байт", entry.name, entry.size);
                             }
                         }
-                        Err(error) => println!("  оглавление недоступно: {error}"),
+                        Err(error) => say!(flags, "  оглавление недоступно: {error}"),
                     }
                 }
                 if info.legacy {
-                    println!("Формат: контейнер версии 1");
+                    say!(flags, "Формат: контейнер версии 1");
                 }
-                println!(
+                say!(
+                    flags,
                     "Устойчивость к загрузке: {}",
                     summary.carrier.survives_upload()
                 );
             }
             payload::group::ScanResult::Empty => {
-                println!("Нагрузки нет: {} — обычный файл", item.path.display());
+                say!(
+                    flags,
+                    "Нагрузки нет: {} — обычный файл",
+                    item.path.display()
+                );
             }
             payload::group::ScanResult::Error(error) => {
                 eprintln!("Ошибка: {} — {error}", item.path.display());
@@ -1348,11 +1846,11 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
     }
 
     if multiple {
-        println!();
-        println!("Итог: {}", payload::group::scan_summary(&items));
-        println!("Что можно извлечь:");
+        say!(flags, "");
+        say!(flags, "Итог: {}", payload::group::scan_summary(&items));
+        say!(flags, "Что можно извлечь:");
         for item in &items {
-            println!("  {}", item.describe());
+            say!(flags, "  {}", item.describe());
         }
     }
 
@@ -1360,6 +1858,9 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
         .iter()
         .filter(|item| matches!(item.result, payload::group::ScanResult::Error(_)))
         .count();
+    if flags.json {
+        print_json(&scan_items_json(&items));
+    }
     if failed > 0 {
         return Err(format!(
             "Не удалось проверить {failed} из {} файлов.",
@@ -1380,29 +1881,59 @@ fn command_verify(flags: &Flags) -> Result<(), String> {
     let password = flags.password();
     let multiple = carriers.len() > 1;
     let mut failed = 0_usize;
+    let mut results = Vec::with_capacity(carriers.len());
     for carrier in &carriers {
         if multiple {
-            println!("=== {} ===", carrier.display());
+            say!(flags, "=== {} ===", carrier.display());
         }
         match payload::verify_file(carrier, password.as_deref()) {
             Ok(outcome) => {
-                println!("Файл: {}", carrier.display());
-                println!("Нагрузка: {} ({} байт)", outcome.name, outcome.size);
-                println!("Целых копий: {}", outcome.copies);
-                println!("SHA-256: {}", outcome.sha256);
+                let entries: Vec<Value> = outcome
+                    .entries
+                    .iter()
+                    .map(|entry| json!({"name": entry.name, "size": entry.size}))
+                    .collect();
+                results.push(json!({
+                    "carrier": carrier,
+                    "ok": true,
+                    "name": outcome.name,
+                    "size": outcome.size,
+                    "copies": outcome.copies,
+                    "sha256": outcome.sha256,
+                    "bundle": outcome.bundle,
+                    "entries": entries,
+                }));
+                say!(flags, "Файл: {}", carrier.display());
+                say!(flags, "Нагрузка: {} ({} байт)", outcome.name, outcome.size);
+                say!(flags, "Целых копий: {}", outcome.copies);
+                say!(flags, "SHA-256: {}", outcome.sha256);
                 if outcome.bundle {
-                    println!("Бандл: {} файл(ов)", outcome.entries.len());
+                    say!(flags, "Бандл: {} файл(ов)", outcome.entries.len());
                     for entry in &outcome.entries {
-                        println!("  {} — {} байт", entry.name, entry.size);
+                        say!(flags, "  {} — {} байт", entry.name, entry.size);
                     }
                 }
-                println!("Проверка: OK");
+                say!(flags, "Проверка: OK");
             }
             Err(error) => {
                 failed += 1;
-                eprintln!("Ошибка: {} — {error}", carrier.display());
+                results.push(json!({
+                    "carrier": carrier,
+                    "ok": false,
+                    "error": error,
+                }));
+                if !flags.json {
+                    eprintln!("Ошибка: {} — {error}", carrier.display());
+                }
             }
         }
+    }
+    if flags.json {
+        print_json(&json!({
+            "ok": failed == 0,
+            "command": "verify",
+            "items": results,
+        }));
     }
     if failed > 0 {
         return Err(format!(
@@ -1411,4 +1942,105 @@ fn command_verify(flags: &Flags) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Небольшие статические файлы дополнений: без внешних зависимостей и
+/// генераторов — их достаточно, чтобы команды и флаги подсказывались в shell.
+fn completion_script(shell: &str) -> Result<&'static str, String> {
+    let script = match shell.trim().to_ascii_lowercase().as_str() {
+        "bash" => {
+            r#"complete -W "pump generate make embed extract inspect verify completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
+"#
+        }
+        "zsh" => {
+            r#"#compdef file-pumper-cli
+_arguments '1:command:(pump generate make embed extract inspect verify completions)' '*:file:_files'
+"#
+        }
+        "fish" => {
+            r#"complete -c file-pumper-cli -f -a "pump generate make embed extract inspect verify completions"
+complete -c file-pumper-cli -l json -d "Машинный вывод в JSON"
+complete -c file-pumper-cli -l quiet -d "Без прогресса и служебного текста"
+complete -c file-pumper-cli -l no-progress -d "Без полосы прогресса"
+complete -c file-pumper-cli -l pair-by -d "Сопоставление пар: order или name"
+complete -c file-pumper-cli -l password-file -r -d "Пароль из файла"
+"#
+        }
+        "powershell" | "pwsh" => {
+            r#"Register-ArgumentCompleter -Native -CommandName file-pumper-cli -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $items = 'pump','generate','make','embed','extract','inspect','verify','completions',
+        '--help','--version','--size','--size-mode','--vary','--vary-mode','--names',
+        '--random-style','--random-length','--random-alphabet','--method','--format',
+        '--from-dir','--from-file','--recursive','--ext','--skip-unsupported','--jobs',
+        '--dry-run','--verify','--report','--out-dir','--output','--payload','--pair',
+        '--pair-by','--pair-password','--copies','--compress','--password',
+        '--password-file','--password-stdin','--quiet','--no-progress','--json',
+        '--type','--mix','--name','--count'
+    $items | Where-Object { $_ -like "$wordToComplete*" } |
+        ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+}
+"#
+        }
+        other => {
+            return Err(format!(
+                "Неизвестный shell: {other}. Допустимо: bash, zsh, fish, powershell."
+            ));
+        }
+    };
+    Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Flags {
+        let args: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+        Flags::parse(&args).unwrap()
+    }
+
+    #[test]
+    fn script_flags_are_parsed() {
+        let flags = parse(&[
+            "--json",
+            "--quiet",
+            "--no-progress",
+            "--jobs",
+            "0",
+            "--password-file",
+            "password.txt",
+            "--password-stdin",
+            "--pair-by",
+            "name",
+            "--size",
+            "10",
+        ]);
+        assert!(flags.json);
+        assert!(flags.quiet);
+        assert!(flags.no_progress);
+        assert_eq!(flags.jobs, 0);
+        assert!((1..=16).contains(&flags.jobs()));
+        assert!(flags.pair);
+        assert_eq!(flags.pair_mode, PairMode::Name);
+        assert_eq!(flags.password_files, [PathBuf::from("password.txt")]);
+        assert!(flags.password_stdin);
+    }
+
+    #[test]
+    fn legacy_pair_flag_keeps_order_mode() {
+        let flags = parse(&["--pair", "carrier.png"]);
+        assert!(flags.pair);
+        assert_eq!(flags.pair_mode, PairMode::Order);
+        assert_eq!(flags.positional, vec!["carrier.png".to_owned()]);
+    }
+
+    #[test]
+    fn completion_scripts_cover_all_supported_shells() {
+        for shell in ["bash", "zsh", "fish", "powershell"] {
+            let script = completion_script(shell).unwrap();
+            assert!(script.contains("file-pumper-cli"), "{shell}");
+        }
+        assert!(completion_script("cmd").is_err());
+    }
 }

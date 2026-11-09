@@ -8,8 +8,109 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const MIB: u64 = 1024 * 1024;
+pub const GIB: u64 = 1024 * MIB;
 pub const IO_CHUNK: usize = 1024 * 1024;
 pub const CANCELLED_MESSAGE: &str = "Операция отменена пользователем.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordStrength {
+    Weak,
+    Medium,
+    Strong,
+}
+
+impl PasswordStrength {
+    pub fn label(self) -> &'static str {
+        match self {
+            PasswordStrength::Weak => "слабый",
+            PasswordStrength::Medium => "средний",
+            PasswordStrength::Strong => "сильный",
+        }
+    }
+}
+
+/// Грубая оценка пароля для подсказки в окне: длина и разнообразие классов
+/// символов. Это не криптоанализ, а именно индикатор «стоит ли усложнить».
+pub fn password_strength(value: &str) -> Option<PasswordStrength> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let length = value.chars().count();
+    let mut classes = 0;
+    if value.chars().any(|symbol| symbol.is_ascii_lowercase()) {
+        classes += 1;
+    }
+    if value.chars().any(|symbol| symbol.is_ascii_uppercase()) {
+        classes += 1;
+    }
+    if value.chars().any(|symbol| symbol.is_ascii_digit()) {
+        classes += 1;
+    }
+    if value.chars().any(|symbol| !symbol.is_ascii_alphanumeric()) {
+        classes += 1;
+    }
+    Some(if length >= 16 && classes >= 3 {
+        PasswordStrength::Strong
+    } else if length >= 10 && classes >= 2 {
+        PasswordStrength::Medium
+    } else {
+        PasswordStrength::Weak
+    })
+}
+
+/// Размер в удобных единицах: `512 КБ`, `10.0 МБ`, `1.5 ГБ`.
+pub fn format_bytes(bytes: f64) -> String {
+    if bytes >= GIB as f64 {
+        format!("{:.1} ГБ", bytes / GIB as f64)
+    } else if bytes >= MIB as f64 {
+        format!("{:.1} МБ", bytes / MIB as f64)
+    } else if bytes >= 1024.0 {
+        format!("{:.1} КБ", bytes / 1024.0)
+    } else {
+        format!("{:.0} Б", bytes.max(0.0))
+    }
+}
+
+pub fn format_speed(bytes_per_second: f64) -> String {
+    format!("{}/с", format_bytes(bytes_per_second.max(0.0)))
+}
+
+/// Длительность в формате `MM:SS` или `HH:MM:SS`.
+pub fn format_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+pub fn available_space(path: &Path) -> Option<u64> {
+    let mut current = path;
+    loop {
+        if let Ok(free) = fs2::available_space(current) {
+            return Some(free);
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Предупреждение, если на диске для результата не хватает места.
+pub fn disk_space_warning(path: &Path, required: u64) -> Option<String> {
+    let free = available_space(path)?;
+    (free < required).then(|| {
+        format!(
+            "На диске может не хватить места: нужно {}, свободно {} ({}).",
+            format_bytes(required as f64),
+            format_bytes(free as f64),
+            path.display()
+        )
+    })
+}
 
 /// Флаг отмены, разделяемый интерфейсом и рабочим потоком.
 #[derive(Clone, Default)]
@@ -344,6 +445,31 @@ mod tests {
         assert!(same_file(&existing, &existing));
         let missing_same = dir.path().join("carrier.png");
         assert!(same_file(&existing, &missing_same));
+    }
+
+    #[test]
+    fn password_strength_grows_with_length_and_variety() {
+        assert_eq!(password_strength(""), None);
+        assert_eq!(password_strength("123456"), Some(PasswordStrength::Weak));
+        assert_eq!(
+            password_strength("correct-horse"),
+            Some(PasswordStrength::Medium)
+        );
+        assert_eq!(
+            password_strength("Correct-Horse-42!"),
+            Some(PasswordStrength::Strong)
+        );
+    }
+
+    #[test]
+    fn human_units_and_durations_are_readable() {
+        assert_eq!(format_bytes(512.0), "512 Б");
+        assert_eq!(format_bytes(1536.0), "1.5 КБ");
+        assert_eq!(format_bytes(MIB as f64), "1.0 МБ");
+        assert_eq!(format_speed(MIB as f64), "1.0 МБ/с");
+        assert_eq!(format_duration(9.4), "00:09");
+        assert_eq!(format_duration(65.0), "01:05");
+        assert_eq!(format_duration(3661.0), "01:01:01");
     }
 
     #[test]
