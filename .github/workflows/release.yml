@@ -110,6 +110,14 @@ jobs:
     env:
       GH_REPO: ${{ github.repository }}
     steps:
+      # Checkout идёт ПЕРВЫМ: он чистит рабочую папку (git clean -ffdx) и,
+      # если выполнить его после download-artifact, скачанные архивы исчезнут.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            docs/release-notes
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -131,12 +139,6 @@ jobs:
       # плейсхолдеры {{WIN_SHA}} и {{LINUX_SHA}}, здесь они заменяются на реальные
       # SHA-256 залитых архивов, чтобы описание всегда совпадало с файлами.
       # Нет заметок — остаётся автоматическое описание от gh.
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            docs/release-notes
-          sparse-checkout-cone-mode: false
-
       - name: Тело релиза из заметок версии
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
