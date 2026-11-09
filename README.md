@@ -7,7 +7,7 @@
 ![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange)
 ![Windows | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![MIT](https://img.shields.io/badge/license-MIT-green)
-![Версия 0.5.5](https://img.shields.io/badge/version-0.5.5-lightgrey)
+![Версия 0.5.6](https://img.shields.io/badge/version-0.5.6-lightgrey)
 
 ## Содержание
 
@@ -108,7 +108,7 @@ workflow подставляет сам — по фактически залит�
 подгружаются динамически и нужны только окну:
 
 ```bash
-tar -xzf FilePumper-0.5.5-linux-x64.tar.gz
+tar -xzf FilePumper-0.5.6-linux-x64.tar.gz
 chmod +x linux/file-pumper linux/file-pumper-cli
 ./linux/file-pumper-cli --help
 ```
@@ -513,7 +513,8 @@ docs/
     ├── v0.5.2.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.5.3.md        описание релиза с плейсхолдерами SHA-256
     ├── v0.5.4.md        описание релиза, SHA-256 подставлены
-    └── v0.5.5.md        описание релиза с плейсхолдерами SHA-256
+    ├── v0.5.5.md        описание релиза с плейсхолдерами SHA-256
+    └── v0.5.6.md        описание релиза с плейсхолдерами SHA-256
 
 scripts/
 ├── check_linux_build.sh    проверка собранного Linux-бинарника
@@ -562,7 +563,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 --bins
 ### Тесты и линтеры
 
 ```powershell
-cargo test                        # 137 тестов: юнит, сквозные, разброс, имена и на устойчивость
+cargo test                        # 168 тестов: юнит, сквозные, разброс, имена и на устойчивость
 cargo clippy --all-targets
 cargo fmt --check
 bash scripts/check_linux_build.sh # проверка Linux-бинарника (в Linux или WSL)

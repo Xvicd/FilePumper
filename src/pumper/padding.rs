@@ -113,6 +113,38 @@ pub fn append_png_padding(path: &Path, target: u64, job: &Job<'_>) -> Result<(),
     persist(temp, path)
 }
 
+/// Сколько байт данных нужно положить в один Comment Extension, чтобы вместе
+/// с байтами длин подблоков он занял ровно `total` байт.
+///
+/// Сумма `data + blocks` принимает все значения, кроме 1, 257, 513, …:
+/// при `data = 255q` получается `256q`, дальше идут `256q + 2 … 256q + 255`.
+fn gif_comment_data_len(total: u64) -> Option<u64> {
+    let quotient = total / 256;
+    match total % 256 {
+        0 => Some(255 * quotient),
+        1 => None,
+        remainder => Some(255 * quotient + (remainder - 1)),
+    }
+}
+
+/// План добивки GIF: длины данных для Comment Extension.
+///
+/// Обычно хватает одного комментария. Если `data + blocks` не может принять
+/// нужное значение (остаток 1 от деления на 256), добавляется пустой
+/// комментарий и второй с данными — так цель достигается и на границах
+/// подблоков. Совсем маленькие зазоры 1, 2 и 4 байта комментариями GIF
+/// представить нельзя, для них возвращается `None`.
+fn gif_comment_plan(needed: u64) -> Option<Vec<u64>> {
+    if needed < 3 {
+        return None;
+    }
+    if let Some(data_len) = gif_comment_data_len(needed - 3) {
+        return Some(vec![data_len]);
+    }
+    let second = gif_comment_data_len(needed.checked_sub(6)?)?;
+    Some(vec![0, second])
+}
+
 /// Добавляет комментарий GIF перед трейлером: в отличие от мусора после
 /// трейлера, такой файл остаётся валидным GIF для любых серверов.
 pub fn append_gif_comment_padding(path: &Path, target: u64, job: &Job<'_>) -> Result<(), String> {
@@ -123,6 +155,13 @@ pub fn append_gif_comment_padding(path: &Path, target: u64, job: &Job<'_>) -> Re
     if current < 14 {
         return Err("Некорректный GIF: файл слишком мал.".into());
     }
+    let needed = target - current;
+    let plan = gif_comment_plan(needed).ok_or_else(|| {
+        format!(
+            "GIF нельзя добить ровно на {needed} байт: такой зазор нельзя \
+             представить Comment Extension (минимум 3 байта, 4 байта невозможно)."
+        )
+    })?;
     let mut source = File::open(path).map_err(|err| err.to_string())?;
     source
         .seek(SeekFrom::End(-1))
@@ -144,34 +183,39 @@ pub fn append_gif_comment_padding(path: &Path, target: u64, job: &Job<'_>) -> Re
     drop(prefix);
 
     // 2 байта заголовка расширения + подблоки + терминатор блока.
-    let needed = target - current;
-    let mut data_len = needed.saturating_sub(3);
-    loop {
-        let blocks = data_len.div_ceil(GIF_SUB_BLOCK as u64);
-        let next = needed.saturating_sub(3 + blocks);
-        if next == data_len {
-            break;
-        }
-        data_len = next;
-    }
-    temp.write_all(&[0x21, 0xFE])
-        .map_err(|err| err.to_string())?;
-    let mut remaining = data_len;
-    while remaining > 0 {
-        job.check()?;
-        let size = remaining.min(GIF_SUB_BLOCK as u64) as usize;
-        let bytes = random_bytes(size)?;
-        temp.write_all(&[u8::try_from(size).unwrap_or(u8::MAX)])
-            .and_then(|_| temp.write_all(&bytes))
+    let total_data: u64 = plan.iter().sum();
+    let mut written = 0_u64;
+    for data_len in plan {
+        temp.write_all(&[0x21, 0xFE])
             .map_err(|err| err.to_string())?;
-        remaining -= size as u64;
-        job.report(
-            (data_len - remaining) as f32 / data_len.max(1) as f32 * 100.0,
-            "Добавление комментария GIF...",
-        );
+        let mut remaining = data_len;
+        while remaining > 0 {
+            job.check()?;
+            let size = remaining.min(GIF_SUB_BLOCK as u64) as usize;
+            let bytes = random_bytes(size)?;
+            temp.write_all(&[u8::try_from(size).unwrap_or(u8::MAX)])
+                .and_then(|_| temp.write_all(&bytes))
+                .map_err(|err| err.to_string())?;
+            remaining -= size as u64;
+            written += size as u64;
+            job.report(
+                written as f32 / total_data.max(1) as f32 * 100.0,
+                "Добавление комментария GIF...",
+            );
+        }
+        temp.write_all(&[0x00]).map_err(|err| err.to_string())?;
     }
-    temp.write_all(&[0x00, 0x3B])
-        .map_err(|err| err.to_string())?;
+    temp.write_all(&[0x3B]).map_err(|err| err.to_string())?;
+    let written_len = temp
+        .as_file()
+        .metadata()
+        .map_err(|err| err.to_string())?
+        .len();
+    if written_len != target {
+        return Err(format!(
+            "GIF-паддинг промахнулся мимо цели: {written_len} из {target} байт."
+        ));
+    }
     persist(temp, path)
 }
 
@@ -243,6 +287,48 @@ mod tests {
         append_gif_comment_padding(&path, start + 1000, &Job::quiet()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), start + 1000);
         assert!(image::open(&path).is_ok());
+    }
+
+    #[test]
+    fn gif_padding_is_exact_on_comment_block_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        // 260, 516 и 772 раньше зацикливали поиск длины данных: сумма
+        // `data + blocks` не могла принять значение `needed - 3`.
+        for needed in [
+            3_u64, 5, 6, 7, 253, 254, 255, 256, 258, 259, 260, 516, 772, 1000, 4096,
+        ] {
+            let path = dir.path().join(format!("sample-{needed}.gif"));
+            image::RgbImage::from_pixel(3, 3, image::Rgb([1, 2, 3]))
+                .save(&path)
+                .unwrap();
+            let start = fs::metadata(&path).unwrap().len();
+            append_gif_comment_padding(&path, start + needed, &Job::quiet())
+                .unwrap_or_else(|err| panic!("зазор {needed}: {err}"));
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                start + needed,
+                "зазор {needed}"
+            );
+            assert!(image::open(&path).is_ok(), "GIF после добивки на {needed}");
+        }
+    }
+
+    #[test]
+    fn gif_padding_rejects_impossible_tiny_gaps_without_touching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for needed in [1_u64, 2, 4] {
+            let path = dir.path().join(format!("tiny-{needed}.gif"));
+            image::RgbImage::from_pixel(3, 3, image::Rgb([1, 2, 3]))
+                .save(&path)
+                .unwrap();
+            let start = fs::metadata(&path).unwrap().len();
+            let before = fs::read(&path).unwrap();
+            let error = append_gif_comment_padding(&path, start + needed, &Job::quiet())
+                .expect_err("зазор нельзя представить комментариями GIF");
+            assert!(error.contains("нельзя добить"), "{error}");
+            assert_eq!(fs::metadata(&path).unwrap().len(), start);
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]
