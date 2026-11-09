@@ -1,4 +1,4 @@
-FilePumper 0.5.4 — готовые сборки
+FilePumper 0.5.5 — готовые сборки
 ===========================================
 
 windows\
@@ -17,7 +17,8 @@ windows\
                         [--dry-run] [--report отчёт.csv|.json] [--skip-unsupported]
     FilePumper-cli.exe pump --from-dir ПАПКА [--recursive] [--ext png,jpg] --size 10
     FilePumper-cli.exe pump --from-file список.txt --size 10
-    FilePumper-cli.exe generate --size 10 --type png [--count N] [--name ОСНОВА]
+    FilePumper-cli.exe generate --size 10 --type png[,gif,...] [--mix even|random]
+                        [--count N] [--name ОСНОВА]
                         [--vary <МБ> [--vary-mode plus|minus|both]]
                         [--names size|plain|random] [--random-style words|chars]
                         [--payload <файл> ...] [--out-dir ПАПКА]
@@ -39,8 +40,13 @@ windows\
   Файлы с нуля: generate (алиас make) создаёт файл нужного размера без исходника —
   внутри криптослучайные байты, поэтому zip/gzip/7z его не сожмут. Тип задаётся
   --type bin|png|gif|jpg|webp: картиночные типы остаются открывающимися файлами.
+  Типов может быть несколько: --type png,gif,bin (список через запятую, all — все
+  пять). Как разложить типы, решает --mix: even (по умолчанию) — по --count файлов
+  каждого типа, random — всего --count файлов со случайным типом.
   С --payload внутрь прячется нагрузка, но размер остаётся ровно целевым.
   Пример: .\FilePumper-cli.exe generate --size 5,10 --count 2 --type png --out-dir .\big
+  Пример: .\FilePumper-cli.exe generate --size 10 --type png,gif --count 3 --out-dir .\big
+  Пример: .\FilePumper-cli.exe generate --size 10 --type bin,png,gif --count 6 --mix random --out-dir .\big
 
   Имена результатов: --names size (по умолчанию, размер в имени), --names plain
   (photo.png), --names random (green-apple-4821.png). Занятое имя получает суффикс.
