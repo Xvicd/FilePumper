@@ -135,6 +135,138 @@ fn count_creates_several_files_with_distinct_names() {
 }
 
 #[test]
+fn several_types_are_created_in_one_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    let target = (0.2 * MIB as f64) as u64;
+
+    let code = cli(&[
+        "generate",
+        "--size",
+        "0.2",
+        "--count",
+        "2",
+        "--type",
+        "png,gif",
+        "--name",
+        "mix",
+        "--out-dir",
+        path_str(&out_dir),
+    ]);
+
+    assert_eq!(code, 0);
+    let mut png = 0_usize;
+    let mut gif = 0_usize;
+    for entry in fs::read_dir(&out_dir).unwrap() {
+        let path = entry.unwrap().path();
+        assert_eq!(fs::metadata(&path).unwrap().len(), target);
+        assert!(image::open(&path).is_ok(), "{} не открылся", path.display());
+        let extension = path.extension().unwrap().to_string_lossy().into_owned();
+        match extension.as_str() {
+            "png" => png += 1,
+            "gif" => gif += 1,
+            other => panic!("неожиданный тип файла: {other}"),
+        }
+    }
+    assert_eq!((png, gif), (2, 2), "по два файла каждого типа");
+}
+
+#[test]
+fn random_mix_creates_exactly_the_requested_number_of_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    let target = (0.2 * MIB as f64) as u64;
+
+    let code = cli(&[
+        "generate",
+        "--size",
+        "0.2",
+        "--count",
+        "5",
+        "--type",
+        "bin,png",
+        "--mix",
+        "random",
+        "--out-dir",
+        path_str(&out_dir),
+    ]);
+
+    assert_eq!(code, 0);
+    let made: Vec<PathBuf> = fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(made.len(), 5, "случайное распределение не добавляет файлов");
+    for path in &made {
+        assert_eq!(fs::metadata(path).unwrap().len(), target);
+        let extension = path.extension().unwrap().to_string_lossy().into_owned();
+        assert!(
+            extension == "bin" || extension == "png",
+            "лишний тип файла: {extension}"
+        );
+        if extension == "png" {
+            assert!(image::open(path).is_ok(), "{} не открылся", path.display());
+        }
+    }
+}
+
+#[test]
+fn unknown_type_inside_the_list_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    let code = cli(&[
+        "generate",
+        "--size",
+        "1",
+        "--type",
+        "png,exe",
+        "--out-dir",
+        path_str(&out_dir),
+    ]);
+    assert_eq!(code, 1);
+    assert!(!out_dir.exists(), "ничего не должно создаваться");
+}
+
+#[test]
+fn unknown_mix_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let code = cli(&[
+        "generate",
+        "--size",
+        "1",
+        "--type",
+        "png,gif",
+        "--mix",
+        "sideways",
+        "--out-dir",
+        path_str(&dir.path().join("out")),
+    ]);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn dry_run_lists_several_types_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+
+    let code = cli(&[
+        "generate",
+        "--size",
+        "1",
+        "--count",
+        "2",
+        "--type",
+        "png,gif",
+        "--out-dir",
+        path_str(&out_dir),
+        "--dry-run",
+    ]);
+
+    assert_eq!(code, 0);
+    assert!(!out_dir.exists(), "папка результатов не должна создаваться");
+}
+
+#[test]
 fn every_size_is_repeated_for_every_count() {
     let dir = tempfile::tempdir().unwrap();
     let out_dir = dir.path().join("out");

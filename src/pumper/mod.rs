@@ -107,6 +107,38 @@ impl GeneratedKind {
         }
     }
 
+    /// Список типов через запятую или точку с запятой: `png,gif`, `bin;webp`.
+    ///
+    /// `all` (или `все`) означает все [`GeneratedKind::ALL`]. Повторы
+    /// выбрасываются, порядок сохраняется; пустой список — ошибка.
+    pub fn parse_list(value: &str) -> Result<Vec<Self>, String> {
+        let mut kinds = Vec::new();
+        for item in value.split([',', ';']) {
+            let item = item.trim().trim_start_matches('.');
+            if item.is_empty() {
+                continue;
+            }
+            if matches!(item.to_ascii_lowercase().as_str(), "all" | "все") {
+                for kind in Self::ALL {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                continue;
+            }
+            let kind = Self::parse(item)?;
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        if kinds.is_empty() {
+            return Err(
+                "Укажите хотя бы один тип файла: bin, png, gif, jpg, webp или all.".to_owned(),
+            );
+        }
+        Ok(kinds)
+    }
+
     /// Расширение созданного файла.
     pub fn extension(self) -> &'static str {
         match self {

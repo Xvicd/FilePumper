@@ -4,8 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::batch::{
-    self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, NameMode, Names,
-    PumpPlan, RandomNames, RandomStyle, SizeJitter, TargetMode,
+    self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, MixMode, NameMode,
+    Names, PumpPlan, RandomNames, RandomStyle, SizeJitter, TargetMode,
 };
 use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
@@ -67,7 +67,8 @@ FilePumper
 
 Создать файл с нуля (исходник не нужен; внутрь можно спрятать нагрузку):
   file-pumper-cli generate --size <МБ[,МБ...]> [--count N]
-                                   [--type bin|png|gif|jpg|webp]
+                                   [--type bin|png|gif|jpg|webp[,ТИП...]]
+                                   [--mix even|random]
                                    [--vary <МБ> [--vary-mode plus|minus|both]]
                                    [--name ОСНОВА] [--names size|plain|random]
                                    [--random-style words|chars]
@@ -81,14 +82,22 @@ FilePumper
   Содержимое — криптослучайные байты, поэтому архиватор файл не сожмёт:
   zip, gzip и 7z вернут примерно тот же объём.
   --type         bin — обычный файл (по умолчанию); png, gif, jpg, webp —
-                 валидная картинка: объём лежит внутри её структуры
-  --count N      сколько файлов создать для каждого размера: --size 5,10
-                 --count 2 даёт четыре файла (по два на каждый размер)
+                 валидная картинка: объём лежит внутри её структуры.
+                 Список через запятую создаёт сразу несколько типов
+                 (--type png,gif), all — все пять
+  --mix          как разложить несколько типов: even — по --count файлов
+                 каждого типа (по умолчанию), random — всего --count файлов,
+                 тип каждого выбирается случайно из указанных
+  --count N      сколько файлов создать: при --mix even на каждый тип, при
+                 --mix random всего. --size 5,10 --count 2 --type png,gif даёт
+                 восемь файлов (по два на каждый размер и тип)
   --name         основа имени без расширения (по умолчанию file)
   --payload      что спрятать внутрь: контейнер встаёт в заранее посчитанное
                  место, поэтому размер файла остаётся ровно заданным
   Примеры: file-pumper-cli generate --size 10 --type png --name photo
            file-pumper-cli generate --size 5,20 --count 2 --type gif
+           file-pumper-cli generate --size 10 --type png,gif,jpg --count 3
+           file-pumper-cli generate --size 10 --type bin,png --count 6 --mix random
            file-pumper-cli generate --size 10 --payload secret.pdf --password 1234
            file-pumper-cli generate --size 400 --vary 5 --type png
            размер каждого файла — случайный в пределах 395…405 МБ
@@ -169,7 +178,8 @@ struct Flags {
     jobs: usize,
     report_path: Option<PathBuf>,
     verify: bool,
-    generated: GeneratedKind,
+    generated: Vec<GeneratedKind>,
+    mix: MixMode,
     base_name: String,
     count: usize,
 }
@@ -255,7 +265,8 @@ impl Flags {
             jobs: 1,
             report_path: None,
             verify: false,
-            generated: GeneratedKind::default(),
+            generated: Vec::new(),
+            mix: MixMode::default(),
             base_name: "file".to_owned(),
             count: 1,
         };
@@ -382,7 +393,15 @@ impl Flags {
                 }
                 "--type" | "--kind" => {
                     let raw = next("--type", &mut iterator)?;
-                    flags.generated = GeneratedKind::parse(&raw)?;
+                    for kind in GeneratedKind::parse_list(&raw)? {
+                        if !flags.generated.contains(&kind) {
+                            flags.generated.push(kind);
+                        }
+                    }
+                }
+                "--mix" => {
+                    let raw = next("--mix", &mut iterator)?;
+                    flags.mix = MixMode::parse(&raw)?;
                 }
                 "--name" | "--base-name" => {
                     let raw = next("--name", &mut iterator)?;
@@ -476,6 +495,15 @@ impl Flags {
     fn names_value(&self) -> Names {
         Names::new(self.names).with_random(self.random.clone())
     }
+
+    /// Что создавать: без `--type` — обычный файл, как раньше.
+    fn generate_kinds(&self) -> Vec<GeneratedKind> {
+        if self.generated.is_empty() {
+            vec![GeneratedKind::default()]
+        } else {
+            self.generated.clone()
+        }
+    }
 }
 
 /// Подпись режима имён для строки плана: у случайного имени ещё и способ.
@@ -484,6 +512,23 @@ fn names_label(flags: &Flags) -> String {
         NameMode::Random => format!("{} ({})", NameMode::Random.label(), flags.random.label()),
         other => other.label().to_owned(),
     }
+}
+
+/// Типы файлов для строки плана: `png, gif`.
+fn kinds_label(kinds: &[GeneratedKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.extension())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Как разложены несколько типов: у одного типа пояснение не нужно.
+fn mix_note(kinds: &[GeneratedKind], mix: MixMode) -> String {
+    if kinds.len() < 2 {
+        return String::new();
+    }
+    format!(", распределение: «{}»", mix.label())
 }
 
 /// Предупреждает, если разброс способен «съесть» весь размер: при `minus` файл
@@ -760,14 +805,16 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
     let targets = batch::targets_from_mb(&flags.sizes)?;
     let jitter = flags.jitter()?;
     warn_jitter(jitter, &targets);
+    let kinds = flags.generate_kinds();
     let spec = GenerateTargets {
         sizes: targets,
         count: flags.count,
         jitter,
+        kinds: kinds.clone(),
+        mix: flags.mix,
     };
     let mut items = batch::plan_generate(
         &flags.base_name,
-        flags.generated,
         flags.names_value(),
         flags.out_dir.as_deref(),
         &spec,
@@ -793,11 +840,12 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
 
     if flags.dry_run {
         println!(
-            "План: {} файл(ов), тип «{}», имена «{}»{}",
+            "План: {} файл(ов), типы: {}, имена «{}»{}{}",
             items.len(),
-            flags.generated.title(),
+            kinds_label(&kinds),
             names_label(flags),
-            jitter_note(jitter)
+            jitter_note(jitter),
+            mix_note(&kinds, flags.mix)
         );
         for item in &items {
             println!(

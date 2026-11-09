@@ -8,7 +8,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{
-    self, BatchItem, GenerateTargets, JitterMode, NameMode, Names, PumpPlan, RandomNames,
+    self, BatchItem, GenerateTargets, JitterMode, MixMode, NameMode, Names, PumpPlan, RandomNames,
     RandomStyle, SizeJitter, TargetMode,
 };
 use crate::payload::{self, ContainerOptions, PayloadSummary};
@@ -147,7 +147,8 @@ struct Settings {
     random_length: usize,
     random_alphabet: String,
     tab: usize,
-    gen_kind: usize,
+    gen_kinds: Vec<usize>,
+    gen_mix: usize,
     gen_base: String,
     gen_count: usize,
     gen_attach: bool,
@@ -173,7 +174,8 @@ impl Default for Settings {
             random_length: batch::DEFAULT_RANDOM_LENGTH,
             random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
             tab: 0,
-            gen_kind: 0,
+            gen_kinds: vec![generated_kind_index(GeneratedKind::default())],
+            gen_mix: 0,
             gen_base: "file".to_owned(),
             gen_count: 1,
             gen_attach: false,
@@ -246,7 +248,10 @@ pub struct PumperApp {
     random_alphabet: String,
     /// Зерно образца имени: пока его не меняют, пример в окне стоит на месте.
     example_seed: u64,
-    gen_kind: GeneratedKind,
+    /// Какие типы файлов создавать: `.bin`, PNG, GIF, JPEG и WebP сразу.
+    gen_kinds: Vec<GeneratedKind>,
+    /// Как разложить выбранные типы между файлами серии.
+    gen_mix: MixMode,
     gen_base: String,
     gen_count: usize,
     gen_attach: bool,
@@ -287,7 +292,8 @@ impl Default for PumperApp {
             random_length: batch::DEFAULT_RANDOM_LENGTH,
             random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
             example_seed: batch::DEFAULT_SAMPLE_SEED,
-            gen_kind: GeneratedKind::default(),
+            gen_kinds: vec![GeneratedKind::default()],
+            gen_mix: MixMode::default(),
             gen_base: "file".to_owned(),
             gen_count: 1,
             gen_attach: false,
@@ -343,7 +349,15 @@ impl PumperApp {
             random_length: self.random_length,
             random_alphabet: self.random_alphabet.clone(),
             tab: self.tab.index(),
-            gen_kind: generated_kind_index(self.gen_kind),
+            gen_kinds: self
+                .gen_kinds
+                .iter()
+                .map(|kind| generated_kind_index(*kind))
+                .collect(),
+            gen_mix: MixMode::ALL
+                .iter()
+                .position(|mode| *mode == self.gen_mix)
+                .unwrap_or(0),
             gen_base: self.gen_base.clone(),
             gen_count: self.gen_count,
             gen_attach: self.gen_attach,
@@ -388,7 +402,23 @@ impl PumperApp {
             self.random_alphabet = settings.random_alphabet;
         }
         self.tab = Tab::from_index(settings.tab);
-        self.gen_kind = generated_kind_from_index(settings.gen_kind);
+        self.gen_kinds = settings
+            .gen_kinds
+            .iter()
+            .map(|index| generated_kind_from_index(*index))
+            .fold(Vec::new(), |mut kinds, kind| {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+                kinds
+            });
+        if self.gen_kinds.is_empty() {
+            self.gen_kinds = vec![GeneratedKind::default()];
+        }
+        self.gen_mix = MixMode::ALL
+            .get(settings.gen_mix)
+            .copied()
+            .unwrap_or_default();
         if !settings.gen_base.trim().is_empty() {
             self.gen_base = settings.gen_base;
         }
@@ -411,6 +441,16 @@ impl PumperApp {
         Names::new(self.names).with_random(self.random_names())
     }
 
+    /// Сколько файлов получится по текущим настройкам: при «поровну» — по
+    /// `count` на каждый отмеченный тип, при случайном — всего `count`.
+    fn generate_total(&self) -> usize {
+        let count = self.gen_count.max(1);
+        match self.gen_mix {
+            MixMode::Even => count * self.gen_kinds.len().max(1),
+            MixMode::Random => count,
+        }
+    }
+
     /// Пример имени результата для текущих настроек (показывается под кнопками).
     ///
     /// Случайная основа берётся по зерну `example_seed`, а не заново каждый
@@ -422,7 +462,7 @@ impl PumperApp {
             Tab::Generate => batch::sample_generated_name(
                 &self.gen_base,
                 target,
-                self.gen_kind,
+                self.gen_kinds.first().copied().unwrap_or_default(),
                 self.naming(),
                 seed,
             ),
@@ -658,13 +698,18 @@ impl PumperApp {
         });
     }
 
-    /// Создаёт файл «с нуля»: размер из пункта 3, тип и основа имени — из пункта 5.
-    /// Если включено «Прицепить второе дно», внутрь уходит нагрузка из пункта 4.
+    /// Создаёт файлы «с нуля»: размер из блока «Размер нового файла», типы — из
+    /// «Типы файлов», имена — из «Имя, количество и папка». Если включено
+    /// «Спрятать внутрь нагрузку», внутрь уходит нагрузка из «Второе дно».
     fn start_generate(&mut self) {
         let Some(mb) = self.target_mb_value() else {
             self.result_dialog = Some((false, "Введите корректный размер в МБ.".to_owned(), None));
             return;
         };
+        if self.gen_kinds.is_empty() {
+            self.result_dialog = Some((false, "Выберите хотя бы один тип файла.".to_owned(), None));
+            return;
+        }
         if self.gen_attach && self.payloads.is_empty() {
             self.result_dialog = Some((
                 false,
@@ -708,14 +753,16 @@ impl PumperApp {
         } else {
             Vec::new()
         };
+        let kinds = self.gen_kinds.clone();
         let spec = GenerateTargets {
             sizes: targets,
             count: self.gen_count,
             jitter,
+            kinds,
+            mix: self.gen_mix,
         };
         let items = match batch::plan_generate(
             &self.gen_base,
-            self.gen_kind,
             self.naming(),
             self.out_dir.as_deref(),
             &spec,
@@ -2079,26 +2126,63 @@ impl PumperApp {
         }
     }
 
-    /// Вкладка «Создать файл»: размер, тип, имена и необязательное второе дно.
+    /// Вкладка «Создать файл»: размер, типы файлов, имена и второе дно.
     fn generate_tab_ui(&mut self, ui: &mut egui::Ui) {
         group_ui(ui, "1. Размер нового файла", |ui| {
             self.size_ui(ui)
         });
-        group_ui(ui, "2. Тип файла", |ui| {
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("generated_kind")
-                    .selected_text(self.gen_kind.title())
-                    .show_ui(ui, |ui| {
-                        for kind in GeneratedKind::ALL {
-                            ui.selectable_value(&mut self.gen_kind, kind, kind.title());
+        group_ui(ui, "2. Типы файлов", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Создавать:");
+                for kind in GeneratedKind::ALL {
+                    let mut chosen = self.gen_kinds.contains(&kind);
+                    let response = ui.add_enabled(
+                        !self.busy,
+                        egui::Checkbox::new(&mut chosen, kind.extension()),
+                    );
+                    if response.changed() {
+                        if chosen {
+                            self.gen_kinds.push(kind);
+                            // Порядок — как в GeneratedKind::ALL: тогда имена в
+                            // плане идут предсказуемо.
+                            self.gen_kinds
+                                .sort_by_key(|item| generated_kind_index(*item));
+                        } else {
+                            self.gen_kinds.retain(|item| *item != kind);
                         }
-                    });
-                ui.weak(if self.gen_kind.is_image() {
-                    "останется открывающейся картинкой"
-                } else {
-                    "случайные байты без формата"
+                    }
+                    response.on_hover_text(kind.title());
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Все типы"))
+                    .clicked()
+                {
+                    self.gen_kinds = GeneratedKind::ALL.to_vec();
+                }
+                if ui
+                    .add_enabled(
+                        !self.busy && self.gen_kinds.len() > 1,
+                        egui::Button::new("Только .bin"),
+                    )
+                    .clicked()
+                {
+                    self.gen_kinds = vec![GeneratedKind::Bin];
+                }
+                ui.weak(match self.gen_kinds.len() {
+                    0 => "ничего не отмечено".to_owned(),
+                    1 => "один тип".to_owned(),
+                    count => format!("{count} типа(ов) сразу"),
                 });
             });
+            if self.gen_kinds.is_empty() {
+                ui.colored_label(ERROR_COLOR, "Отметьте хотя бы один тип файла.");
+            } else if self.gen_kinds.iter().any(|kind| kind.is_image()) {
+                ui.weak("Картинки остаются рабочими: объём лежит внутри структуры файла.");
+            } else {
+                ui.weak("Случайные байты без формата: файл не откроется программой.");
+            }
         });
         group_ui(ui, "3. Имя, количество и папка", |ui| {
             ui.horizontal(|ui| {
@@ -2109,14 +2193,55 @@ impl PumperApp {
                         .hint_text("file")
                         .desired_width(140.0),
                 );
-                ui.label("Файлов на размер:");
+                ui.label(
+                    if self.gen_mix == MixMode::Even && self.gen_kinds.len() > 1 {
+                        "Файлов на каждый тип:"
+                    } else {
+                        "Файлов на размер:"
+                    },
+                );
                 ui.add_enabled(
                     !self.busy,
                     egui::DragValue::new(&mut self.gen_count).range(1..=32),
                 );
             });
+            if self.gen_kinds.len() > 1 {
+                ui.horizontal(|ui| {
+                    ui.label("Распределение:");
+                    egui::ComboBox::from_id_salt("generate_mix")
+                        .selected_text(self.gen_mix.label())
+                        .show_ui(ui, |ui| {
+                            for mode in MixMode::ALL {
+                                ui.selectable_value(&mut self.gen_mix, mode, mode.title());
+                            }
+                        });
+                    ui.weak(format!("всего файлов: {}", self.generate_total()));
+                });
+            }
             self.names_ui(ui);
             self.out_dir_ui(ui);
+            if let Some(mb) = self.target_mb_value() {
+                let target = (mb * MIB as f64) as u64;
+                let examples: Vec<String> = self
+                    .gen_kinds
+                    .iter()
+                    .map(|kind| {
+                        batch::sample_generated_name(
+                            &self.gen_base,
+                            target,
+                            *kind,
+                            self.naming(),
+                            self.example_seed,
+                        )
+                    })
+                    .collect();
+                if !examples.is_empty() {
+                    ui.weak(format!("Например: {}", examples.join(", ")))
+                        .on_hover_text(
+                            "Имена с учётом режима «Имена»: размер в имени, без него или случайные",
+                        );
+                }
+            }
         });
         group_ui(
             ui,
@@ -2139,7 +2264,7 @@ impl PumperApp {
             },
         );
         ui.horizontal(|ui| {
-            let ready = !self.busy && self.jitter().is_ok();
+            let ready = !self.busy && self.jitter().is_ok() && !self.gen_kinds.is_empty();
             if action_button(ui, ready, "Создать файл") {
                 self.start_generate();
             }

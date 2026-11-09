@@ -1106,21 +1106,71 @@ pub struct GenerateItem {
     pub payloads: Vec<PathBuf>,
 }
 
-/// Что создавать «с нуля»: размеры в байтах, число повторов и разброс размера.
+/// Как разложить несколько выбранных типов по серии файлов.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MixMode {
+    /// По `count` файлов каждого выбранного типа на каждый размер.
+    #[default]
+    Even,
+    /// Всего `count` файлов на каждый размер, а тип каждого файла выбирается
+    /// случайно из отмеченных.
+    Random,
+}
+
+impl MixMode {
+    pub const ALL: [MixMode; 2] = [MixMode::Even, MixMode::Random];
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "even" | "each" | "same" | "поровну" | "каждый" => Ok(MixMode::Even),
+            "random" | "mix" | "shuffle" | "случайно" | "вперемешку" => {
+                Ok(MixMode::Random)
+            }
+            other => Err(format!(
+                "Неизвестное распределение: {other}. Допустимо: even, random."
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MixMode::Even => "поровну на каждый тип",
+            MixMode::Random => "случайно из выбранных",
+        }
+    }
+
+    /// Пояснение с примером — для интерфейса и справки.
+    pub fn title(self) -> &'static str {
+        match self {
+            MixMode::Even => "Поровну: по N файлов каждого отмеченного типа",
+            MixMode::Random => "Случайно: N файлов всего, тип каждого — из отмеченных",
+        }
+    }
+}
+
+/// Что создавать «с нуля»: размеры в байтах, типы файлов, число повторов и
+/// разброс размера.
 #[derive(Clone, Debug, Default)]
 pub struct GenerateTargets {
     /// Размеры в байтах; каждый повторяется `count` раз.
     pub sizes: Vec<u64>,
-    /// Сколько файлов создать на каждый размер.
+    /// Сколько файлов создать: на каждый размер или на каждый тип — по [`MixMode`].
     pub count: usize,
     /// Разброс размера: `None` — размер всегда ровно указанный.
     pub jitter: Option<SizeJitter>,
+    /// Что создавать; пустой список — ошибка планирования.
+    pub kinds: Vec<GeneratedKind>,
+    /// Как распределить выбранные типы между файлами.
+    pub mix: MixMode,
 }
 
-/// План генерации: каждый размер создаётся `count` раз, имена — по [`NameMode`].
+/// План генерации: каждый размер создаётся по правилам [`MixMode`], имена — по
+/// [`NameMode`].
+///
+/// Смешанная серия ничем не отличается от однотипной: у каждого элемента плана
+/// своё поле `kind`, поэтому файлы разных типов создаются в одном проходе.
 pub fn plan_generate(
     base: &str,
-    kind: GeneratedKind,
     names: impl Into<Names>,
     out_dir: Option<&Path>,
     targets: &GenerateTargets,
@@ -1129,14 +1179,18 @@ pub fn plan_generate(
     if targets.sizes.is_empty() {
         return Err("Укажите размер файла.".to_owned());
     }
+    if targets.kinds.is_empty() {
+        return Err("Выберите хотя бы один тип файла.".to_owned());
+    }
     let names = names.into();
     let count = targets.count.clamp(1, 64);
     let mut reservations = Reservations::new();
-    let mut items = Vec::with_capacity(targets.sizes.len() * count);
+    let mut items = Vec::with_capacity(targets.sizes.len() * count * targets.kinds.len());
+    let mut rng = rand::thread_rng();
     for size in &targets.sizes {
-        for _ in 0..count {
-            // Разброс считается для каждого файла отдельно: у серии из `count`
-            // файлов размеры будут разными, и имя покажет фактический размер.
+        for kind in series_kinds(&targets.kinds, count, targets.mix, &mut rng) {
+            // Разброс считается для каждого файла отдельно: у серии размеры
+            // будут разными, и имя покажет фактический размер.
             let exact = match targets.jitter {
                 Some(jitter) => jitter.apply(*size),
                 None => *size,
@@ -1151,6 +1205,25 @@ pub fn plan_generate(
         }
     }
     Ok(items)
+}
+
+/// Типы файлов для одной серии: поровну на каждый отмеченный или `count`
+/// случайных выборов из отмеченных.
+fn series_kinds(
+    kinds: &[GeneratedKind],
+    count: usize,
+    mix: MixMode,
+    rng: &mut impl rand::Rng,
+) -> Vec<GeneratedKind> {
+    match mix {
+        MixMode::Even => kinds
+            .iter()
+            .flat_map(|kind| std::iter::repeat_n(*kind, count))
+            .collect(),
+        MixMode::Random => (0..count)
+            .map(|_| kinds[rng.gen_range(0..kinds.len())])
+            .collect(),
+    }
 }
 
 /// Создаёт файл «с нуля» и возвращает его размер.
@@ -1934,16 +2007,10 @@ mod tests {
             sizes: vec![MIB, MIB / 2],
             count: 2,
             jitter: None,
+            kinds: vec![GeneratedKind::Bin],
+            mix: MixMode::Even,
         };
-        let items = plan_generate(
-            "seed",
-            GeneratedKind::Bin,
-            NameMode::Size,
-            Some(dir.path()),
-            &targets,
-            &[],
-        )
-        .unwrap();
+        let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
 
         assert_eq!(items.len(), 4);
         let names: Vec<PathBuf> = items.iter().map(|item| item.output.clone()).collect();
@@ -1954,6 +2021,93 @@ mod tests {
         assert_eq!(items[0].target, MIB);
         assert_eq!(items[2].target, MIB / 2);
         assert!(items.iter().all(|item| item.payloads.is_empty()));
+    }
+
+    #[test]
+    fn plan_generate_gives_every_selected_kind_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = GenerateTargets {
+            sizes: vec![MIB],
+            count: 2,
+            jitter: None,
+            kinds: vec![GeneratedKind::Png, GeneratedKind::Gif],
+            mix: MixMode::Even,
+        };
+        let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
+
+        assert_eq!(items.len(), 4, "два типа по два файла");
+        let made: Vec<(PathBuf, GeneratedKind)> = items
+            .iter()
+            .map(|item| (item.output.clone(), item.kind))
+            .collect();
+        assert_eq!(
+            made[0],
+            (dir.path().join("seed_1MB.png"), GeneratedKind::Png)
+        );
+        assert_eq!(
+            made[1],
+            (dir.path().join("seed_1MB-2.png"), GeneratedKind::Png)
+        );
+        assert_eq!(
+            made[2],
+            (dir.path().join("seed_1MB.gif"), GeneratedKind::Gif)
+        );
+        assert_eq!(
+            made[3],
+            (dir.path().join("seed_1MB-2.gif"), GeneratedKind::Gif)
+        );
+    }
+
+    #[test]
+    fn plan_generate_random_mix_creates_exactly_the_requested_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = GenerateTargets {
+            sizes: vec![MIB],
+            count: 5,
+            jitter: None,
+            kinds: vec![GeneratedKind::Bin, GeneratedKind::Png],
+            mix: MixMode::Random,
+        };
+        let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
+
+        assert_eq!(
+            items.len(),
+            5,
+            "случайное распределение не добавляет файлов"
+        );
+        assert!(items
+            .iter()
+            .all(|item| matches!(item.kind, GeneratedKind::Bin | GeneratedKind::Png)));
+        assert!(items.iter().all(|item| item.target == MIB));
+        let unique: std::collections::HashSet<PathBuf> =
+            items.iter().map(|item| item.output.clone()).collect();
+        assert_eq!(unique.len(), 5, "имена не должны повторяться");
+    }
+
+    #[test]
+    fn plan_generate_needs_at_least_one_kind() {
+        let targets = GenerateTargets {
+            sizes: vec![MIB],
+            count: 1,
+            jitter: None,
+            kinds: Vec::new(),
+            mix: MixMode::Even,
+        };
+        let error = plan_generate("seed", NameMode::Size, None, &targets, &[]).unwrap_err();
+        assert!(error.contains("тип"), "{error}");
+    }
+
+    #[test]
+    fn mix_mode_parses_and_describes_itself() {
+        assert_eq!(MixMode::parse("even").unwrap(), MixMode::Even);
+        assert_eq!(MixMode::parse(" RANDOM ").unwrap(), MixMode::Random);
+        assert_eq!(MixMode::parse("вперемешку").unwrap(), MixMode::Random);
+        assert!(MixMode::parse("sideways").is_err());
+        assert_eq!(MixMode::default(), MixMode::Even);
+        for mode in MixMode::ALL {
+            assert!(!mode.label().is_empty());
+            assert!(!mode.title().is_empty());
+        }
     }
 
     #[test]
@@ -2084,16 +2238,10 @@ mod tests {
             sizes: vec![2 * MIB],
             count: 6,
             jitter: Some(SizeJitter::new(spread, JitterMode::Plus)),
+            kinds: vec![GeneratedKind::Bin],
+            mix: MixMode::Even,
         };
-        let items = plan_generate(
-            "seed",
-            GeneratedKind::Bin,
-            NameMode::Size,
-            Some(dir.path()),
-            &targets,
-            &[],
-        )
-        .unwrap();
+        let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
 
         assert_eq!(items.len(), 6);
         let mut distinct = std::collections::HashSet::new();
