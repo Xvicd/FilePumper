@@ -11,13 +11,15 @@ use crate::batch::{
     self, BatchItem, BatchReport, GenerateTargets, ItemResult, JitterMode, MixMode, NameMode,
     Names, PumpPlan, RandomNames, RandomStyle, SizeJitter, TargetMode,
 };
+use crate::metadata;
 use crate::payload::group::PairMode;
 use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::report;
 use crate::scan;
 use crate::util::{
-    format_duration, format_speed, CancelToken, Job, Reservations, CANCELLED_MESSAGE, MIB,
+    format_bytes, format_duration, format_speed, CancelToken, Job, Reservations, CANCELLED_MESSAGE,
+    MIB,
 };
 
 /// Обычная строка результата: в quiet/json-режиме её не печатаем.
@@ -189,6 +191,20 @@ FilePumper
 Проверить целостность и контрольные суммы:
   file-pumper-cli verify <носитель>... [--password ПАРОЛЬ] [--json]
 
+Убрать метаданные (можно сразу несколько файлов):
+  file-pumper-cli clean <файл>... [--out-dir ПАПКА] [--output ФАЙЛ]
+                                   [--suffix _clean] [--profiles]
+                                   [--dry-run] [--quiet] [--no-progress] [--json]
+  Удаляются автор, даты, программы и комментарии: PNG (tEXt/zTXt/iTXt, EXIF,
+  tIME), JPEG (EXIF/XMP/IPTC, комментарии), GIF (комментарии, XMP), WebP
+  (EXIF/XMP), SVG (<metadata>, <title>, <desc>, комментарии), docx/xlsx/pptx
+  (свойства документа, приложение и компания, пользовательские свойства) и PDF
+  (/Info, /Metadata). Пиксели, текст документа и полезная нагрузка FilePumper
+  не меняются. Рядом с исходником появляется копия с суффиксом --suffix.
+  --profiles дополнительно удаляет цветовые профили (ICC) и превью документов:
+  без профиля цвета на широком охвате могут отличаться.
+  --dry-run только показывает, что нашлось.
+
 Дополнения для shell:
   file-pumper-cli completions bash|zsh|fish|powershell
 
@@ -254,6 +270,10 @@ struct Flags {
     jobs: usize,
     report_path: Option<PathBuf>,
     verify: bool,
+    /// Удалять вместе с текстом цветовые профили (ICC) и превью документов.
+    clean_profiles: bool,
+    /// Суффикс имени результата при очистке метаданных.
+    clean_suffix: String,
     generated: Vec<GeneratedKind>,
     mix: MixMode,
     base_name: String,
@@ -347,6 +367,8 @@ impl Flags {
             jobs: 1,
             report_path: None,
             verify: false,
+            clean_profiles: false,
+            clean_suffix: "_clean".to_owned(),
             generated: Vec::new(),
             mix: MixMode::default(),
             base_name: "file".to_owned(),
@@ -477,6 +499,14 @@ impl Flags {
                 "--skip-unsupported" => flags.skip_unsupported = true,
                 "--dry-run" => flags.dry_run = true,
                 "--verify" => flags.verify = true,
+                "--profiles" | "--remove-profiles" => flags.clean_profiles = true,
+                "--suffix" => {
+                    let raw = next("--suffix", &mut iterator)?;
+                    if raw.contains(['/', '\\']) {
+                        return Err("Суффикс имени не может содержать разделители пути.".to_owned());
+                    }
+                    flags.clean_suffix = raw;
+                }
                 "--compress" => flags.compress = true,
                 "--method" => {
                     let raw = next("--method", &mut iterator)?;
@@ -756,6 +786,7 @@ pub fn execute(args: &[String]) -> Result<(), String> {
         "extract" => command_extract(&flags),
         "inspect" => command_inspect(&flags),
         "verify" => command_verify(&flags),
+        "clean" | "metadata" | "strip-meta" => command_clean(&flags),
         other => Err(format!("Неизвестная команда: {other}. Используйте --help.")),
     }
 }
@@ -1944,21 +1975,210 @@ fn command_verify(flags: &Flags) -> Result<(), String> {
     Ok(())
 }
 
+fn command_clean(flags: &Flags) -> Result<(), String> {
+    let mut inputs = flags.inputs()?;
+    if inputs.is_empty() {
+        return Err("Укажите файлы: clean <файл>...".to_owned());
+    }
+    let explicit_output = flags
+        .output
+        .clone()
+        .or_else(|| flags.legacy_output(&mut inputs));
+    if explicit_output.is_some() && inputs.len() > 1 {
+        return Err("Параметр --output работает только с одним файлом.".to_owned());
+    }
+    if let Some(output) = explicit_output.as_ref() {
+        if let Some(input) = inputs.first() {
+            if crate::util::same_file(input, output) {
+                return Err("Нельзя перезаписать исходный файл: укажите другую копию.".to_owned());
+            }
+        }
+    }
+    let options = metadata::CleanOptions {
+        text: true,
+        profiles: flags.clean_profiles,
+    };
+
+    if flags.dry_run {
+        let mut items = Vec::with_capacity(inputs.len());
+        let mut failed = 0_usize;
+        for input in &inputs {
+            match metadata::scan(input, options) {
+                Ok(report) => {
+                    items.push(json!({
+                        "input": input,
+                        "kind": report.kind.label(),
+                        "removed": report
+                            .removed
+                            .iter()
+                            .map(|removal| json!({"label": removal.label, "bytes": removal.bytes}))
+                            .collect::<Vec<Value>>(),
+                        "removed_bytes": report.removed_bytes(),
+                    }));
+                    say!(flags, "{}", input.display());
+                    for removal in &report.removed {
+                        say!(
+                            flags,
+                            "  {} — {}",
+                            removal.label,
+                            format_bytes(removal.bytes as f64)
+                        );
+                    }
+                    if report.is_empty() {
+                        say!(flags, "  метаданных нет");
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    items.push(json!({"input": input, "ok": false, "error": error}));
+                    note!(flags, "Ошибка: {} — {error}", input.display());
+                }
+            }
+        }
+        if flags.json {
+            print_json(&json!({
+                "ok": failed == 0,
+                "dry_run": true,
+                "command": "clean",
+                "profiles": flags.clean_profiles,
+                "items": items,
+            }));
+        }
+        if failed > 0 {
+            return Err(format!(
+                "Не удалось разобрать {failed} из {} файлов.",
+                inputs.len()
+            ));
+        }
+        return Ok(());
+    }
+
+    let total_bytes: u64 = inputs
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum();
+    let progress = progress_printer(flags.progress_enabled(), Some(total_bytes));
+    let cancel = CancelToken::new();
+    let job = Job::new(&progress, &cancel);
+    let mut batch_report = BatchReport::default();
+    let mut items = Vec::with_capacity(inputs.len());
+    let mut failed = 0_usize;
+    for input in &inputs {
+        let output = match explicit_output.clone() {
+            Some(path) => path,
+            None => match batch::cleaned_path(input, flags.out_dir.as_deref(), &flags.clean_suffix)
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    failed += 1;
+                    batch_report.items.push((
+                        input.clone(),
+                        ItemResult::Failed {
+                            message: error.clone(),
+                        },
+                    ));
+                    items.push(json!({"input": input, "ok": false, "error": error}));
+                    if !flags.json {
+                        eprintln!("Ошибка: {} — {error}", input.display());
+                    }
+                    continue;
+                }
+            },
+        };
+        match metadata::clean(input, &output, options, &job) {
+            Ok(report) => {
+                let size = std::fs::metadata(&output)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                batch_report.items.push((
+                    input.clone(),
+                    ItemResult::Created {
+                        output: output.clone(),
+                        size,
+                    },
+                ));
+                items.push(json!({
+                    "input": input,
+                    "output": output,
+                    "ok": true,
+                    "kind": report.kind.label(),
+                    "removed": report
+                        .removed
+                        .iter()
+                        .map(|removal| json!({"label": removal.label, "bytes": removal.bytes}))
+                        .collect::<Vec<Value>>(),
+                    "removed_bytes": report.removed_bytes(),
+                    "size_before": report.size_before,
+                    "size_after": report.size_after,
+                }));
+                say!(
+                    flags,
+                    "Готово: {} -> {} ({})",
+                    input.display(),
+                    output.display(),
+                    report.blocks_label()
+                );
+                for removal in &report.removed {
+                    say!(
+                        flags,
+                        "  {} — {}",
+                        removal.label,
+                        format_bytes(removal.bytes as f64)
+                    );
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                batch_report.items.push((
+                    input.clone(),
+                    ItemResult::Failed {
+                        message: error.clone(),
+                    },
+                ));
+                items.push(json!({"input": input, "ok": false, "error": error}));
+                if !flags.json {
+                    eprintln!("Ошибка: {} — {error}", input.display());
+                }
+            }
+        }
+    }
+    if flags.json {
+        print_json(&json!({
+            "ok": failed == 0,
+            "command": "clean",
+            "profiles": flags.clean_profiles,
+            "items": items,
+        }));
+    }
+    if let Some(path) = flags.report_path.as_deref() {
+        report::write_report(path, &batch_report)?;
+        note!(flags, "Отчёт: {}", path.display());
+    }
+    if failed > 0 {
+        return Err(format!(
+            "Не удалось обработать {failed} из {} файлов.",
+            inputs.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Небольшие статические файлы дополнений: без внешних зависимостей и
 /// генераторов — их достаточно, чтобы команды и флаги подсказывались в shell.
 fn completion_script(shell: &str) -> Result<&'static str, String> {
     let script = match shell.trim().to_ascii_lowercase().as_str() {
         "bash" => {
-            r#"complete -W "pump generate make embed extract inspect verify completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
+            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
 "#
         }
         "zsh" => {
             r#"#compdef file-pumper-cli
-_arguments '1:command:(pump generate make embed extract inspect verify completions)' '*:file:_files'
+_arguments '1:command:(pump generate make embed extract inspect verify clean completions)' '*:file:_files'
 "#
         }
         "fish" => {
-            r#"complete -c file-pumper-cli -f -a "pump generate make embed extract inspect verify completions"
+            r#"complete -c file-pumper-cli -f -a "pump generate make embed extract inspect verify clean completions"
 complete -c file-pumper-cli -l json -d "Машинный вывод в JSON"
 complete -c file-pumper-cli -l quiet -d "Без прогресса и служебного текста"
 complete -c file-pumper-cli -l no-progress -d "Без полосы прогресса"
@@ -1969,7 +2189,7 @@ complete -c file-pumper-cli -l password-file -r -d "Пароль из файла
         "powershell" | "pwsh" => {
             r#"Register-ArgumentCompleter -Native -CommandName file-pumper-cli -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
-    $items = 'pump','generate','make','embed','extract','inspect','verify','completions',
+    $items = 'pump','generate','make','embed','extract','inspect','verify','clean','completions',
         '--help','--version','--size','--size-mode','--vary','--vary-mode','--names',
         '--random-style','--random-length','--random-alphabet','--method','--format',
         '--from-dir','--from-file','--recursive','--ext','--skip-unsupported','--jobs',

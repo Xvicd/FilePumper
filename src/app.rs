@@ -12,6 +12,7 @@ use crate::batch::{
     self, BatchItem, GenerateTargets, JitterMode, MixMode, NameMode, Names, PumpPlan, RandomNames,
     RandomStyle, SizeJitter, TargetMode,
 };
+use crate::metadata::{self, CleanOptions};
 use crate::payload::group::PairMode;
 use crate::payload::{self, ContainerOptions, PayloadSummary};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
@@ -50,11 +51,21 @@ enum WorkerMessage {
     BatchItemStarted(usize),
     BatchItemProgress(usize, f32, String),
     BatchItemDone(usize, Result<u64, String>),
+    /// Очистка метаданных завершена: статусы по строкам списка.
+    CleanFinished {
+        ok: bool,
+        cancelled: bool,
+        text: String,
+        reveal: Option<PathBuf>,
+        results: Vec<(usize, Result<String, String>)>,
+    },
     BatchFinished {
         ok: bool,
         cancelled: bool,
         text: String,
-        folder: Option<PathBuf>,
+        /// Что показать по кнопке «Показать в проводнике»: файл результата при
+        /// одном файле, иначе папка результатов.
+        reveal: Option<PathBuf>,
     },
 }
 
@@ -117,16 +128,19 @@ enum Tab {
     Payload,
     /// Создать файл нужного размера без исходника.
     Generate,
+    /// Убрать метаданные: автор, даты, комментарии, свойства документа.
+    Metadata,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Pump, Tab::Payload, Tab::Generate];
+    const ALL: [Tab; 4] = [Tab::Pump, Tab::Payload, Tab::Generate, Tab::Metadata];
 
     fn title(self) -> &'static str {
         match self {
             Tab::Pump => "Накачать файлы",
             Tab::Payload => "Спрятать / извлечь",
             Tab::Generate => "Создать файл",
+            Tab::Metadata => "Убрать метаданные",
         }
     }
 
@@ -137,6 +151,7 @@ impl Tab {
                 "Спрячьте любой файл внутрь картинки и достаньте его обратно: данные лежат в структуре файла, картинка остаётся рабочей. Файлов может быть много: «Проверить все» покажет, что где спрятано, «Извлечь всё в папку» достанет сразу всё, а пары разложат нагрузки по носителям с разными паролями."
             }
             Tab::Generate => "Файл нужного размера без исходника: внутри криптослучайные байты, поэтому zip, gzip и 7z его не сожмут.",
+            Tab::Metadata => "Уберите автора, даты и комментарии из готовых файлов: PNG, JPEG, GIF, WebP, SVG, docx/xlsx/pptx, PDF — рядом появится копия «_clean».",
         }
     }
 
@@ -172,6 +187,8 @@ struct Settings {
     gen_base: String,
     gen_count: usize,
     gen_attach: bool,
+    clean_text: bool,
+    clean_profiles: bool,
 }
 
 /// Сохранённый набор настроек окна: метод, размер, имена, папка и прочее.
@@ -208,6 +225,8 @@ impl Default for Settings {
             gen_base: "file".to_owned(),
             gen_count: 1,
             gen_attach: false,
+            clean_text: true,
+            clean_profiles: false,
         }
     }
 }
@@ -287,6 +306,12 @@ pub struct PumperApp {
     preview: Option<Preview>,
     /// Пары «носитель ← нагрузка» для группового встраивания.
     pairs: Vec<PairRow>,
+    /// Список файлов вкладки «Убрать метаданные».
+    clean_rows: Vec<BatchRow>,
+    /// Удалять текстовые метаданные (автор, даты, комментарии, свойства).
+    clean_text: bool,
+    /// Удалять вместе с ними цветовые профили (ICC) и превью документов.
+    clean_profiles: bool,
     /// Результат обзора носителей: в каком файле что спрятано.
     scan: Vec<payload::group::ScanItem>,
     /// Пароль для проверки и извлечения: может отличаться от пароля встраивания.
@@ -337,6 +362,9 @@ impl Default for PumperApp {
             gen_attach: false,
             preview: None,
             pairs: Vec::new(),
+            clean_rows: Vec::new(),
+            clean_text: true,
+            clean_profiles: false,
             scan: Vec::new(),
             extract_password: String::new(),
             show_passwords: false,
@@ -408,6 +436,8 @@ impl PumperApp {
             gen_base: self.gen_base.clone(),
             gen_count: self.gen_count,
             gen_attach: self.gen_attach,
+            clean_text: self.clean_text,
+            clean_profiles: self.clean_profiles,
         }
     }
 
@@ -448,6 +478,8 @@ impl PumperApp {
         if !settings.random_alphabet.trim().is_empty() {
             self.random_alphabet = settings.random_alphabet;
         }
+        self.clean_text = settings.clean_text;
+        self.clean_profiles = settings.clean_profiles;
         self.tab = Tab::from_index(settings.tab);
         self.gen_kinds = settings
             .gen_kinds
@@ -624,6 +656,9 @@ impl PumperApp {
     ///
     /// Случайная основа берётся по зерну `example_seed`, а не заново каждый
     /// кадр: иначе пример «перебирал» бы имена при любой перерисовке окна.
+    /// Пример строится по первому файлу списка: у Office/ZIP, PDF и «просто
+    /// заполнения» расширение результата зависит от исходника, поэтому
+    /// постоянный `photo.png` вводил в заблуждение при выборе `.docx`.
     fn example_name(&self) -> String {
         let target = (self.target_mb_value().unwrap_or(10.0) * MIB as f64) as u64;
         let seed = self.example_seed;
@@ -636,7 +671,7 @@ impl PumperApp {
                 seed,
             ),
             _ => batch::sample_result_name(
-                Path::new("photo.png"),
+                self.sample_input(),
                 target,
                 self.method,
                 self.animation_format,
@@ -644,6 +679,14 @@ impl PumperApp {
                 seed,
             ),
         }
+    }
+
+    /// Исходник для примера имени: первый файл списка, иначе `photo.png`.
+    fn sample_input(&self) -> &Path {
+        self.rows
+            .first()
+            .map(|row| row.input.as_path())
+            .unwrap_or_else(|| Path::new("photo.png"))
     }
 
     /// Размер из поля «Размер» в мегабайтах (запятая тоже работает).
@@ -820,6 +863,7 @@ impl PumperApp {
             let mut failed = 0_usize;
             let mut cancelled = false;
             let mut folder: Option<PathBuf> = None;
+            let mut last_output: Option<PathBuf> = None;
             // Общий контекст нужен только ради общего флага отмены: прогресс
             // каждого файла пересчитывается в общий дочерним контекстом.
             let silent = |_: f32, _: &str| {};
@@ -859,6 +903,7 @@ impl PumperApp {
                     Ok(size) => {
                         created += 1;
                         folder = item.output.parent().map(PathBuf::from);
+                        last_output = Some(item.output.clone());
                         let _ = sender.send(WorkerMessage::BatchItemDone(row_index, Ok(size)));
                     }
                     Err(message) if message == CANCELLED_MESSAGE => {
@@ -881,17 +926,25 @@ impl PumperApp {
             if failed > 0 {
                 text.push_str(&format!("\nС ошибкой: {failed}."));
             }
-            match folder.as_ref() {
-                Some(directory) => {
+            match (created, last_output.as_ref(), folder.as_ref()) {
+                (1, Some(file), _) => {
+                    text.push_str(&format!("\nРезультат: {}", file.display()));
+                }
+                (_, _, Some(directory)) => {
                     text.push_str(&format!("\nПапка результатов: {}", directory.display()));
                 }
-                None => text.push_str("\nРезультаты лежат рядом с исходными файлами."),
+                _ => text.push_str("\nРезультаты лежат рядом с исходными файлами."),
             }
+            let reveal = if created == 1 {
+                last_output.clone()
+            } else {
+                folder.clone()
+            };
             let _ = sender.send(WorkerMessage::BatchFinished {
                 ok: !cancelled && failed == 0,
                 cancelled,
                 text,
-                folder,
+                reveal,
             });
         });
     }
@@ -1005,6 +1058,7 @@ impl PumperApp {
             let mut cancelled = false;
             let mut last_error: Option<String> = None;
             let mut folder: Option<PathBuf> = None;
+            let mut last_output: Option<PathBuf> = None;
             // Общий контекст нужен только ради флага отмены: прогресс каждого
             // файла пересчитывается в общий через дочерний контекст.
             let silent = |_: f32, _: &str| {};
@@ -1037,6 +1091,7 @@ impl PumperApp {
                     Ok(_) => {
                         created += 1;
                         folder = item.output.parent().map(PathBuf::from);
+                        last_output = Some(item.output.clone());
                     }
                     Err(message) if message == CANCELLED_MESSAGE => {
                         cancelled = true;
@@ -1060,17 +1115,25 @@ impl PumperApp {
             if let Some(message) = last_error {
                 text.push_str(&format!("\nПоследняя ошибка: {message}"));
             }
-            match folder.as_ref() {
-                Some(directory) => {
+            match (created, last_output.as_ref(), folder.as_ref()) {
+                (1, Some(file), _) => {
+                    text.push_str(&format!("\nРезультат: {}", file.display()));
+                }
+                (_, _, Some(directory)) => {
                     text.push_str(&format!("\nПапка результатов: {}", directory.display()));
                 }
-                None => text.push_str("\nФайлы созданы в рабочей папке."),
+                _ => text.push_str("\nФайлы созданы в рабочей папке."),
             }
+            let reveal = if created == 1 {
+                last_output.clone()
+            } else {
+                folder.clone()
+            };
             let _ = sender.send(WorkerMessage::BatchFinished {
                 ok: !cancelled && failed == 0,
                 cancelled,
                 text,
-                folder,
+                reveal,
             });
         });
     }
@@ -1694,11 +1757,53 @@ impl PumperApp {
                         row.progress = 1.0;
                     }
                 }
+                WorkerMessage::CleanFinished {
+                    ok,
+                    cancelled,
+                    text,
+                    reveal,
+                    results,
+                } => {
+                    self.busy = false;
+                    self.worker = None;
+                    self.progress = if ok { 1.0 } else { 0.0 };
+                    self.status = if ok {
+                        "Метаданные удалены.".to_owned()
+                    } else if cancelled {
+                        CANCELLED_MESSAGE.to_owned()
+                    } else {
+                        "Часть файлов не удалось обработать.".to_owned()
+                    };
+                    for (index, result) in results {
+                        if let Some(row) = self.clean_rows.get_mut(index) {
+                            row.progress = 1.0;
+                            match result {
+                                Ok(message) => {
+                                    row.status = message;
+                                    row.ok = Some(true);
+                                }
+                                Err(error) => {
+                                    row.status = format!("Ошибка: {error}");
+                                    row.ok = Some(false);
+                                }
+                            }
+                        }
+                    }
+                    if cancelled {
+                        for row in self.clean_rows.iter_mut() {
+                            if row.ok.is_none() {
+                                row.status = "Отменено".to_owned();
+                                row.ok = Some(false);
+                            }
+                        }
+                    }
+                    self.result_dialog = Some((ok, text, reveal));
+                }
                 WorkerMessage::BatchFinished {
                     ok,
                     cancelled,
                     text,
-                    folder,
+                    reveal,
                 } => {
                     self.busy = false;
                     self.worker = None;
@@ -1718,7 +1823,7 @@ impl PumperApp {
                             }
                         }
                     }
-                    self.result_dialog = Some((ok, text, folder));
+                    self.result_dialog = Some((ok, text, reveal));
                 }
             }
         }
@@ -1782,6 +1887,13 @@ impl PumperApp {
         // На вкладке «Спрятать / извлечь» зоны различаются: файл, брошенный
         // на блок носителей, не станет нагрузкой, и наоборот. Вне зон ничего
         // не добавляем, чтобы случайное перетаскивание не путало списки.
+        if self.tab == Tab::Metadata {
+            let added = expanded.len();
+            self.add_clean_files(expanded);
+            self.status = format!("Файлов добавлено: {added}.");
+            return;
+        }
+
         if self.tab == Tab::Payload {
             let pointer = ctx.input(|input| {
                 input
@@ -1886,6 +1998,7 @@ impl eframe::App for PumperApp {
                     Tab::Pump => self.pump_tab_ui(ui),
                     Tab::Payload => self.payload_tab_ui(ui),
                     Tab::Generate => self.generate_tab_ui(ui),
+                    Tab::Metadata => self.metadata_tab_ui(ui),
                 });
         });
 
@@ -1944,6 +2057,29 @@ fn paint_drop_zones(ui: &egui::Ui, carriers: Option<egui::Rect>, payloads: Optio
             ui.painter()
                 .rect_stroke(rect, 6.0, egui::Stroke::new(2.0_f32, OK_COLOR));
         }
+    }
+}
+
+/// Что найдено в файле: строка для списка очистки и признак «разобрали».
+///
+/// Файлы больше 8 МиБ при добавлении не разбираются: обзор читает файл целиком,
+/// а ждать этого на каждое перетаскивание не хочется.
+fn describe_metadata(path: &Path, text: bool, profiles: bool) -> (String, Option<bool>) {
+    const PREVIEW_LIMIT: u64 = 8 * MIB;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > PREVIEW_LIMIT {
+            return (
+                format!(
+                    "будет очищено ({} МБ, обзор пропущен)",
+                    meta.len().div_ceil(MIB)
+                ),
+                None,
+            );
+        }
+    }
+    match metadata::scan(path, CleanOptions { text, profiles }) {
+        Ok(report) => (report.blocks_label(), None),
+        Err(error) => (error, Some(false)),
     }
 }
 
@@ -2093,6 +2229,294 @@ impl PumperApp {
             });
         if let Some(index) = remove {
             self.rows.remove(index);
+        }
+    }
+
+    /// Добавляет файлы в список очистки и сразу показывает, что найдено.
+    fn add_clean_files(&mut self, paths: Vec<PathBuf>) {
+        let mut added = 0_usize;
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            if self
+                .clean_rows
+                .iter()
+                .any(|row| crate::util::same_file(&row.input, &path))
+            {
+                continue;
+            }
+            let (status, ok) = describe_metadata(&path, self.clean_text, self.clean_profiles);
+            self.clean_rows.push(BatchRow {
+                input: path,
+                status,
+                ok,
+                progress: 0.0,
+            });
+            added += 1;
+        }
+        if added > 0 {
+            self.status = format!("Файлов в списке: {}.", self.clean_rows.len());
+        }
+    }
+
+    /// Пересчитывает «что найдено» после смены галочек.
+    fn refresh_clean_statuses(&mut self) {
+        for row in self.clean_rows.iter_mut() {
+            let (status, ok) = describe_metadata(&row.input, self.clean_text, self.clean_profiles);
+            row.status = status;
+            row.ok = ok;
+            row.progress = 0.0;
+        }
+    }
+
+    /// Убирает метаданные из всех файлов списка в фоновом потоке.
+    fn start_clean(&mut self) {
+        if self.clean_rows.is_empty() {
+            self.result_dialog = Some((false, "Добавьте хотя бы один файл.".to_owned(), None));
+            return;
+        }
+        let options = CleanOptions {
+            text: self.clean_text,
+            profiles: self.clean_profiles,
+        };
+        if options.nothing() {
+            self.result_dialog = Some((
+                false,
+                "Отметьте, что удалять: текст и свойства или профили.".to_owned(),
+                None,
+            ));
+            return;
+        }
+        let inputs: Vec<(usize, PathBuf)> = self
+            .clean_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (index, row.input.clone()))
+            .collect();
+        let total_bytes: u64 = inputs
+            .iter()
+            .filter_map(|(_, path)| std::fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .sum();
+        let out_dir = self.out_dir.clone();
+        for row in self.clean_rows.iter_mut() {
+            row.ok = None;
+            row.status = "Ожидает".to_owned();
+            row.progress = 0.0;
+        }
+        let (sender, cancel) = self.begin_job();
+        self.status = "Очистка метаданных...".to_owned();
+        thread::spawn(move || {
+            let total = inputs.len();
+            let started = Instant::now();
+            let mut created = 0_usize;
+            let mut failed = 0_usize;
+            let mut cancelled = false;
+            let mut last_output: Option<PathBuf> = None;
+            let mut folder: Option<PathBuf> = None;
+            let mut results = Vec::with_capacity(total);
+            for (position, (index, input)) in inputs.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let progress_sender = sender.clone();
+                let progress = move |percent: f32, text: &str| {
+                    let within = percent.clamp(0.0, 100.0) / 100.0;
+                    let overall = ((position as f32 + within) / total as f32).clamp(0.0, 1.0);
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let mut message = format!("Файл {}/{}: {text}", position + 1, total);
+                    if elapsed > 0.25 && overall > 0.0 {
+                        message.push_str("  ");
+                        message
+                            .push_str(&format_speed(total_bytes as f64 * overall as f64 / elapsed));
+                    }
+                    let _ = progress_sender.send(WorkerMessage::Progress(overall, message));
+                };
+                let job = Job::new(&progress, &cancel);
+                let output = match batch::cleaned_path(input, out_dir.as_deref(), "_clean") {
+                    Ok(path) => path,
+                    Err(error) => {
+                        failed += 1;
+                        results.push((*index, Err(error)));
+                        continue;
+                    }
+                };
+                match metadata::clean(input, &output, options, &job) {
+                    Ok(report) => {
+                        created += 1;
+                        folder = output.parent().map(PathBuf::from);
+                        last_output = Some(output.clone());
+                        results.push((*index, Ok(report.blocks_label())));
+                    }
+                    Err(error) if error == CANCELLED_MESSAGE => {
+                        results.push((*index, Err(error)));
+                        cancelled = true;
+                        break;
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        results.push((*index, Err(error)));
+                    }
+                }
+            }
+            let mut text = if cancelled {
+                format!("Очистка отменена.\nГотово файлов: {created} из {total}.")
+            } else {
+                format!("Готово файлов: {created} из {total}.")
+            };
+            if failed > 0 {
+                text.push_str(&format!("\nС ошибкой: {failed}."));
+            }
+            match (created, last_output.as_ref(), folder.as_ref()) {
+                (1, Some(file), _) => {
+                    text.push_str(&format!("\nРезультат: {}", file.display()));
+                }
+                (_, _, Some(directory)) => {
+                    text.push_str(&format!("\nПапка результатов: {}", directory.display()));
+                }
+                _ => {}
+            }
+            let reveal = if created == 1 { last_output } else { folder };
+            let _ = sender.send(WorkerMessage::CleanFinished {
+                ok: !cancelled && failed == 0,
+                cancelled,
+                text,
+                reveal,
+                results,
+            });
+        });
+    }
+
+    /// Вкладка «Убрать метаданные»: список файлов, что удалять, запуск.
+    fn metadata_tab_ui(&mut self, ui: &mut egui::Ui) {
+        group_ui(ui, "1. Из каких файлов убираем", |ui| {
+            self.clean_files_ui(ui)
+        });
+        let mut options_changed = false;
+        group_ui(ui, "2. Что удалять", |ui| {
+            ui.add_enabled_ui(!self.busy, |ui| {
+                options_changed |= ui
+                    .checkbox(
+                        &mut self.clean_text,
+                        "Текст, EXIF, свойства документа и комментарии",
+                    )
+                    .on_hover_text(
+                        "PNG tEXt/zTXt/iTXt, EXIF и tIME; JPEG EXIF/XMP/IPTC и комментарии; GIF-комментарии и XMP; WebP EXIF/XMP; SVG <metadata>, <title>, <desc>; свойства docx/xlsx/pptx; PDF /Info и /Metadata",
+                    )
+                    .changed();
+                options_changed |= ui
+                    .checkbox(
+                        &mut self.clean_profiles,
+                        "Цветовые профили (ICC) и превью документов",
+                    )
+                    .on_hover_text(
+                        "Без цветового профиля цвета на широком охвате могут отличаться: включайте, если важнее скрыть всё лишнее",
+                    )
+                    .changed();
+            });
+        });
+        if options_changed {
+            self.refresh_clean_statuses();
+        }
+        group_ui(ui, "3. Куда сохранить", |ui| {
+            ui.weak(
+                "Копия без метаданных ложится рядом с исходником, к имени добавляется «_clean».",
+            );
+            self.out_dir_ui(ui);
+        });
+        ui.horizontal(|ui| {
+            let ready = !self.busy
+                && !self.clean_rows.is_empty()
+                && (self.clean_text || self.clean_profiles);
+            if action_button(ui, ready, "Убрать метаданные") {
+                self.start_clean();
+            }
+            ui.weak(match self.clean_rows.len() {
+                0 => "сначала добавьте файлы".to_owned(),
+                count => format!("файлов к обработке: {count}"),
+            });
+        });
+    }
+
+    /// Список файлов очистки: добавление, удаление и что найдено.
+    fn clean_files_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Добавить файлы..."))
+                .clicked()
+            {
+                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                    self.add_clean_files(paths);
+                }
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Добавить папку..."))
+                .on_hover_text("Папка добавляется вместе с подпапками")
+                .clicked()
+            {
+                if let Some(directory) = rfd::FileDialog::new().pick_folder() {
+                    match scan::collect_from_dir(&directory, true, &[]) {
+                        Ok(found) => self.add_clean_files(found),
+                        Err(message) => self.result_dialog = Some((false, message, None)),
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !self.clean_rows.is_empty(),
+                    egui::Button::new("Очистить список"),
+                )
+                .clicked()
+            {
+                self.clean_rows.clear();
+                self.status = "Список файлов очищен.".to_owned();
+            }
+            match self.clean_rows.len() {
+                0 => ui.weak(
+                    "файлы не выбраны — перетащите их в окно или нажмите «Добавить файлы...»",
+                ),
+                count => ui.weak(format!("файлов: {count}")),
+            };
+        });
+        if self.clean_rows.is_empty() {
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("clean_rows")
+            .max_height(150.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (index, row) in self.clean_rows.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.busy, egui::Button::new("✕")).clicked() {
+                            remove = Some(index);
+                        }
+                        let name = row
+                            .input
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("файл");
+                        ui.monospace(name)
+                            .on_hover_text(row.input.display().to_string());
+                        match row.ok {
+                            Some(true) => {
+                                ui.colored_label(OK_COLOR, &row.status);
+                            }
+                            Some(false) => {
+                                ui.colored_label(ERROR_COLOR, &row.status);
+                            }
+                            None => {
+                                ui.weak(&row.status);
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some(index) = remove {
+            self.clean_rows.remove(index);
         }
     }
 
@@ -2881,4 +3305,75 @@ pub fn run_gui() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(PumperApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with(input: &str) -> PumperApp {
+        PumperApp {
+            rows: vec![BatchRow {
+                input: PathBuf::from(input),
+                status: String::new(),
+                ok: None,
+                progress: 0.0,
+            }],
+            tab: Tab::Pump,
+            target_mb: "19".to_owned(),
+            ..PumperApp::default()
+        }
+    }
+
+    #[test]
+    fn example_name_follows_the_first_file_format() {
+        let mut app = app_with("отчёт.docx");
+        app.method = Method::OfficePdf;
+        app.names = NameMode::Plain;
+        assert_eq!(app.example_name(), "отчёт.docx");
+
+        app.names = NameMode::Size;
+        assert_eq!(app.example_name(), "отчёт_19MB.docx");
+    }
+
+    #[test]
+    fn example_name_uses_the_method_extension_for_images() {
+        let mut app = app_with("photo.png");
+        app.method = Method::Animation;
+        app.animation_format = AnimationFormat::Gif;
+        app.names = NameMode::Size;
+        // Метод делает GIF из чего угодно: расширение берётся у метода,
+        // а основа имени — у первого файла списка.
+        app.rows[0].input = PathBuf::from("report.docx");
+        assert_eq!(app.example_name(), "report_19MB.gif");
+    }
+
+    #[test]
+    fn metadata_preview_reports_text_and_unsupported_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]))
+            .save(&png)
+            .unwrap();
+        let (status, ok) = describe_metadata(&png, true, false);
+        assert!(ok.is_none());
+        assert!(status.contains("метаданных нет"), "{status}");
+
+        let other = dir.path().join("note.txt");
+        std::fs::write(&other, b"hello").unwrap();
+        let (status, ok) = describe_metadata(&other, true, false);
+        assert_eq!(ok, Some(false));
+        assert!(status.contains("Формат не распознан"), "{status}");
+    }
+
+    #[test]
+    fn example_name_falls_back_to_the_sample_file() {
+        let app = PumperApp {
+            tab: Tab::Pump,
+            method: Method::OfficePdf,
+            names: NameMode::Plain,
+            ..PumperApp::default()
+        };
+        assert_eq!(app.example_name(), "photo.png");
+    }
 }

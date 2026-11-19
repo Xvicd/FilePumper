@@ -1,4 +1,4 @@
-FilePumper 0.5.7 — готовые сборки
+FilePumper 0.5.8 — готовые сборки
 ===========================================
 
 windows\
@@ -29,6 +29,8 @@ windows\
     FilePumper-cli.exe extract <носитель>... [--out-dir ПАПКА] [--password ПАРОЛЬ]
     FilePumper-cli.exe inspect <носитель>... [--json]
     FilePumper-cli.exe verify <носитель>... [--json]
+    FilePumper-cli.exe clean <файл>... [--out-dir ПАПКА] [--output ФАЙЛ]
+                        [--suffix _clean] [--profiles] [--dry-run] [--json]
 
   Для скриптов: --quiet (без прогресса и служебного текста), --no-progress,
   --json (машинный вывод), --password-file ФАЙЛ, --password-stdin и --jobs 0
@@ -72,6 +74,12 @@ windows\
   Нагрузка: повторный --payload упаковывает несколько файлов в ZIP-бандл внутри
   носителя. extract распаковывает бандл по файлам, inspect показывает оглавление,
   verify перечитывает носитель и проверяет SHA-256 без записи на диск.
+
+  Метаданные: clean убирает автора, даты, программы и комментарии из PNG, JPEG,
+  GIF, WebP, SVG, docx/xlsx/pptx и PDF. Пиксели и текст документа не меняются,
+  рядом появляется копия с суффиксом _clean (--suffix меняет суффикс, --profiles
+  добавляет ICC-профили и превью документов). --dry-run показывает, что найдено.
+  Пример: .\FilePumper-cli.exe clean .\photo.jpg .\report.docx --out-dir .\clean
 
   Группы файлов: embed --pair раскладывает нагрузки по носителям по порядку
   (--pair-password ПАРОЛЬ задаёт пароль пары, флаг можно повторять). inspect с

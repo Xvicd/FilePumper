@@ -831,6 +831,32 @@ pub fn output_path(
     Ok(unique_path(&candidate))
 }
 
+/// Путь копии без метаданных: рядом с исходником или в `out_dir`.
+///
+/// Суффикс отделяет результат от исходника (`photo_clean.jpg`), а совпадение
+/// имён с уже существующими файлами разводится счётчиком.
+pub fn cleaned_path(input: &Path, out_dir: Option<&Path>, suffix: &str) -> Result<PathBuf, String> {
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("file");
+    let name = match input.extension().and_then(|value| value.to_str()) {
+        Some(extension) if !extension.is_empty() => format!("{stem}{suffix}.{extension}"),
+        _ => format!("{stem}{suffix}"),
+    };
+    let candidate = match out_dir {
+        Some(directory) => {
+            fs::create_dir_all(directory).map_err(|err| {
+                format!("Не удалось создать папку {}: {err}", directory.display())
+            })?;
+            directory.join(name)
+        }
+        None => input.with_file_name(name),
+    };
+    Ok(crate::util::unique_path(&candidate))
+}
+
 /// Обрабатывает один файл пакета и возвращает размер результата.
 pub fn pump_one(
     item: &BatchItem,

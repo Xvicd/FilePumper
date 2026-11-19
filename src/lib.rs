@@ -4,6 +4,7 @@
 pub mod app;
 pub mod batch;
 pub mod cli;
+pub mod metadata;
 pub mod payload;
 pub mod pumper;
 pub mod report;

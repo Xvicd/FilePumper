@@ -389,11 +389,31 @@ pub fn sanitize_file_name(name: &str) -> String {
 }
 
 /// Открывает проводник с выделением файла (на других платформах — каталог).
+///
+/// Проводник разбирает командную строку сам, поэтому `/select` и путь должны
+/// быть одной строкой, а путь — в кавычках. Без кавычек путь с пробелами
+/// (`C:\Users\me\Documents\gitub cloned\reports\file.docx`) обрезается, и
+/// вместо нужной папки открываются «Документы». Каталог открывается как
+/// каталог, файл — как выделенный элемент в своей папке; если файла уже нет,
+/// открывается его папка.
 pub fn reveal_in_explorer(path: &Path) {
     #[cfg(target_os = "windows")]
     {
-        let argument = format!("/select,{}", path.display());
-        let _ = std::process::Command::new("explorer").arg(argument).spawn();
+        use std::os::windows::process::CommandExt;
+
+        let Some((target, select)) = explorer_target(path) else {
+            return;
+        };
+        let quoted = format!("\"{}\"", target.display());
+        let mut command = std::process::Command::new("explorer");
+        // `raw_arg` передаёт строку байт-в-байт: обычный `arg` добавил бы свои
+        // кавычки и сломал разбор `/select,` в проводнике.
+        if select {
+            command.raw_arg(format!("/select,{quoted}"));
+        } else {
+            command.raw_arg(quoted);
+        }
+        let _ = command.spawn();
     }
     #[cfg(target_os = "macos")]
     {
@@ -409,6 +429,23 @@ pub fn reveal_in_explorer(path: &Path) {
             .arg(directory)
             .spawn();
     }
+}
+
+/// Что открывать проводником на Windows: путь и нужно ли выделять его в папке.
+///
+/// Файл выделяется в своей папке, каталог просто открывается, а для уже
+/// удалённого файла открывается его папка.
+#[cfg(any(target_os = "windows", test))]
+fn explorer_target(path: &Path) -> Option<(PathBuf, bool)> {
+    if path.is_dir() {
+        return Some((path.to_path_buf(), false));
+    }
+    if path.is_file() {
+        return Some((path.to_path_buf(), true));
+    }
+    path.parent()
+        .filter(|parent| parent.is_dir())
+        .map(|parent| (parent.to_path_buf(), false))
 }
 
 #[cfg(test)]
@@ -480,6 +517,26 @@ mod tests {
         assert!(job.check().is_ok());
         token.cancel();
         assert_eq!(job.check().unwrap_err(), CANCELLED_MESSAGE);
+    }
+
+    #[test]
+    fn explorer_reveals_files_and_opens_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ЧМИ_ПР7 Итог.docx");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(explorer_target(&file), Some((file.clone(), true)));
+        assert_eq!(
+            explorer_target(dir.path()),
+            Some((dir.path().to_path_buf(), false))
+        );
+        // Файла уже нет — открываем его папку, а не пустоту.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            explorer_target(&file),
+            Some((dir.path().to_path_buf(), false))
+        );
+        assert_eq!(explorer_target(Path::new("")), None);
     }
 
     #[test]
