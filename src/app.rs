@@ -180,6 +180,8 @@ struct Settings {
     names: usize,
     random_style: usize,
     random_length: usize,
+    /// Верхняя граница случайной длины имени; 0 — длина фиксированная.
+    random_length_max: usize,
     random_alphabet: String,
     tab: usize,
     gen_kinds: Vec<usize>,
@@ -187,6 +189,9 @@ struct Settings {
     gen_base: String,
     gen_count: usize,
     gen_attach: bool,
+    /// Размер видимой «шумовой» картинки в сгенерированных файлах.
+    image_width: u32,
+    image_height: u32,
     clean_text: bool,
     clean_profiles: bool,
 }
@@ -218,6 +223,7 @@ impl Default for Settings {
             names: 0,
             random_style: 0,
             random_length: batch::DEFAULT_RANDOM_LENGTH,
+            random_length_max: 0,
             random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
             tab: 0,
             gen_kinds: vec![generated_kind_index(GeneratedKind::default())],
@@ -225,6 +231,8 @@ impl Default for Settings {
             gen_base: "file".to_owned(),
             gen_count: 1,
             gen_attach: false,
+            image_width: crate::pumper::generate::ImageSize::default().width,
+            image_height: crate::pumper::generate::ImageSize::default().height,
             clean_text: true,
             clean_profiles: false,
         }
@@ -293,6 +301,8 @@ pub struct PumperApp {
     names: NameMode,
     random_style: RandomStyle,
     random_length: usize,
+    /// Верхняя граница случайной длины имени; 0 — длина фиксированная.
+    random_length_max: usize,
     random_alphabet: String,
     /// Зерно образца имени: пока его не меняют, пример в окне стоит на месте.
     example_seed: u64,
@@ -304,6 +314,9 @@ pub struct PumperApp {
     gen_count: usize,
     /// Поле ручного ввода количества файлов: число берётся отсюда.
     gen_count_text: String,
+    /// Размер видимой «шумовой» картинки в сгенерированных файлах.
+    image_width: u32,
+    image_height: u32,
     gen_attach: bool,
     preview: Option<Preview>,
     /// Пары «носитель ← нагрузка» для группового встраивания.
@@ -355,6 +368,7 @@ impl Default for PumperApp {
             names: NameMode::Size,
             random_style: RandomStyle::default(),
             random_length: batch::DEFAULT_RANDOM_LENGTH,
+            random_length_max: 0,
             random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
             example_seed: batch::DEFAULT_SAMPLE_SEED,
             gen_kinds: vec![GeneratedKind::default()],
@@ -362,6 +376,8 @@ impl Default for PumperApp {
             gen_base: "file".to_owned(),
             gen_count: 1,
             gen_count_text: "1".to_owned(),
+            image_width: crate::pumper::generate::ImageSize::default().width,
+            image_height: crate::pumper::generate::ImageSize::default().height,
             gen_attach: false,
             preview: None,
             pairs: Vec::new(),
@@ -425,6 +441,7 @@ impl PumperApp {
                 .position(|style| *style == self.random_style)
                 .unwrap_or(0),
             random_length: self.random_length,
+            random_length_max: self.random_length_max,
             random_alphabet: self.random_alphabet.clone(),
             tab: self.tab.index(),
             gen_kinds: self
@@ -439,6 +456,8 @@ impl PumperApp {
             gen_base: self.gen_base.clone(),
             gen_count: self.gen_count,
             gen_attach: self.gen_attach,
+            image_width: self.image_width,
+            image_height: self.image_height,
             clean_text: self.clean_text,
             clean_profiles: self.clean_profiles,
         }
@@ -478,6 +497,13 @@ impl PumperApp {
             *batch::RANDOM_LENGTH_RANGE.start(),
             *batch::RANDOM_LENGTH_RANGE.end(),
         );
+        self.random_length_max = if settings.random_length_max > self.random_length {
+            settings
+                .random_length_max
+                .clamp(self.random_length + 1, *batch::RANDOM_LENGTH_RANGE.end())
+        } else {
+            0
+        };
         if !settings.random_alphabet.trim().is_empty() {
             self.random_alphabet = settings.random_alphabet;
         }
@@ -507,6 +533,13 @@ impl PumperApp {
         self.gen_count = settings.gen_count.clamp(1, batch::MAX_GENERATED_FILES);
         self.gen_count_text = self.gen_count.to_string();
         self.gen_attach = settings.gen_attach;
+        let image = crate::pumper::generate::ImageSize {
+            width: settings.image_width,
+            height: settings.image_height,
+        }
+        .sanitized();
+        self.image_width = image.width;
+        self.image_height = image.height;
     }
 
     /// Сохранить текущие настройки как профиль (или обновить выбранный).
@@ -636,6 +669,8 @@ impl PumperApp {
         RandomNames {
             style: self.random_style,
             length: self.random_length,
+            length_max: (self.random_length_max > self.random_length)
+                .then_some(self.random_length_max),
             alphabet: self.random_alphabet.clone(),
         }
         .sanitized()
@@ -1015,6 +1050,10 @@ impl PumperApp {
             jitter,
             kinds,
             mix: self.gen_mix,
+            image: crate::pumper::generate::ImageSize {
+                width: self.image_width,
+                height: self.image_height,
+            },
         };
         let items = match batch::plan_generate(
             &self.gen_base,
@@ -2667,18 +2706,53 @@ impl PumperApp {
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Длина:");
-                ui.add_enabled(
-                    !self.busy,
-                    egui::DragValue::new(&mut self.random_length)
-                        .range(batch::RANDOM_LENGTH_RANGE)
-                        .suffix(" симв."),
-                );
+                let mut random_length = self.random_length_max > self.random_length;
+                if ui
+                    .add_enabled(!self.busy, egui::Checkbox::new(&mut random_length, "случайная"))
+                    .on_hover_text("У каждого имени своя длина: например от 5 до 12 символов")
+                    .changed()
+                {
+                    self.random_length_max = if random_length {
+                        (self.random_length + 6)
+                            .min(*batch::RANDOM_LENGTH_RANGE.end())
+                    } else {
+                        0
+                    };
+                }
+                if random_length {
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.random_length)
+                            .range(batch::RANDOM_LENGTH_RANGE)
+                            .prefix("от ")
+                            .suffix(" симв."),
+                    );
+                    let min = self.random_length;
+                    if self.random_length_max <= min {
+                        self.random_length_max =
+                            (min + 1).min(*batch::RANDOM_LENGTH_RANGE.end());
+                    }
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.random_length_max)
+                            .range((min + 1)..=*batch::RANDOM_LENGTH_RANGE.end())
+                            .prefix("до ")
+                            .suffix(" симв."),
+                    );
+                } else {
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.random_length)
+                            .range(batch::RANDOM_LENGTH_RANGE)
+                            .suffix(" симв."),
+                    );
+                }
                 ui.label("Символы:");
                 ui.add_enabled(
                     !self.busy,
                     egui::TextEdit::singleline(&mut self.random_alphabet)
                         .hint_text(batch::DEFAULT_ALPHABET)
-                        .desired_width(240.0),
+                        .desired_width(200.0),
                 )
                 .on_hover_text("Из этих символов собирается имя: k7fq2mzp");
             });
@@ -3024,7 +3098,47 @@ impl PumperApp {
             if self.gen_kinds.is_empty() {
                 ui.colored_label(ERROR_COLOR, "Отметьте хотя бы один тип файла.");
             } else if self.gen_kinds.iter().any(|kind| kind.is_image()) {
-                ui.weak("Картинки остаются рабочими: объём лежит внутри структуры файла.");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Картинка:");
+                    let size = crate::pumper::generate::ImageSize {
+                        width: self.image_width,
+                        height: self.image_height,
+                    };
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.image_width)
+                            .range(crate::pumper::generate::ImageSize::SIDE_RANGE)
+                            .speed(1.0),
+                    )
+                    .on_hover_text("Ширина видимой «шумовой» картинки в пикселях");
+                    ui.label("×");
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.image_height)
+                            .range(crate::pumper::generate::ImageSize::SIDE_RANGE)
+                            .speed(1.0),
+                    )
+                    .on_hover_text("Высота видимой «шумовой» картинки в пикселях");
+                    ui.label("px");
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("512×512").small())
+                        .on_hover_text("Шумовая картинка 512×512 — как обычное фото")
+                        .clicked()
+                    {
+                        self.image_width = 512;
+                        self.image_height = 512;
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("16×16").small())
+                        .on_hover_text("Служебная картинка по умолчанию: файл меньше")
+                        .clicked()
+                    {
+                        self.image_width = 16;
+                        self.image_height = 16;
+                    }
+                    ui.weak(format!("сейчас {}", size.label()));
+                });
+                ui.weak("Картинки остаются рабочими: объём лежит внутри структуры файла, а шум занимает всю видимую площадь.");
             } else {
                 ui.weak("Случайные байты без формата: файл не откроется программой.");
             }

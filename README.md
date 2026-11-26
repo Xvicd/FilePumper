@@ -45,6 +45,8 @@
 - **Файлы «с нуля»** — `generate --size 10 --type png` создаёт файл нужного размера
   без исходника: внутри криптослучайные байты, поэтому `zip`, `gzip` и `7z` его не
   сожмут, а картинка остаётся валидной (`--type bin|png|gif|jpg|webp`, `--count N`).
+  `--image-size 512x512` делает видимую часть настоящей шумовой картинкой, а не
+  заглушкой 16×16.
   Туда же можно прицепить нагрузку — файл не вырастет ни на байт.
 - **Удаление метаданных** — отдельная вкладка «Убрать метаданные» и команда
   `clean`: из готовых файлов убираются автор, даты, программы, комментарии и
@@ -172,8 +174,8 @@ chmod +x linux/file-pumper linux/file-pumper-cli
 
 | Команда | Назначение |
 | --- | --- |
-| `pump <вход>... --size <МБ[,МБ]> [--size-mode exact\|at-least\|add] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--names size\|plain\|random] [--random-style words\|chars] [--random-length N] [--random-alphabet НАБОР] [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--format gif\|png\|webp] [--from-dir ПАПКА [--recursive] [--ext ...]] [--from-file СПИСОК] [--skip-unsupported] [--jobs N] [--dry-run] [--verify] [--report ФАЙЛ]` | накачать один или несколько файлов до размера |
-| `generate [--size <МБ[,МБ]>] [--type bin\|png\|gif\|jpg\|webp[,ТИП...]] [--mix even\|random] [--name ОСНОВА] [--count N] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--payload <файл> [--payload ...]] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--names size\|plain\|random] [--random-style words\|chars] [--random-length N] [--random-alphabet НАБОР] [--out-dir ПАПКА] [--dry-run] [--verify] [--report ФАЙЛ]` | создать файл нужного размера без исходника (алиас `make`); `--type png,gif` — сразу несколько типов |
+| `pump <вход>... --size <МБ[,МБ]> [--size-mode exact\|at-least\|add] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--names size\|plain\|random] [--random-style words\|chars] [--random-length N|N-M|random] [--random-alphabet НАБОР] [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--format gif\|png\|webp] [--from-dir ПАПКА [--recursive] [--ext ...]] [--from-file СПИСОК] [--skip-unsupported] [--jobs N] [--dry-run] [--verify] [--report ФАЙЛ]` | накачать один или несколько файлов до размера |
+| `generate [--size <МБ[,МБ]>] [--type bin\|png\|gif\|jpg\|webp[,ТИП...]] [--mix even\|random] [--name ОСНОВА] [--count N] [--image-size WxH] [--vary <МБ> [--vary-mode plus\|minus\|both]] [--payload <файл> [--payload ...]] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--names size\|plain\|random] [--random-style words\|chars] [--random-length N|N-M|random] [--random-alphabet НАБОР] [--out-dir ПАПКА] [--dry-run] [--verify] [--report ФАЙЛ]` | создать файл нужного размера без исходника (алиас `make`); `--type png,gif` — сразу несколько типов |
 | `embed <носитель>... --payload <файл> [--payload ...] [--out-dir ПАПКА] [--output ФАЙЛ] [--copies 1..3] [--compress] [--password ПАРОЛЬ] [--pair [--pair-password ПАРОЛЬ ...]] [--names random [--random-style words\|chars]] [--dry-run] [--report ФАЙЛ]` | спрятать файл (или несколько) в одном либо нескольких носителях; `--pair` — по паре на носитель |
 | `extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ] [--password ПАРОЛЬ]` | извлечь спрятанное (бандл распаковывается в папку; обычные файлы в пакете — не ошибка) |
 | `inspect <носитель>... [--password ПАРОЛЬ]` | показать, что лежит внутри каждого файла, с итогом «что можно извлечь» |
@@ -227,6 +229,12 @@ file-pumper-cli generate --size 0.2 --type png,gif --count 2 --out-dir .\made
 
 # шесть файлов по 10 МБ, тип каждого выбирается случайно из bin, png, gif
 file-pumper-cli generate --size 10 --type bin,png,gif --count 6 --mix random --out-dir .\made
+
+# шумовая картинка 512×512, а объём файла — ровно 25 МБ
+file-pumper-cli generate --size 25 --type png --image-size 512x512 --out-dir .\made
+
+# случайная длина имени: у каждого файла своя, от 5 до 12 символов
+file-pumper-cli generate --size 1 --count 20 --names random --random-style chars --random-length 5-12 --out-dir .\made
 
 # создать файл и сразу спрятать в него нагрузку: размер останется ровно 10 МБ
 file-pumper-cli generate --size 10 --type gif --payload .\secret.zip --password пароль --out-dir .\made
@@ -292,11 +300,20 @@ file-pumper-cli extract .\photos\*.png .\docs\note.pdf --out-dir .\restored --pa
 не трогают оригинал: занятое имя получает суффикс (`photo-2.png`).
 
 Вид случайного имени задают три флага: `--random-style words|chars` — слова
-(`green-apple-4821`) или набор символов (`k7fq2mzp`), `--random-length N` — длина
-набора (3…48, по умолчанию 10) и `--random-alphabet НАБОР` — из каких символов
-собирать имя (по умолчанию `a-z0-9`; годятся латиница, цифры, `-` и `_`, остальное
-отбрасывается). В окне это переключатель «Вид случайного имени», поле «Длина»,
-поле «Символы» и готовые наборы рядом с ним. Короткие имена иногда совпадают —
+(`green-apple-4821`) или набор символов (`k7fq2mzp`), `--random-length` — длина
+набора и `--random-alphabet НАБОР` — из каких символов собирать имя (по
+умолчанию `a-z0-9`; годятся латиница, цифры, `-` и `_`, остальное
+отбрасывается).
+
+- `--random-length 10` — фиксированная длина (3…48, по умолчанию 10);
+- `--random-length 5-12` — случайная длина у каждого имени в этих границах;
+- `--random-length random` — то же, но границы по умолчанию: 4…16.
+
+В словаре имён есть и короткие, и длинные слова (`ivy`, `oak`, `wisp` и
+`cobblestone`, `constellation`, `breathtaking`), поэтому `words` тоже даёт
+имена разной длины. В окне это переключатель «Вид случайного имени», галочка
+«случайная» рядом с полем «Длина» (появляются поля «от» и «до»), поле
+«Символы» и готовые наборы рядом с ним. Короткие имена иногда совпадают —
 тогда файл получает суффикс `-2`, `-3`, как и любой другой результат.
 
 `--vary` делает размер не фиксированным, а случайным в заданных пределах:
@@ -326,6 +343,13 @@ file-pumper-cli extract .\photos\*.png .\docs\note.pdf --out-dir .\restored --pa
   `--type png,gif --count 2` даёт две PNG и две GIF на каждый размер из `--size`;
 - `random` — всего `--count` файлов на каждый размер, тип каждого выбирается
   случайно из отмеченных: `--type bin,png,gif --count 6 --mix random`.
+
+`--image-size 512x512` задаёт размер видимой «шумовой» картинки у `png`, `gif`,
+`jpg` и `webp`: по умолчанию служебная картинка 16×16, а с `--image-size`
+файл выглядит как настоящая шумовая фотография нужного разрешения (`512x512`,
+`1024x768` или одно число — квадрат). Объём при этом всё равно ровно целевой:
+остальное лежит внутри структуры файла. В окне это поля «Картинка: Ш × В px» с
+кнопками `512×512` и `16×16`.
 
 `--name` задаёт основу имени, а `--count N` — число файлов (при `even` на каждый
 размер и тип, `--size 5,10 --count 2 --type png,gif` — восемь файлов). Число

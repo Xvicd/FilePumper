@@ -430,7 +430,14 @@ mod tests {
             GeneratedKind::Webp,
         ] {
             let path = dir.path().join(format!("made.{}", kind.extension()));
-            generate::run(kind, &path, 64 * 1024, &Job::quiet()).unwrap();
+            generate::run(
+                kind,
+                &path,
+                64 * 1024,
+                generate::ImageSize::default(),
+                &Job::quiet(),
+            )
+            .unwrap();
             let report = scan(&path, CleanOptions::everything()).unwrap();
             if kind == GeneratedKind::Gif {
                 assert_eq!(report.removed.len(), 1, "{:?}", report.removed);

@@ -1,4 +1,4 @@
-FilePumper 0.5.9 — готовые сборки
+FilePumper 0.6.0 — готовые сборки
 ===========================================
 
 windows\
@@ -12,13 +12,13 @@ windows\
                         [--size-mode exact|at-least|add]
                         [--vary <МБ> [--vary-mode plus|minus|both]]
                         [--names size|plain|random] [--random-style words|chars]
-                        [--random-length N] [--random-alphabet НАБОР]
+                        [--random-length N|N-M|random] [--random-alphabet НАБОР]
                         [--out-dir ПАПКА] [--output ФАЙЛ] [--method ...] [--jobs N]
                         [--dry-run] [--report отчёт.csv|.json] [--skip-unsupported]
     FilePumper-cli.exe pump --from-dir ПАПКА [--recursive] [--ext png,jpg] --size 10
     FilePumper-cli.exe pump --from-file список.txt --size 10
     FilePumper-cli.exe generate --size 10 --type png[,gif,...] [--mix even|random]
-                        [--count N] [--name ОСНОВА]
+                        [--count N] [--image-size WxH] [--name ОСНОВА]
                         [--vary <МБ> [--vary-mode plus|minus|both]]
                         [--names size|plain|random] [--random-style words|chars]
                         [--payload <файл> ...] [--out-dir ПАПКА]
@@ -48,7 +48,10 @@ windows\
   внутри криптослучайные байты, поэтому zip/gzip/7z его не сожмут. Тип задаётся
   --type bin|png|gif|jpg|webp: картиночные типы остаются открывающимися файлами.
   Типов может быть несколько: --type png,gif,bin (список через запятую, all — все
-  пять). Число файлов задаёт --count (от 1 до 10000) или поле в окне. Как разложить типы, решает --mix: even (по умолчанию) — по --count файлов
+  пять). Число файлов задаёт --count (от 1 до 10000) или поле в окне.
+  Размер видимой картинки задаёт --image-size 512x512 (по умолчанию 16x16):
+  файл выглядит как шумовое фото нужного разрешения.
+  Как разложить типы, решает --mix: even (по умолчанию) — по --count файлов
   каждого типа, random — всего --count файлов со случайным типом.
   С --payload внутрь прячется нагрузка, но размер остаётся ровно целевым.
   Пример: .\FilePumper-cli.exe generate --size 5,10 --count 2 --type png --out-dir .\big
@@ -60,7 +63,8 @@ windows\
   через «_»: photo_12_3MB.png (точка выглядела бы началом расширения).
   Занятое имя получает суффикс -2, -3, …
   Вид случайного имени: --random-style words|chars (слова или набор символов),
-  --random-length N (3…48, по умолчанию 10) и --random-alphabet НАБОР (например
+  --random-length N|N-M|random (3…48; «5-12» — своя длина у каждого имени,
+  random — 4…16) и --random-alphabet НАБОР (например
   0123456789abcdef; годятся латиница, цифры, «-» и «_»). Пример:
   .\FilePumper-cli.exe pump .\photos\* --size 5 --names random --random-style chars --random-length 8
 

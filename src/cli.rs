@@ -102,8 +102,12 @@ FilePumper
                  (quiet-river-4821.png или набор символов)
   --random-style вид случайного имени: words — два слова и число
                  (green-apple-4821, по умолчанию), chars — символы из алфавита
-  --random-length  сколько символов в случайном имени при --random-style chars
-                 (10 по умолчанию, допустимо 3..48)
+  --random-length  длина имени при --random-style chars: число (10 по
+                 умолчанию, от 3 до 48), диапазон «5-12» — у каждого имени своя
+                 длина, random — случайная длина 4..16
+  --image-size   размер видимой «шумовой» картинки у png/gif/jpg/webp:
+                 «512x512», «1024x768» или одно число (квадрат). По умолчанию
+                 16x16 — файл выглядит как маленькая шумовая картинка
   --random-alphabet  из каких символов собирать имя (по умолчанию a-z0-9);
                  лишние символы отбрасываются: годятся латиница, цифры, - и _
   --from-dir     добавить все файлы папки, --recursive — вместе с подпапками
@@ -122,7 +126,9 @@ FilePumper
                                    [--vary <МБ> [--vary-mode plus|minus|both]]
                                    [--name ОСНОВА] [--names size|plain|random]
                                    [--random-style words|chars]
-                                   [--random-length N] [--random-alphabet НАБОР]
+                                   [--random-length N|N-M|random]
+                                   [--random-alphabet НАБОР]
+                                   [--image-size 512x512]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--payload ФАЙЛ ...] [--copies 1..3]
                                    [--compress] [--password ПАРОЛЬ]
@@ -236,6 +242,8 @@ struct Flags {
     names: NameMode,
     /// Настройки случайных имён: работают вместе с `--names random`.
     random: RandomNames,
+    /// Размер видимой «шумовой» картинки у созданных типов-картинок.
+    image_size: crate::pumper::generate::ImageSize,
     method: Method,
     format: AnimationFormat,
     copies: usize,
@@ -343,6 +351,7 @@ impl Flags {
             vary_mode: JitterMode::Both,
             names: NameMode::Size,
             random: RandomNames::default(),
+            image_size: crate::pumper::generate::ImageSize::default(),
             method: Method::Animation,
             format: AnimationFormat::Gif,
             copies: 1,
@@ -411,19 +420,9 @@ impl Flags {
                 }
                 "--random-length" | "--random-len" => {
                     let raw = next("--random-length", &mut iterator)?;
-                    let length = raw
-                        .trim()
-                        .parse::<usize>()
-                        .map_err(|_| format!("Неверная длина случайного имени: {raw}"))?;
-                    let range = batch::RANDOM_LENGTH_RANGE;
-                    if !range.contains(&length) {
-                        return Err(format!(
-                            "Длина случайного имени — от {} до {} символов.",
-                            range.start(),
-                            range.end()
-                        ));
-                    }
+                    let (length, max) = batch::parse_random_length(&raw)?;
                     flags.random.length = length;
+                    flags.random.length_max = max;
                 }
                 "--random-alphabet" | "--random-chars" => {
                     let raw = next("--random-alphabet", &mut iterator)?;
@@ -434,6 +433,10 @@ impl Flags {
                         ));
                     }
                     flags.random.alphabet = alphabet;
+                }
+                "--image-size" | "--image" => {
+                    let raw = next("--image-size", &mut iterator)?;
+                    flags.image_size = crate::pumper::generate::ImageSize::parse(&raw)?;
                 }
                 "--copies" => {
                     let raw = next("--copies", &mut iterator)?;
@@ -1117,6 +1120,7 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
         jitter,
         kinds: kinds.clone(),
         mix: flags.mix,
+        image: flags.image_size,
     };
     let mut items = batch::plan_generate(
         &flags.base_name,
@@ -2171,7 +2175,7 @@ fn command_clean(flags: &Flags) -> Result<(), String> {
 fn completion_script(shell: &str) -> Result<&'static str, String> {
     let script = match shell.trim().to_ascii_lowercase().as_str() {
         "bash" => {
-            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
+            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
 "#
         }
         "zsh" => {
@@ -2193,7 +2197,7 @@ complete -c file-pumper-cli -l password-file -r -d "Пароль из файла
     param($wordToComplete, $commandAst, $cursorPosition)
     $items = 'pump','generate','make','embed','extract','inspect','verify','clean','completions',
         '--help','--version','--size','--size-mode','--vary','--vary-mode','--names',
-        '--random-style','--random-length','--random-alphabet','--method','--format',
+        '--random-style','--random-length','--random-alphabet','--image-size','--method','--format',
         '--from-dir','--from-file','--recursive','--ext','--skip-unsupported','--jobs',
         '--dry-run','--verify','--report','--out-dir','--output','--payload','--pair',
         '--pair-by','--pair-password','--copies','--compress','--password',

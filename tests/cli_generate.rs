@@ -574,3 +574,91 @@ fn webp_with_payload_stays_a_working_image() {
         b"payload inside generated webp\n"
     );
 }
+#[test]
+fn random_length_range_and_custom_image_size_work() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Случайная длина имени: у каждого файла своя, в заданных границах.
+    let names_dir = dir.path().join("names");
+    let code = cli(&[
+        "generate",
+        "--size",
+        "0.02",
+        "--type",
+        "bin",
+        "--count",
+        "12",
+        "--names",
+        "random",
+        "--random-style",
+        "chars",
+        "--random-length",
+        "5-12",
+        "--out-dir",
+        path_str(&names_dir),
+        "--no-progress",
+    ]);
+    assert_eq!(code, 0);
+    let lengths: Vec<usize> = fs::read_dir(&names_dir)
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap()
+                .chars()
+                .count()
+        })
+        .collect();
+    assert_eq!(lengths.len(), 12);
+    assert!(
+        lengths.iter().all(|length| (5..=12).contains(length)),
+        "{lengths:?}"
+    );
+    let distinct: std::collections::HashSet<usize> = lengths.iter().copied().collect();
+    assert!(distinct.len() > 1, "длины не меняются: {lengths:?}");
+
+    // Своя «шумовая» картинка: видно 512×512, размер файла — ровно цель.
+    let images_dir = dir.path().join("images");
+    let target = 2 * MIB;
+    let code = cli(&[
+        "generate",
+        "--size",
+        "2",
+        "--type",
+        "png",
+        "--image-size",
+        "512x512",
+        "--out-dir",
+        path_str(&images_dir),
+        "--no-progress",
+    ]);
+    assert_eq!(code, 0);
+    let made = fs::read_dir(&images_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::metadata(&made).unwrap().len(), target);
+    let picture = image::open(&made).unwrap();
+    assert_eq!((picture.width(), picture.height()), (512, 512));
+
+    // Неверный размер картинки — понятная ошибка и код 1.
+    let bad_dir = dir.path().join("bad");
+    let code = cli(&[
+        "generate",
+        "--size",
+        "1",
+        "--type",
+        "png",
+        "--image-size",
+        "10000x100",
+        "--out-dir",
+        path_str(&bad_dir),
+        "--no-progress",
+    ]);
+    assert_eq!(code, 1);
+}

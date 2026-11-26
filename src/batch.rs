@@ -333,6 +333,8 @@ pub const DEFAULT_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
 pub const DEFAULT_RANDOM_LENGTH: usize = 10;
 /// Допустимая длина имени из символов: короче — будут совпадения, длиннее — неудобно.
 pub const RANDOM_LENGTH_RANGE: std::ops::RangeInclusive<usize> = 3..=48;
+/// Какая длина считается «случайной» по умолчанию: `--random-length random`.
+pub const DEFAULT_RANDOM_LENGTH_RANGE: std::ops::RangeInclusive<usize> = 4..=16;
 /// Зерно образца по умолчанию: пример в окне не меняется, пока не нажали «другой».
 pub const DEFAULT_SAMPLE_SEED: u64 = 0x5EED_0523;
 /// Верхняя граница числа файлов за один запуск: защищает от случайного
@@ -344,7 +346,11 @@ pub const MAX_GENERATED_FILES: usize = 10_000;
 pub struct RandomNames {
     pub style: RandomStyle,
     /// Сколько символов в основе (для [`RandomStyle::Words`] не используется).
+    /// Если включена случайная длина, это нижняя граница.
     pub length: usize,
+    /// Верхняя граница случайной длины: `None` — длина всегда равна `length`,
+    /// `Some(max)` — у каждого имени своя длина в `length..=max`.
+    pub length_max: Option<usize>,
     /// Из каких символов выбирать; лишние отбрасываются при генерации.
     pub alphabet: String,
 }
@@ -354,6 +360,7 @@ impl Default for RandomNames {
         Self {
             style: RandomStyle::default(),
             length: DEFAULT_RANDOM_LENGTH,
+            length_max: None,
             alphabet: DEFAULT_ALPHABET.to_owned(),
         }
     }
@@ -364,11 +371,17 @@ impl RandomNames {
     /// [`RANDOM_LENGTH_RANGE`], алфавит — без символов, недопустимых в имени файла.
     pub fn sanitized(&self) -> Self {
         let alphabet = sanitize_alphabet(&self.alphabet);
+        let length = self
+            .length
+            .clamp(*RANDOM_LENGTH_RANGE.start(), *RANDOM_LENGTH_RANGE.end());
+        let length_max = self
+            .length_max
+            .map(|max| max.clamp(length, *RANDOM_LENGTH_RANGE.end()))
+            .filter(|max| *max > length);
         Self {
             style: self.style,
-            length: self
-                .length
-                .clamp(*RANDOM_LENGTH_RANGE.start(), *RANDOM_LENGTH_RANGE.end()),
+            length,
+            length_max,
             alphabet: if alphabet.is_empty() {
                 DEFAULT_ALPHABET.to_owned()
             } else {
@@ -383,12 +396,21 @@ impl RandomNames {
         let clean = self.sanitized();
         match clean.style {
             RandomStyle::Words => RandomStyle::Words.label().to_owned(),
-            RandomStyle::Chars => format!(
-                "{}: {} из «{}»",
-                RandomStyle::Chars.label(),
-                clean.length,
-                clean.alphabet
-            ),
+            RandomStyle::Chars => match clean.length_max {
+                Some(max) => format!(
+                    "{}: {}–{} из «{}»",
+                    RandomStyle::Chars.label(),
+                    clean.length,
+                    max,
+                    clean.alphabet
+                ),
+                None => format!(
+                    "{}: {} из «{}»",
+                    RandomStyle::Chars.label(),
+                    clean.length,
+                    clean.alphabet
+                ),
+            },
         }
     }
 
@@ -409,7 +431,11 @@ impl RandomNames {
             }
             RandomStyle::Chars => {
                 let symbols: Vec<char> = clean.alphabet.chars().collect();
-                (0..clean.length)
+                let length = match clean.length_max {
+                    Some(max) if max > clean.length => rng.gen_range(clean.length..=max),
+                    _ => clean.length,
+                };
+                (0..length)
                     .map(|_| symbols[rng.gen_range(0..symbols.len())])
                     .collect()
             }
@@ -442,6 +468,50 @@ pub fn sanitize_alphabet(value: &str) -> String {
         }
     }
     clean
+}
+
+/// Разбирает длину случайного имени: `10` — фиксированная, `5-12` — случайная
+/// в диапазоне, `random` (или «случайная») — [`DEFAULT_RANDOM_LENGTH_RANGE`].
+///
+/// Возвращает нижнюю границу и верхнюю (`None` — длина фиксированная).
+pub fn parse_random_length(value: &str) -> Result<(usize, Option<usize>), String> {
+    let text = value.trim().to_ascii_lowercase().replace(['–', '—'], "-");
+    if matches!(text.as_str(), "random" | "случайная" | "случайно" | "any") {
+        return Ok((
+            *DEFAULT_RANDOM_LENGTH_RANGE.start(),
+            Some(*DEFAULT_RANDOM_LENGTH_RANGE.end()),
+        ));
+    }
+    let range = RANDOM_LENGTH_RANGE;
+    let parse = |raw: &str| -> Result<usize, String> {
+        raw.trim().parse::<usize>().map_err(|_| {
+            format!("Длина случайного имени: «{raw}» — не число. Пример: 10, 5-12 или random.")
+        })
+    };
+    let check = |length: usize| -> Result<usize, String> {
+        if range.contains(&length) {
+            Ok(length)
+        } else {
+            Err(format!(
+                "Длина случайного имени — от {} до {} символов (получено {length}).",
+                range.start(),
+                range.end()
+            ))
+        }
+    };
+    match text.split_once('-') {
+        Some((min, max)) => {
+            let min = check(parse(min)?)?;
+            let max = check(parse(max)?)?;
+            if max <= min {
+                return Err(format!(
+                    "Верхняя граница случайной длины должна быть больше нижней ({min}–{max})."
+                ));
+            }
+            Ok((min, Some(max)))
+        }
+        None => Ok((check(parse(&text)?)?, None)),
+    }
 }
 
 /// Что попадёт в имя: режим [`NameMode`] вместе с настройками случайных имён.
@@ -791,19 +861,96 @@ fn compose_name(
     }
 }
 
-/// Прилагательные для случайных имён: нейтральные, короткие, латиницей —
-/// чтобы имя одинаково выглядело в любой файловой системе.
-const NAME_ADJECTIVES: [&str; 24] = [
-    "amber", "brave", "bright", "calm", "clever", "cozy", "crisp", "gentle", "golden", "happy",
-    "lucky", "merry", "misty", "quiet", "rapid", "silver", "sunny", "swift", "tidy", "velvet",
-    "vivid", "warm", "wild", "witty",
+/// Прилагательные для случайных имён: нейтральные, латиницей, разной длины
+/// (2–13 символов) — чтобы имена не выглядели однообразными.
+const NAME_ADJECTIVES: [&str; 43] = [
+    "amber",
+    "brave",
+    "bright",
+    "calm",
+    "clever",
+    "cozy",
+    "crisp",
+    "gentle",
+    "golden",
+    "happy",
+    "lucky",
+    "merry",
+    "misty",
+    "quiet",
+    "rapid",
+    "silver",
+    "sunny",
+    "swift",
+    "tidy",
+    "velvet",
+    "vivid",
+    "warm",
+    "wild",
+    "witty",
+    "shy",
+    "sly",
+    "wee",
+    "apt",
+    "hip",
+    "wry",
+    "keen",
+    "glad",
+    "bold",
+    "magnificent",
+    "whispering",
+    "mysterious",
+    "effortless",
+    "spectacular",
+    "prosperous",
+    "untroubled",
+    "breathtaking",
+    "shimmering",
+    "thoughtful",
 ];
 
-/// Существительные для случайных имён.
-const NAME_NOUNS: [&str; 24] = [
-    "apple", "bay", "birch", "breeze", "brook", "cedar", "cloud", "comet", "dawn", "delta",
-    "ember", "fern", "forest", "garden", "harbor", "hill", "island", "lagoon", "meadow", "moon",
-    "orchard", "pebble", "river", "sky",
+/// Существительные для случайных имён: тоже разной длины (2–13 символов).
+const NAME_NOUNS: [&str; 40] = [
+    "apple",
+    "bay",
+    "birch",
+    "breeze",
+    "brook",
+    "cedar",
+    "cloud",
+    "comet",
+    "dawn",
+    "delta",
+    "ember",
+    "fern",
+    "forest",
+    "garden",
+    "harbor",
+    "hill",
+    "island",
+    "lagoon",
+    "meadow",
+    "moon",
+    "orchard",
+    "pebble",
+    "river",
+    "sky",
+    "ash",
+    "elm",
+    "fig",
+    "ivy",
+    "oak",
+    "orb",
+    "constellation",
+    "waterfall",
+    "observatory",
+    "archipelago",
+    "thunderstorm",
+    "lighthouse",
+    "cobblestone",
+    "meadowlark",
+    "honeysuckle",
+    "wanderer",
 ];
 
 /// Случайная основа имени «в рамках приличия» по умолчанию: `quiet-river-4821`.
@@ -1139,12 +1286,14 @@ fn generated_path_in(
 
 /// Задание на создание файла «с нуля»: путь результата, размер, тип и
 /// (необязательно) нагрузка для второго дна.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct GenerateItem {
     pub output: PathBuf,
     pub target: u64,
     pub kind: GeneratedKind,
     pub payloads: Vec<PathBuf>,
+    /// Размер видимой «шумовой» картинки внутри файла.
+    pub image: generate::ImageSize,
 }
 
 /// Как разложить несколько выбранных типов по серии файлов.
@@ -1203,6 +1352,8 @@ pub struct GenerateTargets {
     pub kinds: Vec<GeneratedKind>,
     /// Как распределить выбранные типы между файлами.
     pub mix: MixMode,
+    /// Размер видимой «шумовой» картинки (`16×16` по умолчанию).
+    pub image: generate::ImageSize,
 }
 
 /// План генерации: каждый размер создаётся по правилам [`MixMode`], имена — по
@@ -1242,6 +1393,7 @@ pub fn plan_generate(
                 target: exact,
                 kind,
                 payloads: payloads.to_vec(),
+                image: targets.image.sanitized(),
             });
         }
     }
@@ -1281,7 +1433,7 @@ pub fn generate_one(
     job.check()?;
     create_parent_dir(&item.output)?;
     if item.payloads.is_empty() {
-        return generate::run(item.kind, &item.output, item.target, job);
+        return generate::run(item.kind, &item.output, item.target, item.image, job);
     }
 
     let copies = copies.clamp(payload::MIN_COPIES, payload::MAX_COPIES);
@@ -1289,14 +1441,22 @@ pub fn generate_one(
     let mut options = options.clone();
     options.bundle = prepared.bundle;
     let container_len = prepared.container_len(&options, copies, job)?;
-    let min_size = generate::min_size(item.kind)?;
+    let min_size = generate::min_size(item.kind, item.image)?;
     if item.target < min_size + container_len {
         return Err(too_small_message(item.kind, min_size, container_len));
     }
 
     // Служебные байты формата (заголовки чанков, сегментов, блоков) измеряем
     // на минимальном носителе: тогда готовый файл попадёт точно в цель.
-    let overhead = measure_overhead(item.kind, &prepared, &options, copies, &item.output, job)?;
+    let overhead = measure_overhead(
+        item.kind,
+        item.image,
+        &prepared,
+        &options,
+        copies,
+        &item.output,
+        job,
+    )?;
     let carrier_target = item.target - container_len - overhead;
     if carrier_target < min_size {
         return Err(too_small_message(
@@ -1310,7 +1470,7 @@ pub fn generate_one(
     let directory = parent_dir(&item.output).to_path_buf();
     let carrier = tempfile::NamedTempFile::new_in(&directory)
         .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
-    generate::run(item.kind, carrier.path(), carrier_target, job)?;
+    generate::run(item.kind, carrier.path(), carrier_target, item.image, job)?;
     payload::embed_bytes(
         carrier.path(),
         &prepared.bytes,
@@ -1339,6 +1499,7 @@ pub fn generate_one(
 /// носителе, чтобы не считать формулы для PNG, GIF, JPEG и WebP вручную.
 fn measure_overhead(
     kind: GeneratedKind,
+    image: generate::ImageSize,
     prepared: &payload::PreparedPayload,
     options: &ContainerOptions,
     copies: usize,
@@ -1346,7 +1507,7 @@ fn measure_overhead(
     job: &Job<'_>,
 ) -> Result<u64, String> {
     let directory = parent_dir(output);
-    let base = generate::base_bytes(kind)?;
+    let base = generate::base_bytes(kind, image)?;
     let carrier = tempfile::NamedTempFile::new_in(directory)
         .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
     fs::write(carrier.path(), &base).map_err(|err| err.to_string())?;
@@ -1407,6 +1568,58 @@ mod tests {
         assert_eq!(size_label(0), "0MB");
         assert_eq!(size_label(MIB / 4), "0.25MB");
         assert_eq!(size_label(MIB), "1MB");
+    }
+
+    #[test]
+    fn random_length_can_be_a_range() {
+        assert_eq!(parse_random_length("8").unwrap(), (8, None));
+        assert_eq!(parse_random_length(" 5-12 ").unwrap(), (5, Some(12)));
+        assert_eq!(parse_random_length("5–12").unwrap(), (5, Some(12)));
+        let (min, max) = parse_random_length("random").unwrap();
+        assert_eq!(min, *DEFAULT_RANDOM_LENGTH_RANGE.start());
+        assert_eq!(max, Some(*DEFAULT_RANDOM_LENGTH_RANGE.end()));
+        assert!(parse_random_length("2").is_err());
+        assert!(parse_random_length("10-5").is_err());
+        assert!(parse_random_length("abc").is_err());
+    }
+
+    #[test]
+    fn chars_stem_uses_the_whole_length_range() {
+        use rand::SeedableRng;
+        let names = RandomNames {
+            style: RandomStyle::Chars,
+            length: 5,
+            length_max: Some(9),
+            alphabet: DEFAULT_ALPHABET.to_owned(),
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let lengths: Vec<usize> = (0..300)
+            .map(|_| names.stem_with(&mut rng).chars().count())
+            .collect();
+        assert!(
+            lengths.iter().all(|length| (5..=9).contains(length)),
+            "{lengths:?}"
+        );
+        assert!(lengths.contains(&5), "{lengths:?}");
+        assert!(lengths.contains(&9), "{lengths:?}");
+    }
+
+    #[test]
+    fn word_lists_have_short_and_long_words() {
+        for (name, list) in [
+            ("прилагательные", NAME_ADJECTIVES.as_slice()),
+            ("существительные", NAME_NOUNS.as_slice()),
+        ] {
+            let short = list.iter().filter(|word| word.len() <= 3).count();
+            let long = list.iter().filter(|word| word.len() >= 9).count();
+            assert!(short >= 4, "{name}: коротких слов {short}");
+            assert!(long >= 4, "{name}: длинных слов {long}");
+        }
+        // Одно и то же имя не должно быть собран из двух одинаковых по длине
+        // «кусков» — словари для этого и расширены.
+        let lengths: std::collections::HashSet<usize> =
+            NAME_NOUNS.iter().map(|word| word.len()).collect();
+        assert!(lengths.len() >= 8, "всего {lengths:?}");
     }
 
     #[test]
@@ -1572,6 +1785,8 @@ mod tests {
             style: RandomStyle::Chars,
             length: 999,
             alphabet: "ab a/b*аб12".to_owned(),
+
+            ..Default::default()
         }
         .sanitized();
         assert_eq!(clean.length, *RANDOM_LENGTH_RANGE.end());
@@ -1582,6 +1797,8 @@ mod tests {
             style: RandomStyle::Chars,
             length: 1,
             alphabet: "абв".to_owned(),
+
+            ..Default::default()
         }
         .sanitized();
         assert_eq!(empty.length, *RANDOM_LENGTH_RANGE.start());
@@ -1595,6 +1812,8 @@ mod tests {
             style: RandomStyle::Chars,
             length: 16,
             alphabet: "ab".to_owned(),
+
+            ..Default::default()
         };
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let stem = names.stem_with(&mut rng);
@@ -1611,6 +1830,8 @@ mod tests {
             style: RandomStyle::Chars,
             length: 8,
             alphabet: "abcdef0123456789".to_owned(),
+
+            ..Default::default()
         });
         let name = result_name(
             Path::new("C:/photos/photo.jpeg"),
@@ -1640,6 +1861,8 @@ mod tests {
             style: RandomStyle::Chars,
             length: 6,
             alphabet: "abc".to_owned(),
+
+            ..Default::default()
         };
         let sample = chars.sample();
         assert_eq!(sample.len(), 6);
@@ -1701,6 +1924,8 @@ mod tests {
             style: RandomStyle::Chars,
             length: 8,
             alphabet: "ab".to_owned(),
+
+            ..Default::default()
         };
         assert_eq!(chars.label(), "набор символов: 8 из «ab»");
     }
@@ -2069,6 +2294,8 @@ mod tests {
             jitter: None,
             kinds: vec![GeneratedKind::Bin],
             mix: MixMode::Even,
+
+            ..Default::default()
         };
         let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
 
@@ -2092,6 +2319,8 @@ mod tests {
             jitter: None,
             kinds: vec![GeneratedKind::Png, GeneratedKind::Gif],
             mix: MixMode::Even,
+
+            ..Default::default()
         };
         let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
 
@@ -2127,6 +2356,8 @@ mod tests {
             jitter: None,
             kinds: vec![GeneratedKind::Bin, GeneratedKind::Png],
             mix: MixMode::Random,
+
+            ..Default::default()
         };
         let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
 
@@ -2152,6 +2383,8 @@ mod tests {
             jitter: None,
             kinds: Vec::new(),
             mix: MixMode::Even,
+
+            ..Default::default()
         };
         let error = plan_generate("seed", NameMode::Size, None, &targets, &[]).unwrap_err();
         assert!(error.contains("тип"), "{error}");
@@ -2300,6 +2533,8 @@ mod tests {
             jitter: Some(SizeJitter::new(spread, JitterMode::Plus)),
             kinds: vec![GeneratedKind::Bin],
             mix: MixMode::Even,
+
+            ..Default::default()
         };
         let items = plan_generate("seed", NameMode::Size, Some(dir.path()), &targets, &[]).unwrap();
 
@@ -2325,6 +2560,8 @@ mod tests {
             target: 64 * 1024,
             kind: GeneratedKind::Bin,
             payloads: Vec::new(),
+
+            ..Default::default()
         };
         let written = generate_one(
             &item,
@@ -2348,6 +2585,8 @@ mod tests {
             target: 256 * 1024,
             kind: GeneratedKind::Png,
             payloads: vec![secret],
+
+            ..Default::default()
         };
         let options = ContainerOptions::default();
         let written = generate_one(&item, &options, payload::MIN_COPIES, &Job::quiet()).unwrap();
@@ -2371,6 +2610,8 @@ mod tests {
             target: 16 * 1024,
             kind: GeneratedKind::Png,
             payloads: vec![secret],
+
+            ..Default::default()
         };
         let error = generate_one(
             &item,
