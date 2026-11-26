@@ -13,6 +13,7 @@ mod flac;
 mod gif;
 mod jpeg;
 mod mp3;
+mod mp4;
 mod opc;
 mod pdf;
 mod png;
@@ -42,6 +43,8 @@ pub enum Kind {
     Mp3,
     /// FLAC-аудио: комментарии Vorbis и картинки в блоках метаданных.
     Flac,
+    /// MP4/MOV: служебные боксы `udta`.
+    Mp4,
 }
 
 impl Kind {
@@ -66,6 +69,7 @@ impl Kind {
             Kind::Pdf => "PDF",
             Kind::Mp3 => "MP3",
             Kind::Flac => "FLAC",
+            Kind::Mp4 => "MP4/MOV",
         }
     }
 }
@@ -243,11 +247,14 @@ fn detect_head(path: &Path, head: &[u8]) -> Result<Kind, String> {
     if head.starts_with(b"fLaC") {
         return Ok(Kind::Flac);
     }
+    if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        return Ok(Kind::Mp4);
+    }
     if head.starts_with(b"PK\x03\x04") {
         return if opc::is_package(path) {
             Ok(Kind::Opc)
         } else {
-            Err("Обычный ZIP-архив метаданных не содержит: поддержаны PNG, JPEG, GIF, WebP, SVG, docx/xlsx/pptx, PDF, MP3 и FLAC.".to_owned())
+            Err("Обычный ZIP-архив метаданных не содержит: поддержаны PNG, JPEG, GIF, WebP, SVG, docx/xlsx/pptx, PDF, MP3, FLAC и MP4/MOV.".to_owned())
         };
     }
     if svg::looks_like_svg(path, head) {
@@ -315,6 +322,7 @@ fn walk(
         Kind::Pdf => pdf::clean(input, output, options, report, job),
         Kind::Mp3 => mp3::clean(input, output, options, report, job),
         Kind::Flac => flac::clean(input, output, options, report, job),
+        Kind::Mp4 => mp4::clean(input, output, options, report, job),
     }
 }
 

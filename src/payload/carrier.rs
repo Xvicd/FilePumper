@@ -13,6 +13,10 @@ pub enum Carrier {
     Gif,
     Webp,
     Svg,
+    /// Пакет Office: нагрузка отдельной частью `filepumper/payload.bin`.
+    Opc,
+    /// PDF: неиспользуемый поток-объект перед `%%EOF`.
+    Pdf,
     Raw,
 }
 
@@ -24,6 +28,8 @@ impl Carrier {
             Carrier::Gif => "GIF",
             Carrier::Webp => "WebP",
             Carrier::Svg => "SVG",
+            Carrier::Opc => "пакет Office (docx/xlsx/pptx)",
+            Carrier::Pdf => "PDF",
             Carrier::Raw => "обычный файл",
         }
     }
@@ -36,6 +42,8 @@ impl Carrier {
             Carrier::Gif => "блок Comment Extension перед трейлером",
             Carrier::Webp => "RIFF-чанк UFP1 с пересчётом размера",
             Carrier::Svg => "элемент <metadata id=\"ufpl\"> перед </svg>",
+            Carrier::Opc => "часть filepumper/payload.bin, объявленная в пакете",
+            Carrier::Pdf => "неиспользуемый поток-объект перед %%EOF",
             Carrier::Raw => "контейнер в конце файла с концевым маркером",
         }
     }
@@ -48,6 +56,8 @@ impl Carrier {
             }
             Carrier::Gif => "высокая: комментарий читается декодером как часть формата",
             Carrier::Svg => "средняя: данные в тексте, чувствительно к минификации",
+            Carrier::Opc => "высокая: нагрузка — часть пакета, Word и Excel её не трогают",
+            Carrier::Pdf => "средняя: поток внутри PDF, серверы редко меняют структуру файла",
             Carrier::Raw => "низкая: данные в хвосте файла, сервер может их отрезать",
         }
     }
@@ -101,6 +111,23 @@ pub fn detect_carrier(path: &Path) -> Result<Carrier, String> {
     }
     if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
         return Ok(Carrier::Webp);
+    }
+    if head.starts_with(b"%PDF") {
+        return Ok(Carrier::Pdf);
+    }
+    if head.starts_with(b"PK\x03\x04") {
+        // Обычный ZIP — «сырой» носитель, пакет Office — отдельный тип.
+        if let Ok(file) = File::open(path) {
+            if let Ok(archive) = zip::ZipArchive::new(file) {
+                if archive
+                    .index_for_name(crate::metadata::OPC_CONTENT_TYPES)
+                    .is_some()
+                {
+                    return Ok(Carrier::Opc);
+                }
+            }
+        }
+        return Ok(Carrier::Raw);
     }
     if has_extension(path, &["svg", "svgz"]) {
         return Ok(Carrier::Svg);

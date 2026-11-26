@@ -8,6 +8,8 @@ pub mod format;
 pub mod gif;
 pub mod group;
 pub mod jpeg;
+pub mod opc;
+pub mod pdf;
 pub mod png;
 pub mod raw;
 pub mod svg;
@@ -57,6 +59,8 @@ fn read_stack(carrier: &Path, kind: Carrier) -> Result<Vec<u8>, String> {
         Carrier::Gif => gif::extract(carrier),
         Carrier::Webp => webp::extract(carrier),
         Carrier::Svg => svg::extract(carrier),
+        Carrier::Opc => opc::extract(carrier),
+        Carrier::Pdf => pdf::extract(carrier),
         Carrier::Raw => raw::extract(carrier),
     }
 }
@@ -89,6 +93,8 @@ fn write_stack(
         Carrier::Gif => gif::embed(carrier, data, copy_len, output),
         Carrier::Webp => webp::embed(carrier, data, copy_len, output),
         Carrier::Svg => svg::embed(carrier, data, copy_len, output),
+        Carrier::Opc => opc::embed(carrier, data, output, job),
+        Carrier::Pdf => pdf::embed(carrier, data, output, job),
         Carrier::Raw => raw::embed(carrier, data, output),
     }
 }
@@ -100,6 +106,14 @@ fn decodes_cleanly(path: &Path, kind: Carrier) -> bool {
         Carrier::Png | Carrier::Jpeg | Carrier::Gif | Carrier::Webp => image::open(path).is_ok(),
         Carrier::Svg => fs::read_to_string(path)
             .map(|text| text.trim_end().ends_with("</svg>"))
+            .unwrap_or(false),
+        Carrier::Opc => zip::ZipArchive::new(match File::open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        })
+        .is_ok(),
+        Carrier::Pdf => fs::read(path)
+            .map(|bytes| bytes.starts_with(b"%PDF"))
             .unwrap_or(false),
         Carrier::Raw => true,
     }
@@ -460,6 +474,24 @@ pub fn extract_bundle_to(
     }
     job.report(40.0, "Распаковка бандла...");
     bundle::unpack(&parsed.payload, out_dir, job)
+}
+
+/// Извлекает из бандла только запись с именем `only` (без учёта регистра).
+pub fn extract_bundle_entry(
+    carrier: &Path,
+    out_dir: &Path,
+    only: &str,
+    password: Option<&str>,
+    job: &Job<'_>,
+) -> Result<Vec<(PathBuf, u64)>, String> {
+    job.check()?;
+    job.report(5.0, "Поиск полезной нагрузки...");
+    let (parsed, _copies, _kind) = extract_payload(carrier, password)?;
+    if !parsed.bundle {
+        return Err("В этом файле один файл нагрузки, а не бандл.".to_owned());
+    }
+    job.report(40.0, "Распаковка бандла...");
+    bundle::unpack_selected(&parsed.payload, out_dir, Some(only), job)
 }
 
 /// Извлекает нагрузку в указанный файл (бандл сохраняется как ZIP).

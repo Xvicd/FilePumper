@@ -102,6 +102,19 @@ pub fn list(bytes: &[u8]) -> Result<Vec<BundleEntry>, String> {
 
 /// Распаковывает бандл в папку, не перезаписывая существующие файлы.
 pub fn unpack(bytes: &[u8], out_dir: &Path, job: &Job<'_>) -> Result<Vec<(PathBuf, u64)>, String> {
+    unpack_selected(bytes, out_dir, None, job)
+}
+
+/// Распаковывает бандл целиком или только одну запись с именем `only`.
+///
+/// Сравнение имён без учёта регистра; запись ищется по имени файла внутри
+/// бандла, а не по пути. Если `only` задан и ничего не совпало — пустой список.
+pub fn unpack_selected(
+    bytes: &[u8],
+    out_dir: &Path,
+    only: Option<&str>,
+    job: &Job<'_>,
+) -> Result<Vec<(PathBuf, u64)>, String> {
     fs::create_dir_all(out_dir)
         .map_err(|err| format!("Не удалось создать папку {}: {err}", out_dir.display()))?;
     let mut archive =
@@ -114,6 +127,15 @@ pub fn unpack(bytes: &[u8], out_dir: &Path, job: &Job<'_>) -> Result<Vec<(PathBu
             .by_index(index)
             .map_err(|err| format!("Бандл повреждён: {err}"))?;
         let name = sanitize_file_name(file.name());
+        if let Some(only) = only {
+            if !name.eq_ignore_ascii_case(only) {
+                job.report(
+                    (index + 1) as f32 / total as f32 * 100.0,
+                    &format!("Пропуск: {name}"),
+                );
+                continue;
+            }
+        }
         let destination = unique_path(&out_dir.join(&name));
         let mut data = Vec::with_capacity(file.size() as usize);
         file.read_to_end(&mut data)
@@ -139,6 +161,23 @@ mod tests {
         fs::write(&first, b"hello bundle").unwrap();
         fs::write(&second, b"second payload").unwrap();
         vec![first, second]
+    }
+
+    #[test]
+    fn bundle_unpacks_only_the_requested_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = sample_files(dir.path());
+        let bytes = build(&files, &Job::quiet()).unwrap();
+        let out_dir = dir.path().join("picked");
+        let written = unpack_selected(&bytes, &out_dir, Some("PHOTO.PNG"), &Job::quiet()).unwrap();
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(
+            fs::read(out_dir.join("photo.png")).unwrap(),
+            b"second payload"
+        );
+        assert!(!out_dir.join("note.txt").exists());
+        let empty = unpack_selected(&bytes, &out_dir, Some("missing.txt"), &Job::quiet()).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

@@ -1694,7 +1694,7 @@ impl PumperApp {
             };
             let job = Job::new(&progress, &cancel);
             let result =
-                payload::group::extract_many(&carriers, Some(&directory), &passwords, &job);
+                payload::group::extract_many(&carriers, Some(&directory), &passwords, None, &job);
             let _ = sender.send(WorkerMessage::Extracted(result));
         });
     }
@@ -2965,7 +2965,7 @@ impl PumperApp {
             "«Спрятать файл» кладёт все нагрузки во все носители (несколько — бандлом). «Спрятать по парам» — свой файл в каждый носитель и со своим паролем.",
         );
         ui.weak(
-            "Данные кладутся внутрь структуры файла: чанки PNG, сегменты APP15 JPEG, комментарий GIF, RIFF-чанк WebP, metadata SVG. Картинка остаётся рабочей, поэтому сервер принимает файл целиком.",
+            "Данные кладутся внутрь структуры файла: чанки PNG, сегменты APP15 JPEG, комментарий GIF, RIFF-чанк WebP, metadata SVG, часть filepumper/payload.bin в docx/xlsx/pptx и поток-объект в PDF. Файл остаётся рабочим, поэтому сервер принимает его целиком.",
         );
     }
 

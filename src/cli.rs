@@ -175,6 +175,8 @@ FilePumper
                                    [--dry-run] [--report ОТЧЁТ.csv|ОТЧЁТ.json]
                                    [--quiet] [--no-progress] [--json]
   Несколько --payload упаковываются в один ZIP-бандл внутри контейнера.
+  Поддержаны PNG, JPEG, GIF, WebP, SVG, DOCX/XLSX/PPTX (часть пакета) и PDF
+  (неиспользуемый поток перед %%EOF); остальные файлы получают контейнер в конец.
   --pair сопоставляет носители и нагрузки по порядку: первая нагрузка идёт в
   первый носитель, вторая во второй и так далее (нагрузок меньше — повторяются,
   больше — делятся поровну и попадают в носитель бандлом).
@@ -188,6 +190,7 @@ FilePumper
 Извлечь файлы из картинки (можно несколько носителей):
   file-pumper-cli extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--password ПАРОЛЬ]
+                                   [--only ИМЯ]
                                    [--quiet] [--no-progress] [--json]
   Извлечённый файл сохраняет расширение из имени нагрузки, поэтому система
   знает, чем его открывать. Бандл распаковывается в папку по одному файлу.
@@ -195,6 +198,9 @@ FilePumper
   можно извлечь и из какого файла. Код выхода 1 — только при реальных ошибках.
   --password можно повторять: пароли перебираются по порядку, поэтому пачка
   файлов с разными паролями извлекается одной командой.
+
+  --only ИМЯ извлекает из бандла только одну запись (без учёта регистра):
+  extract carrier.png --only secret.txt. Если имя не совпало, файл не пишется.
 
 Проверить, что лежит внутри (можно несколько носителей):
   file-pumper-cli inspect <носитель>... [--password ПАРОЛЬ]... [--json]
@@ -292,6 +298,8 @@ struct Flags {
     clean_profiles: bool,
     /// Суффикс имени результата при очистке метаданных.
     clean_suffix: String,
+    /// Извлекать из бандла только одну запись с этим именем.
+    extract_only: Option<String>,
     generated: Vec<GeneratedKind>,
     mix: MixMode,
     base_name: String,
@@ -419,6 +427,7 @@ impl Flags {
             verify: false,
             clean_profiles: false,
             clean_suffix: "_clean".to_owned(),
+            extract_only: None,
             generated: Vec::new(),
             mix: MixMode::default(),
             base_name: "file".to_owned(),
@@ -547,6 +556,9 @@ impl Flags {
                 "--skip-unsupported" => flags.skip_unsupported = true,
                 "--dry-run" => flags.dry_run = true,
                 "--verify" => flags.verify = true,
+                "--only" | "--entry" => {
+                    flags.extract_only = Some(next("--only", &mut iterator)?);
+                }
                 "--profiles" | "--remove-profiles" => flags.clean_profiles = true,
                 "--suffix" => {
                     let raw = next("--suffix", &mut iterator)?;
@@ -1631,6 +1643,15 @@ fn command_extract(flags: &Flags) -> Result<(), String> {
     if let Some(output) = explicit_output {
         let carrier = &carriers[0];
         let (summary, password) = payload::group::probe(carrier, &passwords)?;
+        if let Some(only) = flags.extract_only.as_deref() {
+            if !summary.info.name.eq_ignore_ascii_case(only) {
+                return Err(format!(
+                    "В {} нагрузка «{}», а не «{only}».",
+                    carrier.display(),
+                    summary.info.name
+                ));
+            }
+        }
         if summary.info.bundle {
             return Err(format!(
                 "{} — внутри бандл, он распаковывается в папку (--out-dir), а не в один файл.",
@@ -1668,7 +1689,14 @@ fn command_extract(flags: &Flags) -> Result<(), String> {
         };
     }
 
-    command_extract_many(flags, &carriers, flags.out_dir.as_deref(), &passwords, &job)
+    command_extract_many(
+        flags,
+        &carriers,
+        flags.out_dir.as_deref(),
+        &passwords,
+        flags.extract_only.as_deref(),
+        &job,
+    )
 }
 
 fn extract_batch_json(batch: &payload::group::ExtractBatch) -> Value {
@@ -1722,9 +1750,10 @@ fn command_extract_many(
     carriers: &[PathBuf],
     out_dir: Option<&Path>,
     passwords: &[String],
+    only: Option<&str>,
     job: &Job<'_>,
 ) -> Result<(), String> {
-    let batch = payload::group::extract_many(carriers, out_dir, passwords, job)?;
+    let batch = payload::group::extract_many(carriers, out_dir, passwords, only, job)?;
     if flags.progress_enabled() {
         eprintln!();
     }
@@ -2219,7 +2248,7 @@ fn command_clean(flags: &Flags) -> Result<(), String> {
 fn completion_script(shell: &str) -> Result<&'static str, String> {
     let script = match shell.trim().to_ascii_lowercase().as_str() {
         "bash" => {
-            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --noise --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
+            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --noise --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --only --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
 "#
         }
         "zsh" => {

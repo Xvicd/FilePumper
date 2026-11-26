@@ -252,6 +252,14 @@ fn image_carriers_stay_decodable_after_embedding() {
                 assert!(text.trim_end().ends_with("</svg>"));
                 assert!(text.contains("<svg"));
             }
+            Carrier::Opc => {
+                let file = fs::File::open(&output).unwrap();
+                let archive = zip::ZipArchive::new(file).unwrap();
+                assert!(archive.index_for_name("filepumper/payload.bin").is_some());
+            }
+            Carrier::Pdf => {
+                assert!(fs::read(&output).unwrap().starts_with(b"%PDF"));
+            }
             Carrier::Raw => {}
         }
     }

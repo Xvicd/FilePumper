@@ -507,6 +507,7 @@ pub fn extract_many(
     carriers: &[PathBuf],
     out_dir: Option<&Path>,
     passwords: &[String],
+    only: Option<&str>,
     job: &Job<'_>,
 ) -> Result<ExtractBatch, String> {
     if let Some(directory) = out_dir {
@@ -539,17 +540,50 @@ pub fn extract_many(
                 } else {
                     base
                 };
-                extract_bundle_to(carrier, &folder, password.as_deref(), &item_job)
-                    .map(ExtractResult::Bundle)
+                let written = match only {
+                    Some(name) => super::extract_bundle_entry(
+                        carrier,
+                        &folder,
+                        name,
+                        password.as_deref(),
+                        &item_job,
+                    ),
+                    None => extract_bundle_to(carrier, &folder, password.as_deref(), &item_job),
+                };
+                match written {
+                    Ok(files) if only.is_some() && files.is_empty() => Err(format!(
+                        "В бандле нет записи «{}».",
+                        only.unwrap_or_default()
+                    )),
+                    Ok(files) => Ok(ExtractResult::Bundle(files)),
+                    Err(error) => Err(error),
+                }
             }
             Ok((summary, password)) => {
-                let name = sanitize_file_name(&summary.info.name);
-                let target = match out_dir {
-                    Some(directory) => unique_path(&directory.join(&name)),
-                    None => unique_path(&super::default_extract_path(carrier, &name)),
-                };
-                extract_to(carrier, &target, password.as_deref(), &item_job)
-                    .map(ExtractResult::File)
+                if let Some(only) = only {
+                    if !summary.info.name.eq_ignore_ascii_case(only) {
+                        Err(format!(
+                            "В файле нагрузка «{}», а не «{only}».",
+                            summary.info.name
+                        ))
+                    } else {
+                        let name = sanitize_file_name(&summary.info.name);
+                        let target = match out_dir {
+                            Some(directory) => unique_path(&directory.join(&name)),
+                            None => unique_path(&super::default_extract_path(carrier, &name)),
+                        };
+                        extract_to(carrier, &target, password.as_deref(), &item_job)
+                            .map(ExtractResult::File)
+                    }
+                } else {
+                    let name = sanitize_file_name(&summary.info.name);
+                    let target = match out_dir {
+                        Some(directory) => unique_path(&directory.join(&name)),
+                        None => unique_path(&super::default_extract_path(carrier, &name)),
+                    };
+                    extract_to(carrier, &target, password.as_deref(), &item_job)
+                        .map(ExtractResult::File)
+                }
             }
             Err(error) if error == PAYLOAD_NOT_FOUND => Ok(ExtractResult::Empty),
             Err(error) => Err(error),
@@ -741,7 +775,8 @@ mod tests {
         fs::write(&plain, b"just a normal file").unwrap();
         let out_dir = dir.path().join("restored");
 
-        let batch = extract_many(&[hidden, plain], Some(&out_dir), &[], &Job::quiet()).unwrap();
+        let batch =
+            extract_many(&[hidden, plain], Some(&out_dir), &[], None, &Job::quiet()).unwrap();
         assert_eq!(batch.items.len(), 2);
         assert!(batch.items[0].is_done());
         assert!(matches!(batch.items[1].result, ExtractResult::Empty));
@@ -776,7 +811,7 @@ mod tests {
         .unwrap();
 
         let out_dir = dir.path().join("restored");
-        let batch = extract_many(&[output], Some(&out_dir), &[], &Job::quiet()).unwrap();
+        let batch = extract_many(&[output], Some(&out_dir), &[], None, &Job::quiet()).unwrap();
         assert!(matches!(batch.items[0].result, ExtractResult::Bundle(_)));
         assert!(out_dir.join("note.txt").is_file());
         assert!(out_dir.join("song.mp3").is_file());
@@ -809,7 +844,7 @@ mod tests {
         }
 
         let out_dir = dir.path().join("restored");
-        let batch = extract_many(&carriers, Some(&out_dir), &[], &Job::quiet()).unwrap();
+        let batch = extract_many(&carriers, Some(&out_dir), &[], None, &Job::quiet()).unwrap();
         assert_eq!(batch.items.len(), 2);
         assert!(out_dir.join("hidden-first").join("note.txt").is_file());
         assert!(out_dir.join("hidden-second").join("note.txt").is_file());
@@ -845,7 +880,8 @@ mod tests {
         assert_eq!(used.as_deref(), Some("second"));
 
         let out_dir = dir.path().join("restored");
-        let batch = extract_many(&[output], Some(&out_dir), &passwords, &Job::quiet()).unwrap();
+        let batch =
+            extract_many(&[output], Some(&out_dir), &passwords, None, &Job::quiet()).unwrap();
         assert!(batch.items[0].is_done());
         assert_eq!(
             fs::read(out_dir.join("secret.bin")).unwrap(),

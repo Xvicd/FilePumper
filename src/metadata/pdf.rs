@@ -65,6 +65,53 @@ pub(super) fn clean(
                 });
             }
         }
+        // Каталог документа: действия при открытии, скрипты, вложения, формы.
+        if let Some((trailer_start, trailer_end)) = trailer_dict(&data)? {
+            let trailer = &data[trailer_start + 2..trailer_end];
+            if let Some(number) = root_number(trailer) {
+                if let Some((body_start, body_end)) = find_object_body(&data, number) {
+                    // Спускаемся внутрь самого словаря каталога: иначе tokenize
+                    // считает `<< ... >>` одним значением и ключей не видит.
+                    let dict = match find(&data[body_start..body_end], b"<<") {
+                        Some(open) => body_start + open,
+                        None => body_start,
+                    };
+                    let close = dict_end(&data, dict).unwrap_or(body_end);
+                    for (start, end, label) in blank_entries(
+                        &data,
+                        dict + 2,
+                        close,
+                        &[
+                            ("OpenAction", "PDF /OpenAction (действие при открытии)"),
+                            ("AA", "PDF /AA (дополнительные действия)"),
+                            ("Names", "PDF /Names (вложения и скрипты)"),
+                            ("AcroForm", "PDF /AcroForm (формы)"),
+                        ],
+                    ) {
+                        report
+                            .removed
+                            .push(Removal::new(label, (end - start) as u64));
+                        edits.push(Edit {
+                            start,
+                            end,
+                            bytes: vec![b' '; end - start],
+                        });
+                    }
+                }
+            }
+        }
+        // Аннотации страниц: ссылки на них вычищаются пробелами, длина не меняется.
+        for (start, end) in blank_annots(&data) {
+            report.removed.push(Removal::new(
+                "PDF /Annots (аннотации)",
+                (end - start) as u64,
+            ));
+            edits.push(Edit {
+                start,
+                end,
+                bytes: vec![b' '; end - start],
+            });
+        }
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
         for edit in edits {
             if edit.end <= result.len() {
@@ -75,6 +122,94 @@ pub(super) fn clean(
     output.write_all(&result).map_err(|err| err.to_string())?;
     progress.advance(total)?;
     Ok(())
+}
+
+/// Номер объекта каталога из `/Root N 0 R` в словаре трейлера.
+fn root_number(trailer: &[u8]) -> Option<u32> {
+    let position = find(trailer, b"/Root")?;
+    let value = &trailer[position + b"/Root".len()..];
+    first_number(value)
+}
+
+/// Пустые (пробельные) правки для записей словаря: ключ и значение целиком.
+fn blank_entries(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    keys: &[(&str, &'static str)],
+) -> Vec<(usize, usize, &'static str)> {
+    let dict = &data[start..end];
+    let pieces = tokenize(dict);
+    let mut edits = Vec::new();
+    let mut index = 0;
+    while index < pieces.len() {
+        let piece = &pieces[index];
+        if piece.token == Token::Name {
+            let name = String::from_utf8_lossy(&dict[piece.start + 1..piece.end]).into_owned();
+            if let Some((_, label)) = keys.iter().find(|(key, _)| *key == name) {
+                let mut stop = piece.end;
+                let mut next = index + 1;
+                while next < pieces.len() {
+                    let next_piece = &pieces[next];
+                    if next_piece.token == Token::Name {
+                        break;
+                    }
+                    // Закрывающие скобки словаря/массива не съедаем.
+                    if matches!(dict[next_piece.start], b'>' | b']') {
+                        break;
+                    }
+                    stop = next_piece.end;
+                    next += 1;
+                }
+                edits.push((start + piece.start, start + stop, *label));
+                index = next;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    edits
+}
+
+/// Записи `/Annots` по всему файлу: массив или косвенная ссылка.
+fn blank_annots(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut edits = Vec::new();
+    let mut search = 0;
+    while let Some(position) = find(&data[search..], b"/Annots") {
+        let start = search + position;
+        let after = start + b"/Annots".len();
+        if after >= data.len() || !is_delimiter(data[after]) {
+            search = after;
+            continue;
+        }
+        let mut index = after;
+        while index < data.len() && data[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let end = if index < data.len() && data[index] == b'[' {
+            array_end(data, index).unwrap_or(index)
+        } else {
+            let mut cursor = index;
+            for _ in 0..3 {
+                while cursor < data.len() && data[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                let token_start = cursor;
+                while cursor < data.len() && !is_delimiter(data[cursor]) {
+                    cursor += 1;
+                }
+                if cursor == token_start {
+                    break;
+                }
+            }
+            cursor
+        };
+        if end > start {
+            edits.push((start, end));
+        }
+        search = end.max(after);
+    }
+    edits
 }
 
 struct Edit {
@@ -473,6 +608,80 @@ mod tests {
         let original = fs::metadata(&input).unwrap().len();
         assert!(cleaned < original);
         assert!(original - cleaned < 200, "разница {}", original - cleaned);
+    }
+
+    #[test]
+    fn actions_scripts_and_annotations_are_blanked() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("active.pdf");
+        let mut objects: Vec<(u32, Vec<u8>)> = vec![
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R /AA << /O 4 0 R >> \
+                   /Names << /JavaScript 5 0 R >> /AcroForm 6 0 R >>"
+                    .to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [7 0 R] >>".to_vec(),
+            ),
+            (4, b"<< /S /JavaScript /JS (app.alert('hi')) >>".to_vec()),
+            (5, b"<< /S /JavaScript /JS (evil()) >>".to_vec()),
+            (6, b"<< /Fields [] >>".to_vec()),
+            (7, b"<< /Type /Annot /Subtype /Link /A 4 0 R >>".to_vec()),
+        ];
+        objects.sort_by_key(|(number, _)| *number);
+        let mut body = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (number, content) in &objects {
+            offsets.push(body.len());
+            body.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            body.extend_from_slice(content);
+            body.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = body.len();
+        body.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        body.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        fs::write(&input, &body).unwrap();
+        let size_before = body.len();
+
+        let output = dir.path().join("clean.pdf");
+        let report = clean(&input, &output, CleanOptions::default(), &Job::quiet()).unwrap();
+        let text = String::from_utf8_lossy(&fs::read(&output).unwrap()).into_owned();
+        assert!(!text.contains("/OpenAction"), "{text}");
+        assert!(!text.contains("/AA"), "{text}");
+        assert!(!text.contains("/Names"), "{text}");
+        assert!(!text.contains("/AcroForm"), "{text}");
+        assert!(!text.contains("/Annots"), "{text}");
+        assert!(
+            text.contains("app.alert"),
+            "объект действия не тронут: {text}"
+        );
+        assert!(text.contains("/Type /Catalog"));
+        assert_eq!(
+            fs::metadata(&output).unwrap().len() as usize,
+            size_before,
+            "правки одинаковой длины не должны менять размер"
+        );
+        assert!(
+            report
+                .removed
+                .iter()
+                .any(|removal| removal.label.contains("OpenAction")),
+            "{:?}",
+            report.removed
+        );
     }
 
     #[test]

@@ -59,6 +59,64 @@ pub fn is_package(path: &Path) -> bool {
     }
 }
 
+/// Части Word, где встречаются служебные идентификаторы правок.
+fn is_word_part(name: &str) -> bool {
+    if !name.starts_with("word/") || !name.ends_with(".xml") {
+        return false;
+    }
+    let file = name.rsplit('/').next().unwrap_or(name);
+    matches!(
+        file,
+        "document.xml"
+            | "footnotes.xml"
+            | "endnotes.xml"
+            | "comments.xml"
+            | "styles.xml"
+            | "numbering.xml"
+    ) || file.starts_with("header")
+        || file.starts_with("footer")
+}
+
+/// Убирает атрибуты `w:rsid…="…"` из XML: содержимое документа не меняется.
+fn strip_rsids(xml: &[u8]) -> (Vec<u8>, u64) {
+    let mut out = Vec::with_capacity(xml.len());
+    let mut removed = 0_u64;
+    let mut index = 0;
+    while index < xml.len() {
+        if xml[index] == b' ' && xml[index + 1..].starts_with(b"w:rsid") {
+            let start = index;
+            let mut cursor = index + 1;
+            while cursor < xml.len() && (xml[cursor].is_ascii_alphanumeric() || xml[cursor] == b':')
+            {
+                cursor += 1;
+            }
+            if cursor < xml.len() && xml[cursor] == b'=' {
+                let mut end = cursor + 1;
+                if end < xml.len() && (xml[end] == b'"' || xml[end] == b'\'') {
+                    let quote = xml[end];
+                    end += 1;
+                    while end < xml.len() && xml[end] != quote {
+                        end += 1;
+                    }
+                    if end < xml.len() {
+                        end += 1;
+                    }
+                } else {
+                    while end < xml.len() && !xml[end].is_ascii_whitespace() && xml[end] != b'>' {
+                        end += 1;
+                    }
+                }
+                removed += (end - start) as u64;
+                index = end;
+                continue;
+            }
+        }
+        out.push(xml[index]);
+        index += 1;
+    }
+    (out, removed)
+}
+
 pub(super) fn clean(
     input: &Path,
     output: &mut dyn SeekWrite,
@@ -87,31 +145,47 @@ pub(super) fn clean(
         }
         let entry = archive.by_index_raw(index).map_err(|err| err.to_string())?;
         let name = entry.name().to_owned();
-        let replacement: Option<(&str, &[u8])> = match name.as_str() {
-            CORE if options.text => {
-                Some(("свойства документа (автор, даты)", BLANK_CORE.as_bytes()))
-            }
-            APP if options.text => Some(("приложение и компания", BLANK_APP.as_bytes())),
-            CUSTOM if options.text => Some(("пользовательские свойства", BLANK_CUSTOM.as_bytes())),
+        let entry_options = entry.options();
+        let entry_size = entry.size();
+        let mut replacement: Option<(&'static str, Vec<u8>)> = match name.as_str() {
+            CORE if options.text => Some((
+                "свойства документа (автор, даты)",
+                BLANK_CORE.as_bytes().to_vec(),
+            )),
+            APP if options.text => Some(("приложение и компания", BLANK_APP.as_bytes().to_vec())),
+            CUSTOM if options.text => Some((
+                "пользовательские свойства",
+                BLANK_CUSTOM.as_bytes().to_vec(),
+            )),
             _ if options.profiles && name.starts_with(THUMBNAIL_PREFIX) => {
-                Some(("превью документа", BLANK_THUMBNAIL))
+                Some(("превью документа", BLANK_THUMBNAIL.to_vec()))
             }
             _ => None,
         };
+        // Word хранит в частях документа служебные идентификаторы правок
+        // (`w:rsidR`, `w:rsidP`, …): по ним можно связать копии документа.
+        drop(entry);
+        if replacement.is_none() && options.text && is_word_part(&name) {
+            let mut file = archive.by_index(index).map_err(|err| err.to_string())?;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut data).map_err(|err| err.to_string())?;
+            let (stripped, removed) = strip_rsids(&data);
+            if removed > 0 {
+                replacement = Some(("идентификаторы правок (rsid)", stripped));
+            }
+        }
         match replacement {
             Some((what, bytes)) => {
-                let options = entry.options();
-                let original = entry.size();
-                drop(entry);
                 writer
-                    .start_file(name.as_str(), options)
+                    .start_file(name.as_str(), entry_options)
                     .map_err(|err| format!("Не удалось переписать «{name}»: {err}"))?;
-                std::io::Write::write_all(&mut writer, bytes).map_err(|err| err.to_string())?;
+                std::io::Write::write_all(&mut writer, &bytes).map_err(|err| err.to_string())?;
                 report
                     .removed
-                    .push(Removal::new(format!("{name}: {what}"), original));
+                    .push(Removal::new(format!("{name}: {what}"), entry_size));
             }
             None => {
+                let entry = archive.by_index_raw(index).map_err(|err| err.to_string())?;
                 writer
                     .raw_copy_file(entry)
                     .map_err(|err| format!("Не удалось скопировать «{name}»: {err}"))?;
@@ -182,7 +256,10 @@ mod tests {
         let parts: Vec<(&str, &[u8])> = vec![
             (OPC_CONTENT_TYPES, CONTENT_TYPES.as_bytes()),
             ("_rels/.rels", b"<Relationships/>"),
-            ("word/document.xml", b"<w:document xmlns:w=\"w\"/>"),
+            (
+                "word/document.xml",
+                b"<w:document xmlns:w=\"w\" w:rsidR=\"00A12B34\" w:rsidRDefault=\"00A12B34\"><w:body><w:p w:rsidR=\"00C56D78\" w:rsidP=\"00C56D78\"><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>",
+            ),
             (
                 "docProps/core.xml",
                 concat!(
@@ -225,7 +302,7 @@ mod tests {
 
         let output = dir.path().join("clean.docx");
         let report = clean(&input, &output, CleanOptions::default(), &Job::quiet()).unwrap();
-        assert_eq!(report.removed.len(), 3, "{:?}", report.removed);
+        assert_eq!(report.removed.len(), 4, "{:?}", report.removed);
 
         let core = read_part(&output, CORE).unwrap();
         let core = String::from_utf8(core).unwrap();
@@ -246,6 +323,27 @@ mod tests {
         // Пакет читается как архив, порядок частей сохранён.
         let names = parts(&output).unwrap();
         assert_eq!(names.first().map(String::as_str), Some(OPC_CONTENT_TYPES));
+    }
+
+    #[test]
+    fn rsid_attributes_are_removed_and_text_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("report.docx");
+        build_docx(&input);
+        let output = dir.path().join("clean.docx");
+        let report = clean(&input, &output, CleanOptions::default(), &Job::quiet()).unwrap();
+        assert!(
+            report
+                .removed
+                .iter()
+                .any(|removal| removal.label.contains("rsid")),
+            "{:?}",
+            report.removed
+        );
+        let document = String::from_utf8(read_part(&output, "word/document.xml").unwrap()).unwrap();
+        assert!(!document.contains("w:rsid"), "{document}");
+        assert!(document.contains("<w:t>Hello</w:t>"), "{document}");
+        assert!(document.contains("<w:body>"), "{document}");
     }
 
     #[test]

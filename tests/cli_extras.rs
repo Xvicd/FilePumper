@@ -309,6 +309,59 @@ fn verify_accepts_flag_after_pump() {
 }
 
 #[test]
+fn extract_only_keeps_the_requested_bundle_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let carrier = png_file(dir.path(), "carrier.png");
+    let first = text_file(dir.path(), "secret-a.txt", 32);
+    let second = text_file(dir.path(), "secret-b.txt", 48);
+    let out_dir = dir.path().join("out");
+    assert_eq!(
+        cli(&[
+            "embed",
+            path_str(&carrier),
+            "--payload",
+            path_str(&first),
+            "--payload",
+            path_str(&second),
+            "--out-dir",
+            path_str(&out_dir),
+        ]),
+        0
+    );
+    let embedded = out_dir.join("carrier_with_payload.png");
+
+    let picked = dir.path().join("picked");
+    assert_eq!(
+        cli(&[
+            "extract",
+            path_str(&embedded),
+            "--only",
+            "SECRET-B.TXT",
+            "--out-dir",
+            path_str(&picked),
+        ]),
+        0
+    );
+    assert!(picked.join("secret-b.txt").is_file());
+    assert!(!picked.join("secret-a.txt").exists());
+    assert_eq!(fs::read(picked.join("secret-b.txt")).unwrap().len(), 48);
+
+    let none = dir.path().join("none");
+    assert_eq!(
+        cli(&[
+            "extract",
+            path_str(&embedded),
+            "--only",
+            "missing.txt",
+            "--out-dir",
+            path_str(&none),
+        ]),
+        1
+    );
+    assert!(!none.join("missing.txt").exists());
+}
+
+#[test]
 fn bundle_embed_inspect_verify_and_extract() {
     let dir = tempfile::tempdir().unwrap();
     let carrier = png_file(dir.path(), "carrier.png");
