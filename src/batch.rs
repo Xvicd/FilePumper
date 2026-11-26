@@ -68,18 +68,26 @@ pub enum TargetMode {
     AtLeast,
     /// Прибавить указанный объём к размеру исходного файла.
     Add,
+    /// Прибавить N процентов к размеру исходного файла: `50` — половину.
+    Percent,
 }
 
 impl TargetMode {
-    pub const ALL: [TargetMode; 3] = [TargetMode::Exact, TargetMode::AtLeast, TargetMode::Add];
+    pub const ALL: [TargetMode; 4] = [
+        TargetMode::Exact,
+        TargetMode::AtLeast,
+        TargetMode::Add,
+        TargetMode::Percent,
+    ];
 
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_lowercase().as_str() {
             "exact" | "точно" => Ok(TargetMode::Exact),
             "at-least" | "atleast" | "min" | "не-меньше" => Ok(TargetMode::AtLeast),
             "add" | "прибавить" => Ok(TargetMode::Add),
+            "percent" | "процент" | "%" => Ok(TargetMode::Percent),
             other => Err(format!(
-                "Неизвестный режим размера: {other}. Допустимо: exact, at-least, add."
+                "Неизвестный режим размера: {other}. Допустимо: exact, at-least, add, percent."
             )),
         }
     }
@@ -89,6 +97,7 @@ impl TargetMode {
             TargetMode::Exact => "точно",
             TargetMode::AtLeast => "не меньше",
             TargetMode::Add => "прибавить",
+            TargetMode::Percent => "на процент",
         }
     }
 
@@ -98,6 +107,7 @@ impl TargetMode {
             TargetMode::Exact => "Результат ровно указанного размера",
             TargetMode::AtLeast => "Не меньше указанного (крупный файл не уменьшается)",
             TargetMode::Add => "Прибавить указанный объём к исходному файлу",
+            TargetMode::Percent => "Прибавить N процентов к размеру исходного файла",
         }
     }
 
@@ -107,6 +117,8 @@ impl TargetMode {
             TargetMode::Exact => target,
             TargetMode::AtLeast => target.max(input_len),
             TargetMode::Add => input_len.saturating_add(target),
+            // Процент считается от исходного файла в `PumpPlan::target_for`.
+            TargetMode::Percent => input_len,
         }
     }
 }
@@ -565,6 +577,8 @@ pub struct PumpPlan {
     pub jitter: Option<SizeJitter>,
     /// Размеры в байтах, по одному на файл; последний повторяется.
     pub targets: Vec<u64>,
+    /// Проценты для режима [`TargetMode::Percent`] — по одному на файл.
+    pub percents: Vec<f64>,
 }
 
 impl PumpPlan {
@@ -575,6 +589,7 @@ impl PumpPlan {
         mode: TargetMode,
         sizes_mb: &[f64],
     ) -> Result<Self, String> {
+        let percent_mode = mode == TargetMode::Percent;
         Ok(Self {
             method,
             format,
@@ -582,7 +597,16 @@ impl PumpPlan {
             mode,
             names: Names::default(),
             jitter: None,
-            targets: targets_from_mb(sizes_mb)?,
+            targets: if percent_mode {
+                Vec::new()
+            } else {
+                targets_from_mb(sizes_mb)?
+            },
+            percents: if percent_mode {
+                sizes_mb.to_vec()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -605,10 +629,30 @@ impl PumpPlan {
         self
     }
 
+    /// Сколько размеров (или процентов) задано.
+    fn size_count(&self) -> usize {
+        if self.mode == TargetMode::Percent {
+            self.percents.len()
+        } else {
+            self.targets.len()
+        }
+    }
+
     /// Размер для файла номер `index` (если размеров меньше — повторяется последний).
     pub fn target_for(&self, index: usize, input_len: u64) -> u64 {
-        let base = self.targets[index.min(self.targets.len() - 1)];
-        let exact = self.mode.target_bytes(base, input_len);
+        let exact = if self.mode == TargetMode::Percent {
+            let count = self.percents.len();
+            let percent = if count == 0 {
+                0.0
+            } else {
+                self.percents[index.min(count - 1)]
+            };
+            let share = input_len as f64 * percent / 100.0;
+            ((input_len as f64 + share).round()).max(0.0) as u64
+        } else {
+            let base = self.targets[index.min(self.targets.len() - 1)];
+            self.mode.target_bytes(base, input_len)
+        };
         match self.jitter {
             Some(jitter) => jitter.apply(exact),
             None => exact,
@@ -617,17 +661,26 @@ impl PumpPlan {
 
     /// Проверяет, что размеров столько же, сколько файлов, либо указан один.
     pub fn ensure_sizes_match(&self, inputs: usize) -> Result<(), String> {
-        if self.targets.len() == 1 || self.targets.len() == inputs {
+        let count = self.size_count();
+        if count == 1 || count == inputs {
             return Ok(());
         }
         Err(format!(
             "Размеров указано {} ({}) — должно быть либо 1, либо столько же, сколько файлов ({}).",
-            self.targets.len(),
-            self.targets
-                .iter()
-                .map(|bytes| size_label(*bytes))
-                .collect::<Vec<_>>()
-                .join(", "),
+            count,
+            if self.mode == TargetMode::Percent {
+                self.percents
+                    .iter()
+                    .map(|percent| format!("{percent}%"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                self.targets
+                    .iter()
+                    .map(|bytes| size_label(*bytes))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
             inputs
         ))
     }
@@ -1648,6 +1701,51 @@ mod tests {
         let lengths: std::collections::HashSet<usize> =
             NAME_NOUNS.iter().map(|word| word.len()).collect();
         assert!(lengths.len() >= 8, "всего {lengths:?}");
+    }
+
+    #[test]
+    fn percent_mode_adds_share_of_the_input() {
+        let plan = PumpPlan::new(
+            Method::Padding,
+            AnimationFormat::Gif,
+            None,
+            TargetMode::Percent,
+            &[50.0],
+        )
+        .unwrap();
+        assert_eq!(plan.target_for(0, 1000), 1500);
+        assert_eq!(plan.target_for(3, 1000), 1500);
+        assert_eq!(plan.target_for(0, 0), 0);
+
+        let plan = PumpPlan::new(
+            Method::Padding,
+            AnimationFormat::Gif,
+            None,
+            TargetMode::Percent,
+            &[200.0, 10.0],
+        )
+        .unwrap();
+        assert_eq!(plan.target_for(0, 1000), 3000);
+        assert_eq!(plan.target_for(1, 1000), 1100);
+        assert!(plan.ensure_sizes_match(2).is_ok());
+        assert!(plan.ensure_sizes_match(5).is_err());
+    }
+
+    #[test]
+    fn percent_mode_is_rejected_for_generate() {
+        // Генерация не знает исходного размера: процент там не имеет смысла,
+        // но CLI обязан это объяснить, а не молча сделать 0 байт.
+        let plan = PumpPlan::new(
+            Method::Padding,
+            AnimationFormat::Gif,
+            None,
+            TargetMode::Percent,
+            &[10.0],
+        )
+        .unwrap();
+        assert_eq!(plan.mode, TargetMode::Percent);
+        assert!(plan.targets.is_empty());
+        assert_eq!(plan.percents, vec![10.0]);
     }
 
     #[test]

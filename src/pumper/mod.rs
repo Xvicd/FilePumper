@@ -3,6 +3,7 @@
 pub mod animation;
 pub mod documents;
 pub mod generate;
+pub mod media;
 pub mod noise;
 pub mod office;
 pub mod padding;
@@ -41,7 +42,9 @@ impl Method {
             Method::PngChunks => "Приватные PNG-чанки до нужного размера",
             Method::Upscale => "Увеличение изображения + случайные младшие биты",
             Method::Svg => "SVG со встроенным изображением и невидимыми элементами",
-            Method::OfficePdf => "Office/ZIP и PDF; прочие файлы — добавление заполнения",
+            Method::OfficePdf => {
+                "Office/ZIP, PDF и медиа (MP3, FLAC, MP4); прочие — заполнение в конец"
+            }
             Method::Padding => "Копия файла со случайным заполнением в конце",
         }
     }

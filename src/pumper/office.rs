@@ -16,6 +16,7 @@ use std::path::Path;
 use zip::ZipArchive;
 use zip::ZipWriter;
 
+use crate::pumper::media;
 use crate::pumper::padding::append_random_padding;
 use crate::util::{random_bytes, write_random_stream, Job, IO_CHUNK};
 
@@ -78,6 +79,20 @@ pub fn run(input: &Path, output: &Path, target: u64, job: &Job<'_>) -> Result<()
             }
             return pad_zip_to_target(output, target, job);
         }
+    }
+
+    // Медиа-контейнеры: заполнение встаёт внутрь формата (ID3v2, FLAC PADDING,
+    // MP4 free-бокс), а не хвостом после файла.
+    match media::detect(input) {
+        Ok(Some(kind)) => {
+            job.report(
+                5.0,
+                &format!("Добавление заполнения в контейнер {}...", kind.title()),
+            );
+            return media::run(kind, input, output, target, job);
+        }
+        Ok(None) => {}
+        Err(err) => return Err(err.to_string()),
     }
 
     if extension == "pdf" {

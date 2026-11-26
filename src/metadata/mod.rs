@@ -9,8 +9,10 @@
 //! Одна и та же обходная логика используется и для очистки, и для обзора
 //! «что найдено»: обзор просто пишет результат в счётчик вместо файла.
 
+mod flac;
 mod gif;
 mod jpeg;
+mod mp3;
 mod opc;
 mod pdf;
 mod png;
@@ -36,6 +38,10 @@ pub enum Kind {
     /// Пакет OPC: `docx`, `xlsx`, `pptx` и родственные.
     Opc,
     Pdf,
+    /// MP3-аудио: ID3v2 в начале, ID3v1 и APE в конце.
+    Mp3,
+    /// FLAC-аудио: комментарии Vorbis и картинки в блоках метаданных.
+    Flac,
 }
 
 impl Kind {
@@ -58,6 +64,8 @@ impl Kind {
             Kind::Svg => "SVG",
             Kind::Opc => "пакет Office",
             Kind::Pdf => "PDF",
+            Kind::Mp3 => "MP3",
+            Kind::Flac => "FLAC",
         }
     }
 }
@@ -229,11 +237,17 @@ fn detect_head(path: &Path, head: &[u8]) -> Result<Kind, String> {
     if head.starts_with(b"%PDF") {
         return Ok(Kind::Pdf);
     }
+    if head.starts_with(b"ID3") || (head.len() >= 2 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0) {
+        return Ok(Kind::Mp3);
+    }
+    if head.starts_with(b"fLaC") {
+        return Ok(Kind::Flac);
+    }
     if head.starts_with(b"PK\x03\x04") {
         return if opc::is_package(path) {
             Ok(Kind::Opc)
         } else {
-            Err("Обычный ZIP-архив метаданных не содержит: поддержаны PNG, JPEG, GIF, WebP, SVG, docx/xlsx/pptx и PDF.".to_owned())
+            Err("Обычный ZIP-архив метаданных не содержит: поддержаны PNG, JPEG, GIF, WebP, SVG, docx/xlsx/pptx, PDF, MP3 и FLAC.".to_owned())
         };
     }
     if svg::looks_like_svg(path, head) {
@@ -299,6 +313,8 @@ fn walk(
         Kind::Svg => svg::clean(input, output, options, report, job),
         Kind::Opc => opc::clean(input, output, options, report, job),
         Kind::Pdf => pdf::clean(input, output, options, report, job),
+        Kind::Mp3 => mp3::clean(input, output, options, report, job),
+        Kind::Flac => flac::clean(input, output, options, report, job),
     }
 }
 

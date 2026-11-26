@@ -2596,8 +2596,16 @@ impl PumperApp {
                 !self.busy,
                 egui::TextEdit::singleline(&mut self.target_mb).desired_width(80.0),
             )
-            .on_hover_text("В мегабайтах; дробная часть — через точку или запятую: 1.5 или 1,5");
-            ui.label("МБ");
+            .on_hover_text(if self.size_mode == TargetMode::Percent {
+                "В процентах: 50 — прибавить половину исходного размера"
+            } else {
+                "В мегабайтах; дробная часть — через точку или запятую: 1.5 или 1,5"
+            });
+            ui.label(if self.size_mode == TargetMode::Percent {
+                "%"
+            } else {
+                "МБ"
+            });
             ui.separator();
             ui.label("считать как:");
             egui::ComboBox::from_id_salt("size_mode")
@@ -2608,6 +2616,9 @@ impl PumperApp {
                     }
                 });
         });
+        if self.size_mode == TargetMode::Percent {
+            ui.weak("Процент считается от размера исходного файла: 50 — прибавить половину.");
+        }
         ui.horizontal_wrapped(|ui| {
             ui.weak("Быстро:");
             for mb in [2_u64, 5, 10, 20, 50, 100] {

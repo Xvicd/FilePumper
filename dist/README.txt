@@ -1,4 +1,4 @@
-FilePumper 0.6.1 — готовые сборки
+FilePumper 0.6.2 — готовые сборки
 ===========================================
 
 windows\
@@ -37,6 +37,12 @@ windows\
   --json (машинный вывод), --password-file ФАЙЛ, --password-stdin и --jobs 0
   (число потоков по числу ядер). Пары можно сопоставлять по именам:
   --pair-by name (photo.png ← photo.zip, report.pdf ← report.mp3).
+
+  Метод --method office работает и с медиа: MP3 получает padding внутри
+  ID3v2-тега, FLAC — блок PADDING, MP4/MOV — free-бокс.
+
+  Режим размера --size-mode percent прибавляет N процентов к исходному файлу:
+  --size 50 --size-mode percent.
 
   Разброс размера: --vary 5 делает размер случайным в пределах ±5 МБ
   (--size 400 --vary 5 → файл на 395…405 МБ). Направление задаёт
