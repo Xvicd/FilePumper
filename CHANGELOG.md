@@ -3,7 +3,7 @@
 Все заметные изменения проекта. Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 версии — [Semantic Versioning](https://semver.org/lang/ru/).
 
-## [Не выпущено]
+## [0.6.3] — 2026-11-27
 
 Следующая версия: нагрузка внутри DOCX/PDF, `extract --only`, более глубокая
 очистка метаданных PDF, DOCX и MP4, а также очистка MP3/FLAC/MP4.
@@ -711,12 +711,13 @@ drag & drop.
 - Графическая сборка на Windows больше не открывает окно консоли рядом с окном
   приложения.
 
+[0.6.3]: https://github.com/Xvicd/FilePumper/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/Xvicd/FilePumper/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Xvicd/FilePumper/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Xvicd/FilePumper/compare/v0.5.9...v0.6.0
 [0.5.9]: https://github.com/Xvicd/FilePumper/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/Xvicd/FilePumper/compare/v0.5.7...v0.5.8
-[Не выпущено]: https://github.com/Xvicd/FilePumper/compare/v0.6.2...HEAD
+[Не выпущено]: https://github.com/Xvicd/FilePumper/compare/v0.6.3...HEAD
 [0.4.0]: https://github.com/Xvicd/FilePumper/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Xvicd/FilePumper/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Xvicd/FilePumper/releases/tag/v0.2.0
