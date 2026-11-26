@@ -170,6 +170,62 @@ pub fn with_payload_extension(destination: &Path, payload_name: &str) -> PathBuf
     destination.with_file_name(format!("{stem}.{extension}"))
 }
 
+/// Итог проверки «переживёт ли нагрузка перекодирование».
+#[derive(Clone, Debug)]
+pub struct RecompressReport {
+    pub carrier: Carrier,
+    /// Применима ли проверка к этому типу носителя.
+    pub applicable: bool,
+    /// Уцелела ли нагрузка после перекодирования.
+    pub survives: bool,
+    pub note: String,
+}
+
+/// Перекодирует носитель так, как это делают мессенджеры, и проверяет нагрузку.
+///
+/// Картинки пересобираются тем же форматом: приватные чанки PNG, сегменты
+/// APP15 JPEG и комментарии GIF при этом теряются. Для форматов, которые
+/// серверы обычно не перекодируют (SVG, Office, PDF, обычные файлы), проверка
+/// считается неприменимой.
+pub fn recompress_check(
+    carrier: &Path,
+    password: Option<&str>,
+) -> Result<RecompressReport, String> {
+    let kind = detect_carrier(carrier)?;
+    let (format, extension) = match kind {
+        Carrier::Png => (image::ImageFormat::Png, "png"),
+        Carrier::Jpeg => (image::ImageFormat::Jpeg, "jpg"),
+        Carrier::Gif => (image::ImageFormat::Gif, "gif"),
+        other => {
+            return Ok(RecompressReport {
+                carrier: other,
+                applicable: false,
+                survives: true,
+                note: "такие файлы серверы обычно не перекодируют — нагрузка переживёт".to_owned(),
+            })
+        }
+    };
+    let picture =
+        image::open(carrier).map_err(|err| format!("Не удалось открыть картинку: {err}"))?;
+    let directory = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let target = directory.path().join(format!("recompressed.{extension}"));
+    picture
+        .save_with_format(&target, format)
+        .map_err(|err| format!("Не удалось перекодировать картинку: {err}"))?;
+    let survives = extract_payload(&target, password).is_ok();
+    let note = if survives {
+        "нагрузка уцелела после перекодирования".to_owned()
+    } else {
+        "перекодирование теряет данные: приватные чанки и сегменты не сохраняются".to_owned()
+    };
+    Ok(RecompressReport {
+        carrier: kind,
+        applicable: true,
+        survives,
+        note,
+    })
+}
+
 /// Встраивает файл в носитель, повторяя контейнер `copies` раз и проверяя результат.
 pub fn embed_file(
     carrier: &Path,
@@ -349,7 +405,8 @@ pub fn embed_bytes(
     job.report(92.0, "Проверка записанного файла...");
     let written_len = fs::metadata(output).map_err(|err| err.to_string())?.len();
     let stack_back = read_stack(output, kind)?;
-    let (_parsed, found) = format::pick_container(&stack_back, options.password())?;
+    let material = options.material();
+    let (_parsed, found) = format::pick_container(&stack_back, material.as_deref())?;
     // У обычных файлов читается окно хвоста (64 МБ), поэтому гигантские копии
     // может увидеть только путь по концевому маркеру — для них достаточно одной.
     let required = if kind == Carrier::Raw && stack_back.len() as u64 == written_len {
@@ -542,6 +599,78 @@ pub fn extract_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_png(dir: &Path) -> PathBuf {
+        let carrier = dir.join("photo.png");
+        image::RgbImage::from_fn(16, 16, |x, y| image::Rgb([x as u8 * 8, y as u8 * 8, 40]))
+            .save(&carrier)
+            .unwrap();
+        carrier
+    }
+
+    #[test]
+    fn keyfile_changes_the_key_and_is_required_to_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let carrier = sample_png(dir.path());
+        let output = dir.path().join("hidden.png");
+        let options = ContainerOptions {
+            compress: false,
+            password: Some("pw".to_owned()),
+            keyfile: Some(b"key material".to_vec()),
+            bundle: false,
+        };
+        embed_bytes(
+            &carrier,
+            b"secret with keyfile",
+            "secret.txt",
+            &output,
+            &options,
+            1,
+            &Job::quiet(),
+        )
+        .unwrap();
+
+        let material = options.material().unwrap();
+        assert!(material.contains('\u{1}'));
+        let (parsed, _, _) = extract_payload(&output, Some(&material)).unwrap();
+        assert_eq!(parsed.payload, b"secret with keyfile");
+
+        // Без ключ-файла или с другим — ошибка.
+        assert!(extract_payload(&output, Some("pw")).is_err());
+        let wrong = format::password_material(Some("pw"), Some(b"other key")).unwrap();
+        assert!(extract_payload(&output, Some(&wrong)).is_err());
+
+        // Тот же пароль и ключ-файл — снова работает.
+        let same = format::password_material(Some("pw"), Some(b"key material")).unwrap();
+        assert_eq!(same, material);
+    }
+
+    #[test]
+    fn recompression_loses_image_payloads_but_not_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let carrier = sample_png(dir.path());
+        let output = dir.path().join("hidden.png");
+        embed_bytes(
+            &carrier,
+            b"not surviving",
+            "secret.txt",
+            &output,
+            &ContainerOptions::default(),
+            1,
+            &Job::quiet(),
+        )
+        .unwrap();
+        let report = recompress_check(&output, None).unwrap();
+        assert!(report.applicable);
+        assert!(!report.survives, "{report:?}");
+
+        // Для форматов, которые не перекодируют, проверка неприменима.
+        let raw = dir.path().join("plain.bin");
+        fs::write(&raw, b"abc").unwrap();
+        let report = recompress_check(&raw, None).unwrap();
+        assert!(!report.applicable);
+        assert!(report.survives);
+    }
 
     #[test]
     fn payload_extension_is_restored_when_name_has_none() {

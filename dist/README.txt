@@ -30,6 +30,8 @@ windows\
     FilePumper-cli.exe extract <носитель>... [--out-dir ПАПКА] [--password ПАРОЛЬ]
     FilePumper-cli.exe inspect <носитель>... [--json]
     FilePumper-cli.exe verify <носитель>... [--json]
+    FilePumper-cli.exe share <файл> --parts N --threshold K [--out-dir ПАПКА]
+    FilePumper-cli.exe join <часть> <часть> ... [--output ФАЙЛ]
     FilePumper-cli.exe clean <файл>... [--out-dir ПАПКА] [--output ФАЙЛ]
                         [--suffix _clean] [--profiles] [--dry-run] [--json]
 
@@ -37,6 +39,13 @@ windows\
   --json (машинный вывод), --password-file ФАЙЛ, --password-stdin и --jobs 0
   (число потоков по числу ядер). Пары можно сопоставлять по именам:
   --pair-by name (photo.png ← photo.zip, report.pdf ← report.mp3).
+
+  Схема Шамира: share делит файл на части (любые --threshold из --parts
+  восстанавливают исходник), join собирает обратно. Части — обычные файлы
+  <имя>.share1, <имя>.share2, ...
+
+  Ключ-файл: --keyfile ФАЙЛ подмешивается к паролю при выводе ключа
+  (embed/extract/verify). Проверка перекодирования: inspect --recompress.
 
   Метод --method office работает и с медиа: MP3 получает padding внутри
   ID3v2-тега, FLAC — блок PADDING, MP4/MOV — free-бокс.

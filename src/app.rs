@@ -178,6 +178,12 @@ struct Settings {
     out_dir: Option<PathBuf>,
     embed_compress: bool,
     embed_copies: usize,
+    /// Ключ-файл для шифрования и извлечения нагрузки.
+    embed_keyfile: Option<PathBuf>,
+    /// Сколько частей создавать при делении секрета (схема Шамира).
+    share_parts: u8,
+    /// Сколько частей нужно для сборки.
+    share_threshold: u8,
     names: usize,
     random_style: usize,
     random_length: usize,
@@ -223,12 +229,15 @@ impl Default for Settings {
             out_dir: None,
             embed_compress: false,
             embed_copies: 1,
+            embed_keyfile: None,
             names: 0,
             random_style: 0,
             random_length: batch::DEFAULT_RANDOM_LENGTH,
             random_length_max: 0,
             random_alphabet: batch::DEFAULT_ALPHABET.to_owned(),
             tab: 0,
+            share_parts: 3,
+            share_threshold: 2,
             gen_kinds: vec![generated_kind_index(GeneratedKind::default())],
             gen_mix: 0,
             gen_base: "file".to_owned(),
@@ -301,6 +310,11 @@ pub struct PumperApp {
     payloads: Vec<PathBuf>,
     embed_compress: bool,
     embed_password: String,
+    embed_keyfile: Option<PathBuf>,
+    share_file: Option<PathBuf>,
+    share_parts: u8,
+    share_threshold: u8,
+    share_status: String,
     embed_copies: usize,
     names: NameMode,
     random_style: RandomStyle,
@@ -370,6 +384,11 @@ impl Default for PumperApp {
             payloads: Vec::new(),
             embed_compress: false,
             embed_password: String::new(),
+            embed_keyfile: None,
+            share_file: None,
+            share_parts: 3,
+            share_threshold: 2,
+            share_status: String::new(),
             embed_copies: 1,
             names: NameMode::Size,
             random_style: RandomStyle::default(),
@@ -438,6 +457,9 @@ impl PumperApp {
                 .unwrap_or(0),
             out_dir: self.out_dir.clone(),
             embed_compress: self.embed_compress,
+            embed_keyfile: self.embed_keyfile.clone(),
+            share_parts: self.share_parts,
+            share_threshold: self.share_threshold,
             embed_copies: self.embed_copies,
             names: NameMode::ALL
                 .iter()
@@ -495,6 +517,9 @@ impl PumperApp {
             .unwrap_or_default();
         self.out_dir = settings.out_dir;
         self.embed_compress = settings.embed_compress;
+        self.embed_keyfile = settings.embed_keyfile.clone();
+        self.share_parts = settings.share_parts.clamp(2, 255);
+        self.share_threshold = settings.share_threshold.clamp(1, self.share_parts);
         self.embed_copies = settings.embed_copies.clamp(1, 3);
         self.names = NameMode::ALL
             .get(settings.names)
@@ -1103,6 +1128,7 @@ impl PumperApp {
         let options = ContainerOptions {
             compress: self.embed_compress,
             password: password_or_none(&self.embed_password),
+            keyfile: self.keyfile_bytes(),
             bundle: false,
         };
         let copies = self.embed_copies.clamp(1, 3);
@@ -1296,6 +1322,7 @@ impl PumperApp {
         let options = ContainerOptions {
             compress: self.embed_compress,
             password: password_or_none(&self.embed_password),
+            keyfile: self.keyfile_bytes(),
             bundle: false,
         };
         let copies = self.embed_copies.clamp(1, 3);
@@ -1549,6 +1576,7 @@ impl PumperApp {
         let base_options = ContainerOptions {
             compress: self.embed_compress,
             password: password_or_none(&self.embed_password),
+            keyfile: self.keyfile_bytes(),
             bundle: false,
         };
         let copies = self.embed_copies.clamp(1, 3);
@@ -1623,11 +1651,22 @@ impl PumperApp {
 
     /// Пароли для проверки и извлечения: несколько можно перечислить через запятую.
     fn extract_passwords(&self) -> Vec<String> {
+        let keyfile = self.keyfile_bytes();
         self.extract_password
             .split([',', ';'])
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .map(|value| {
+                crate::payload::format::password_material(Some(&value), keyfile.as_deref())
+                    .unwrap_or(value)
+            })
             .collect()
+    }
+
+    /// Содержимое выбранного ключ-файла (если он есть и читается).
+    fn keyfile_bytes(&self) -> Option<Vec<u8>> {
+        let path = self.embed_keyfile.as_deref()?;
+        std::fs::read(path).ok().filter(|bytes| !bytes.is_empty())
     }
 
     /// Проверяет все выбранные носители и показывает, что в них спрятано.
@@ -2936,6 +2975,37 @@ impl PumperApp {
                     );
                 });
                 password_strength_ui(ui, &self.embed_password);
+                ui.horizontal(|ui| {
+                    ui.label("Ключ-файл (необязательно):");
+                    match self.embed_keyfile.as_deref() {
+                        Some(path) => {
+                            ui.monospace(
+                                path.file_name()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or("файл"),
+                            )
+                            .on_hover_text(path.display().to_string());
+                        }
+                        None => {
+                            ui.weak("не выбран");
+                        }
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Выбрать…").small())
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.embed_keyfile = Some(path);
+                        }
+                    }
+                    if self.embed_keyfile.is_some()
+                        && ui
+                            .add_enabled(!self.busy, egui::Button::new("Сбросить").small())
+                            .clicked()
+                    {
+                        self.embed_keyfile = None;
+                    }
+                });
             },
         ));
         paint_drop_zones(ui, self.carrier_drop_rect, self.payload_drop_rect);
@@ -2947,6 +3017,66 @@ impl PumperApp {
         group_ui(ui, "4. Имена файлов результата", |ui| {
             self.names_ui(ui)
         });
+        group_ui(
+            ui,
+            "5. Разделить секрет на части",
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    match self.share_file.as_deref() {
+                        Some(path) => {
+                            ui.monospace(
+                                path.file_name()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or("файл"),
+                            )
+                            .on_hover_text(path.display().to_string());
+                        }
+                        None => {
+                            ui.weak("файл не выбран");
+                        }
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Выбрать…").small())
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.share_file = Some(path);
+                        }
+                    }
+                    ui.label("частей:");
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.share_parts).range(2..=255),
+                    );
+                    ui.label("нужно:");
+                    ui.add_enabled(
+                        !self.busy,
+                        egui::DragValue::new(&mut self.share_threshold).range(1..=self.share_parts),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.busy && self.share_file.is_some(),
+                            egui::Button::new("Разделить"),
+                        )
+                        .clicked()
+                    {
+                        self.share_selected();
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Собрать…"))
+                        .clicked()
+                    {
+                        self.join_shares();
+                    }
+                });
+                if !self.share_status.is_empty() {
+                    ui.weak(&self.share_status);
+                }
+                ui.weak(
+                "Любые «нужно» частей восстанавливают файл; меньше — не дают ничего. Части — обычные файлы .share1, .share2, …",
+            );
+            },
+        );
         ui.horizontal_wrapped(|ui| {
             let can_embed = !self.busy && !self.carriers.is_empty() && !self.payloads.is_empty();
             if action_button(ui, can_embed, "Спрятать файл") {
@@ -2969,10 +3099,144 @@ impl PumperApp {
         );
     }
 
+    /// Делит выбранный файл на части по схеме Шамира.
+    fn share_selected(&mut self) {
+        let Some(path) = self.share_file.clone() else {
+            self.share_status = "Выберите файл.".to_owned();
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.share_status = format!("Не удалось прочитать {}: {err}", path.display());
+                return;
+            }
+        };
+        match crate::share::split(&bytes, self.share_threshold, self.share_parts) {
+            Ok(shares) => {
+                let mut written = 0_usize;
+                for (index, share) in shares.iter().enumerate() {
+                    let packed = match crate::share::pack_share(
+                        share,
+                        self.share_threshold,
+                        self.share_parts,
+                    ) {
+                        Ok(packed) => packed,
+                        Err(err) => {
+                            self.share_status = err;
+                            return;
+                        }
+                    };
+                    let target = crate::util::unique_path(&crate::share::share_path(
+                        &path,
+                        (index + 1) as u8,
+                    ));
+                    if std::fs::write(&target, packed).is_ok() {
+                        written += 1;
+                    }
+                }
+                self.share_status = format!(
+                    "Готово: {written} частей, для сборки нужно {}.",
+                    self.share_threshold
+                );
+            }
+            Err(err) => self.share_status = err,
+        }
+    }
+
+    /// Собирает файл из выбранных частей.
+    fn join_shares(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter(
+                "части FilePumper",
+                &["share1", "share2", "share3", "share4", "share5"],
+            )
+            .pick_files()
+        else {
+            return;
+        };
+        let mut shares = Vec::new();
+        for path in &paths {
+            match std::fs::read(path) {
+                Ok(bytes) => shares.push(bytes),
+                Err(err) => {
+                    self.share_status = format!("Не удалось прочитать {}: {err}", path.display());
+                    return;
+                }
+            }
+        }
+        match crate::share::combine(&shares) {
+            Ok(secret) => {
+                let first = paths.first().cloned().unwrap_or_default();
+                let name = first
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("secret");
+                let base = match name.rfind(".share") {
+                    Some(position) => &name[..position],
+                    None => name,
+                };
+                let directory = first
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let output = crate::util::unique_path(&directory.join(base));
+                match std::fs::write(&output, &secret) {
+                    Ok(()) => {
+                        self.share_status =
+                            format!("Готово: {} ({} байт).", output.display(), secret.len());
+                    }
+                    Err(err) => {
+                        self.share_status = format!("Не удалось записать: {err}");
+                    }
+                }
+            }
+            Err(err) => self.share_status = err,
+        }
+    }
+
     /// Отчёт «Проверить все»: что нашлось в каждом носителе.
     fn scan_ui(&mut self, ui: &mut egui::Ui) {
         if self.scan.is_empty() {
             return;
+        }
+        if ui
+            .add_enabled(
+                !self.busy,
+                egui::Button::new("Проверить перекодирование").small(),
+            )
+            .on_hover_text("Пересобрать картинки тем же форматом и проверить, уцелеет ли нагрузка")
+            .clicked()
+        {
+            let mut lines = Vec::new();
+            for item in &self.scan {
+                if !item.is_found() {
+                    continue;
+                }
+                let name = item
+                    .path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("файл");
+                match payload::recompress_check(&item.path, None) {
+                    Ok(report) => {
+                        let verdict = if !report.applicable {
+                            "не применимо"
+                        } else if report.survives {
+                            "переживёт"
+                        } else {
+                            "не переживёт"
+                        };
+                        lines.push(format!("{name}: {verdict}"));
+                    }
+                    Err(error) => lines.push(format!("{name}: ошибка ({error})")),
+                }
+            }
+            self.status = if lines.is_empty() {
+                "Сначала проверьте файлы.".to_owned()
+            } else {
+                format!("Перекодирование — {}", lines.join("; "))
+            };
         }
         ui.add_space(4.0);
         ui.label(egui::RichText::new(payload::group::scan_summary(&self.scan)).strong());

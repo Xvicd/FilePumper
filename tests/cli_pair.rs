@@ -185,6 +185,7 @@ fn group_extract_tries_every_given_password() {
             &payload::ContainerOptions {
                 compress: false,
                 password: Some(password.to_owned()),
+                keyfile: None,
                 bundle: false,
             },
             1,

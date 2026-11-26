@@ -40,6 +40,7 @@ fn build_and_parse_roundtrip_with_all_flags() {
     let options = ContainerOptions {
         compress: true,
         password: Some("pw".to_owned()),
+        keyfile: None,
         bundle: false,
     };
     let secure = build_container(&bytes, "file.bin", &options, &Job::quiet()).unwrap();

@@ -17,9 +17,10 @@ use crate::payload::{self, ContainerOptions};
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::report;
 use crate::scan;
+use crate::share;
 use crate::util::{
-    format_bytes, format_duration, format_speed, CancelToken, Job, Reservations, CANCELLED_MESSAGE,
-    GIB, MIB,
+    format_bytes, format_duration, format_speed, unique_path, CancelToken, Job, Reservations,
+    CANCELLED_MESSAGE, GIB, MIB,
 };
 
 /// Обычная строка результата: в quiet/json-режиме её не печатаем.
@@ -189,13 +190,16 @@ FilePumper
 
 Извлечь файлы из картинки (можно несколько носителей):
   file-pumper-cli extract <носитель>... [--out-dir ПАПКА] [--output ФАЙЛ]
-                                   [--password ПАРОЛЬ]
+                                   [--password ПАРОЛЬ] [--keyfile ФАЙЛ]
                                    [--only ИМЯ]
                                    [--quiet] [--no-progress] [--json]
   Извлечённый файл сохраняет расширение из имени нагрузки, поэтому система
   знает, чем его открывать. Бандл распаковывается в папку по одному файлу.
   Файлы без нагрузки в пакете не считаются ошибкой: в отчёте видно, что
   можно извлечь и из какого файла. Код выхода 1 — только при реальных ошибках.
+  --recompress проверяет, переживёт ли нагрузка перекодирование картинки
+           (пересборка тем же форматом теряет приватные чанки и сегменты).
+
   --password можно повторять: пароли перебираются по порядку, поэтому пачка
   файлов с разными паролями извлекается одной командой.
 
@@ -225,6 +229,14 @@ FilePumper
   без профиля цвета на широком охвате могут отличаться.
   --dry-run только показывает, что нашлось.
 
+Разделить секрет на части и собрать обратно (схема Шамира):
+  file-pumper-cli share <файл> --parts N --threshold K [--out-dir ПАПКА]
+  file-pumper-cli join <часть> <часть> ... [--output ФАЙЛ] [--out-dir ПАПКА]
+  --parts N      на сколько частей делить (2..255, по умолчанию 3)
+  --threshold K  сколько частей нужно для сборки (1..N, по умолчанию 2)
+  Части — обычные файлы <имя>.share1, <имя>.share2, ...: любые K из них
+  восстанавливают исходник, меньше K — не дают ничего.
+
 Дополнения для shell:
   file-pumper-cli completions bash|zsh|fish|powershell
 
@@ -238,6 +250,8 @@ FilePumper
   --json         машинный вывод в JSON (прогресс и человеческий текст отключены)
   --password-file ФАЙЛ   пароль из файла; можно повторять, по паролю на строку
   --password-stdin       прочитать пароль из stdin (не попадёт в историю shell)
+  --keyfile ФАЙЛ         ключ-файл: подмешивается к паролю при выводе ключа
+                         (Argon2id), поэтому без него нагрузка не расшифруется
   --jobs 0       автоматически выбрать число потоков по числу ядер
 
 Те же команды принимает и графическая сборка, но у неё нет консоли:
@@ -300,6 +314,14 @@ struct Flags {
     clean_suffix: String,
     /// Извлекать из бандла только одну запись с этим именем.
     extract_only: Option<String>,
+    /// Содержимое ключ-файла: вместе с паролем выводит ключ шифрования.
+    keyfile: Option<Vec<u8>>,
+    /// На сколько частей делить секрет (`share`).
+    parts: u8,
+    /// Сколько частей нужно для сборки (`share`).
+    threshold: u8,
+    /// Проверить, переживёт ли нагрузка перекодирование (`inspect`).
+    recompress: bool,
     generated: Vec<GeneratedKind>,
     mix: MixMode,
     base_name: String,
@@ -428,6 +450,10 @@ impl Flags {
             clean_profiles: false,
             clean_suffix: "_clean".to_owned(),
             extract_only: None,
+            keyfile: None,
+            parts: 3,
+            threshold: 2,
+            recompress: false,
             generated: Vec::new(),
             mix: MixMode::default(),
             base_name: "file".to_owned(),
@@ -558,6 +584,33 @@ impl Flags {
                 "--verify" => flags.verify = true,
                 "--only" | "--entry" => {
                     flags.extract_only = Some(next("--only", &mut iterator)?);
+                }
+                "--recompress" | "--survive" => flags.recompress = true,
+                "--parts" | "--shares" => {
+                    let raw = next("--parts", &mut iterator)?;
+                    flags.parts = raw
+                        .parse::<u8>()
+                        .map_err(|_| format!("Частей должно быть числом от 2 до 255: {raw}"))?;
+                }
+                "--threshold" | "--need" => {
+                    let raw = next("--threshold", &mut iterator)?;
+                    flags.threshold = raw
+                        .parse::<u8>()
+                        .map_err(|_| format!("Порог должен быть числом от 1 до 255: {raw}"))?;
+                }
+                "--keyfile" | "--key" => {
+                    let raw = next("--keyfile", &mut iterator)?;
+                    let path = std::path::PathBuf::from(&raw);
+                    let bytes = std::fs::read(&path).map_err(|err| {
+                        format!("Не удалось открыть ключ-файл {}: {err}", path.display())
+                    })?;
+                    if bytes.is_empty() {
+                        return Err(format!(
+                            "Ключ-файл {} пуст: нужен любой файл ненулевого размера.",
+                            path.display()
+                        ));
+                    }
+                    flags.keyfile = Some(bytes);
                 }
                 "--profiles" | "--remove-profiles" => flags.clean_profiles = true,
                 "--suffix" => {
@@ -710,20 +763,27 @@ impl Flags {
                 .as_ref()
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
+            keyfile: self.keyfile.clone(),
             bundle: false,
         }
     }
 
     fn password(&self) -> Option<String> {
-        self.options().password
+        self.options().material()
     }
 
     /// Все пароли для перебора: `--password` можно повторять.
+    ///
+    /// Ключ-файл подмешивается к каждому кандидату: без него ключ другой.
     fn password_candidates(&self) -> Vec<String> {
         self.passwords
             .iter()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+            .map(|value| {
+                crate::payload::format::password_material(Some(&value), self.keyfile.as_deref())
+                    .unwrap_or(value)
+            })
             .collect()
     }
 
@@ -847,6 +907,8 @@ pub fn execute(args: &[String]) -> Result<(), String> {
         "inspect" => command_inspect(&flags),
         "verify" => command_verify(&flags),
         "clean" | "metadata" | "strip-meta" => command_clean(&flags),
+        "share" | "split" => command_share(&flags),
+        "join" | "combine" => command_join(&flags),
         other => Err(format!("Неизвестная команда: {other}. Используйте --help.")),
     }
 }
@@ -1887,6 +1949,7 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
         eprintln!();
     }
     let multiple = carriers.len() > 1;
+    let mut recompress_reports: Vec<Value> = Vec::new();
     for item in &items {
         if multiple {
             say!(flags, "=== {} ===", item.path.display());
@@ -1941,6 +2004,29 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
                     "Устойчивость к загрузке: {}",
                     summary.carrier.survives_upload()
                 );
+                if flags.recompress {
+                    match payload::recompress_check(&item.path, None) {
+                        Ok(report) => {
+                            let verdict = if !report.applicable {
+                                "не применимо"
+                            } else if report.survives {
+                                "переживёт"
+                            } else {
+                                "не переживёт"
+                            };
+                            say!(flags, "Перекодирование: {verdict} — {}", report.note);
+                            recompress_reports.push(json!({
+                                "path": item.path,
+                                "applicable": report.applicable,
+                                "survives": report.survives,
+                                "note": report.note,
+                            }));
+                        }
+                        Err(error) => {
+                            say!(flags, "Перекодирование: проверить не удалось — {error}");
+                        }
+                    }
+                }
             }
             payload::group::ScanResult::Empty => {
                 say!(
@@ -1969,7 +2055,11 @@ fn command_inspect(flags: &Flags) -> Result<(), String> {
         .filter(|item| matches!(item.result, payload::group::ScanResult::Error(_)))
         .count();
     if flags.json {
-        print_json(&scan_items_json(&items));
+        let mut value = scan_items_json(&items);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("recompress".to_owned(), Value::Array(recompress_reports));
+        }
+        print_json(&value);
     }
     if failed > 0 {
         return Err(format!(
@@ -2050,6 +2140,130 @@ fn command_verify(flags: &Flags) -> Result<(), String> {
             "Проверка не прошла для {failed} из {} файлов.",
             carriers.len()
         ));
+    }
+    Ok(())
+}
+
+/// Делит файл на части по схеме Шамира.
+fn command_share(flags: &Flags) -> Result<(), String> {
+    let inputs = flags.inputs()?;
+    if inputs.len() != 1 {
+        return Err("Укажите ровно один файл: share <файл> --parts 3 --threshold 2.".to_owned());
+    }
+    let source = &inputs[0];
+    let bytes = std::fs::read(source)
+        .map_err(|err| format!("Не удалось прочитать {}: {err}", source.display()))?;
+    if bytes.is_empty() {
+        return Err("Пустой файл делить не на что.".to_owned());
+    }
+    let total = flags.parts;
+    let threshold = flags.threshold;
+    let shares = share::split(&bytes, threshold, total)?;
+    let out_dir = match flags.out_dir.clone() {
+        Some(directory) => directory,
+        None => source
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|err| format!("Не удалось создать папку {}: {err}", out_dir.display()))?;
+    let mut written = Vec::new();
+    for (offset, data) in shares.iter().enumerate() {
+        let index = (offset + 1) as u8;
+        let packed = share::pack_share(data, threshold, total)?;
+        let candidate = share::share_path(source, index);
+        let name = candidate
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("share{index}")));
+        let path = unique_path(&out_dir.join(name));
+        std::fs::write(&path, &packed)
+            .map_err(|err| format!("Не удалось записать {}: {err}", path.display()))?;
+        written.push(path);
+    }
+    if flags.json {
+        print_json(&json!({
+            "ok": true,
+            "command": "share",
+            "source": source,
+            "parts": total,
+            "threshold": threshold,
+            "files": written,
+        }));
+    } else {
+        say!(
+            flags,
+            "Готово: {} → {} частей (нужно {} для сборки)",
+            source.display(),
+            total,
+            threshold
+        );
+        for path in &written {
+            say!(flags, "  {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Собирает файл из частей Шамира.
+fn command_join(flags: &Flags) -> Result<(), String> {
+    let inputs = flags.inputs()?;
+    if inputs.is_empty() {
+        return Err("Укажите файлы частей: join <часть> <часть> ...".to_owned());
+    }
+    let mut shares = Vec::with_capacity(inputs.len());
+    for path in &inputs {
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("Не удалось прочитать {}: {err}", path.display()))?;
+        shares.push(bytes);
+    }
+    let secret = share::combine(&shares)?;
+    let output = match flags.output.clone() {
+        Some(path) => path,
+        None => {
+            let first = &inputs[0];
+            let name = first
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("secret");
+            let base = match name.rfind(".share") {
+                Some(position) => &name[..position],
+                None => name,
+            };
+            let directory = flags
+                .out_dir
+                .clone()
+                .or_else(|| first.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            unique_path(&directory.join(base))
+        }
+    };
+    if let Some(directory) = output.parent() {
+        if !directory.as_os_str().is_empty() {
+            std::fs::create_dir_all(directory).map_err(|err| {
+                format!("Не удалось создать папку {}: {err}", directory.display())
+            })?;
+        }
+    }
+    std::fs::write(&output, &secret)
+        .map_err(|err| format!("Не удалось записать {}: {err}", output.display()))?;
+    if flags.json {
+        print_json(&json!({
+            "ok": true,
+            "command": "join",
+            "output": output,
+            "size": secret.len(),
+            "shares": shares.len(),
+        }));
+    } else {
+        say!(
+            flags,
+            "Готово: {} ({} байт из {} частей)",
+            output.display(),
+            secret.len(),
+            shares.len()
+        );
     }
     Ok(())
 }
@@ -2248,7 +2462,7 @@ fn command_clean(flags: &Flags) -> Result<(), String> {
 fn completion_script(shell: &str) -> Result<&'static str, String> {
     let script = match shell.trim().to_ascii_lowercase().as_str() {
         "bash" => {
-            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --noise --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --only --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
+            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --noise --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --only --pair-password --copies --compress --password --password-file --password-stdin --keyfile --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
 "#
         }
         "zsh" => {

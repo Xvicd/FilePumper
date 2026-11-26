@@ -13,10 +13,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use zip::write::SimpleFileOptions as FileOptions;
+use zip::CompressionMethod;
 use zip::ZipArchive;
 use zip::ZipWriter;
 
 use crate::pumper::media;
+use crate::pumper::padding;
 use crate::pumper::padding::append_random_padding;
 use crate::util::{random_bytes, write_random_stream, Job, IO_CHUNK};
 
@@ -68,11 +71,10 @@ pub fn run(input: &Path, output: &Path, target: u64, job: &Job<'_>) -> Result<()
                 }
             }
             if is_opc_package {
-                job.report(
-                    5.0,
-                    "Пересборка пакета Office с объявленной частью заполнения...",
-                );
-                rebuild_opc_package(&mut archive, output, job)?;
+                job.report(5.0, "Пересборка пакета Office...");
+                if smart_office_padding(&mut archive, output, target, job)? {
+                    return Ok(());
+                }
             } else {
                 job.report(10.0, "Добавление несжатой записи в ZIP-контейнер...");
                 fs::copy(input, output).map_err(|err| err.to_string())?;
@@ -125,6 +127,7 @@ fn rebuild_opc_package<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     output: &Path,
     job: &Job<'_>,
+    substitute: Option<(&str, &[u8])>,
 ) -> Result<(), String> {
     let content_types_index = archive
         .index_for_name(CONTENT_TYPES_PART)
@@ -172,6 +175,19 @@ fn rebuild_opc_package<R: Read + Seek>(
             job.report(50.0, "Замена прежней части заполнения...");
             continue;
         }
+        if let Some((target_name, bytes)) = substitute {
+            if name == target_name {
+                // Медиа-часть заменяем без сжатия: так её размер известен точно
+                // и документ выглядит как обычный файл с картинкой побольше.
+                job.report(60.0, "Рост медиа-части внутри документа...");
+                let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+                writer
+                    .start_file(name.as_str(), options)
+                    .map_err(|err| format!("Не удалось записать «{name}»: {err}"))?;
+                writer.write_all(bytes).map_err(|err| err.to_string())?;
+                continue;
+            }
+        }
         let entry = archive.by_index_raw(index).map_err(|err| err.to_string())?;
         writer
             .raw_copy_file(entry)
@@ -181,6 +197,114 @@ fn rebuild_opc_package<R: Read + Seek>(
         .finish()
         .map_err(|err| format!("Не удалось завершить ZIP: {err}"))?;
     Ok(())
+}
+
+/// Характеристики медиа-части пакета.
+struct MediaPart {
+    name: String,
+    /// Размер после распаковки.
+    uncompressed: u64,
+    /// Размер в архиве (сжатый).
+    compressed: u64,
+}
+
+/// Самая большая картинка пакета: в неё и уходит заполнение.
+fn largest_media_part<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<Option<MediaPart>, String> {
+    let mut best: Option<MediaPart> = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index).map_err(|err| err.to_string())?;
+        let name = entry.name().to_owned();
+        let lower = name.to_ascii_lowercase();
+        let extension = lower.rsplit('.').next().unwrap_or("");
+        let is_media = matches!(extension, "png" | "jpg" | "jpeg" | "gif" | "webp")
+            && (lower.contains("/media/") || lower.starts_with("media/"));
+        if !is_media {
+            continue;
+        }
+        let compressed = entry.compressed_size();
+        if best
+            .as_ref()
+            .is_none_or(|part| compressed > part.compressed)
+        {
+            best = Some(MediaPart {
+                name,
+                uncompressed: entry.size(),
+                compressed,
+            });
+        }
+    }
+    Ok(best)
+}
+
+/// Накачивает пакет: рост медиа-части, затем часть-заполнитель.
+///
+/// Возвращает `true`, если файл уже ровно целевого размера.
+fn smart_office_padding<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    output: &Path,
+    target: u64,
+    job: &Job<'_>,
+) -> Result<bool, String> {
+    rebuild_opc_package(archive, output, job, None)?;
+    let rebuilt = fs::metadata(output).map_err(|err| err.to_string())?.len();
+    if rebuilt == target {
+        return Ok(true);
+    }
+    if rebuilt > target {
+        return Ok(false);
+    }
+    let needed = target - rebuilt;
+    if let Some(part) = largest_media_part(archive)? {
+        // Хранение без сжатия уже даёт прирост; остальное — padding картинки.
+        let delta = part.uncompressed.saturating_sub(part.compressed);
+        if needed >= delta {
+            let extra = needed - delta;
+            if let Some(bytes) = pad_media_part(archive, &part.name, extra, job)? {
+                if rebuild_opc_package(archive, output, job, Some((&part.name, &bytes))).is_ok() {
+                    let size = fs::metadata(output).map_err(|err| err.to_string())?.len();
+                    if size == target {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    // Не получилось уложить всё в картинку — добиваем частью-заполнителем.
+    rebuild_opc_package(archive, output, job, None)?;
+    Ok(false)
+}
+
+/// Готовит медиа-часть с дополнительными байтами, сохраняя её валидной.
+fn pad_media_part<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+    extra: u64,
+    job: &Job<'_>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut data = Vec::new();
+    archive
+        .by_name(name)
+        .map_err(|err| format!("Не удалось прочитать «{name}»: {err}"))?
+        .read_to_end(&mut data)
+        .map_err(|err| err.to_string())?;
+    let directory = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let lower = name.to_ascii_lowercase();
+    let extension = lower.rsplit('.').next().unwrap_or("");
+    let path = directory.path().join(format!("part.{extension}"));
+    fs::write(&path, &data).map_err(|err| err.to_string())?;
+    let target = data.len() as u64 + extra;
+    let padded = match extension {
+        "png" => padding::append_png_padding(&path, target, job),
+        "gif" => padding::append_gif_comment_padding(&path, target, job),
+        "jpg" | "jpeg" | "webp" => padding::append_random_padding(&path, target, job),
+        _ => return Ok(None),
+    };
+    if padded.is_err() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read(&path).map_err(|err| err.to_string())?))
 }
 
 /// Добавляет в `[Content_Types].xml` объявление расширения заполнителя.
@@ -519,7 +643,7 @@ mod tests {
         "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
         "<Default Extension=\"rels\" ContentType=\"application/",
         "vnd.openxmlformats-package.relationships+xml\"/>",
-        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/><Default Extension=\"png\" ContentType=\"image/png\"/>",
         "<Override PartName=\"/word/document.xml\" ContentType=\"application/",
         "vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>",
         "</Types>"
@@ -577,7 +701,44 @@ mod tests {
     }
 
     #[test]
-    fn content_type_declaration_is_added_once() {
+    fn media_part_grows_instead_of_a_filler_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("report.docx");
+        let mut image = Vec::new();
+        image::RgbImage::from_fn(64, 64, |x, y| image::Rgb([x as u8 * 4, y as u8 * 4, 9]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut image),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        build_package(&input, &[("word/media/image1.png", image.as_slice())]);
+        let output = dir.path().join("pumped.docx");
+        let target = 128 * 1024;
+        run(&input, &output, target, &Job::quiet()).unwrap();
+        assert_eq!(fs::metadata(&output).unwrap().len(), target);
+
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert!(
+            archive
+                .file_names()
+                .all(|name| !name.starts_with("filepumper/")),
+            "часть-заполнитель не нужна, если есть картинка"
+        );
+        let media = archive.by_name("word/media/image1.png").unwrap();
+        assert!(media.size() > image.len() as u64);
+        drop(media);
+        // Картинка остаётся валидной: приватный чанк PNG не ломает декодер.
+        let mut data = Vec::new();
+        archive
+            .by_name("word/media/image1.png")
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        assert!(image::load_from_memory(&data).is_ok());
+    }
+
+    #[test]
+    fn office_package_keeps_the_zip_comment_free() {
         let declared = declare_padding_content_type(CONTENT_TYPES_XML.as_bytes()).unwrap();
         let text = String::from_utf8(declared.clone()).unwrap();
         assert_eq!(text.matches("Extension=\"fppad\"").count(), 1);

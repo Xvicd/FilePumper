@@ -9,4 +9,5 @@ pub mod payload;
 pub mod pumper;
 pub mod report;
 pub mod scan;
+pub mod share;
 pub mod util;

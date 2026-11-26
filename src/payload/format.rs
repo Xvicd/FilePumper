@@ -28,8 +28,31 @@ const FOOTER_LEN: usize = 12;
 pub struct ContainerOptions {
     pub compress: bool,
     pub password: Option<String>,
+    /// Содержимое ключ-файла: вместе с паролем участвует в выводе ключа.
+    pub keyfile: Option<Vec<u8>>,
     /// Полезная нагрузка — бандл из нескольких файлов (ZIP внутри контейнера).
     pub bundle: bool,
+}
+
+/// Пароль вместе с ключ-файлом: одна и та же строка нужна при записи и чтении.
+///
+/// Ключ-файл не хранится в контейнере: его отсутствие или замена даёт другой
+/// ключ, поэтому расшифровать нагрузку без него нельзя.
+pub fn password_material(password: Option<&str>, keyfile: Option<&[u8]>) -> Option<String> {
+    let base = password.map(str::trim).filter(|value| !value.is_empty());
+    match keyfile {
+        Some(bytes) if !bytes.is_empty() => {
+            let digest = codes::sha256(bytes);
+            let mut material = base.unwrap_or("").to_owned();
+            material.push('\u{1}');
+            for byte in digest {
+                use std::fmt::Write as _;
+                let _ = write!(material, "{byte:02x}");
+            }
+            Some(material)
+        }
+        _ => base.map(str::to_owned),
+    }
 }
 
 impl ContainerOptions {
@@ -38,6 +61,11 @@ impl ContainerOptions {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+    }
+
+    /// Строка для вывода ключа: пароль и ключ-файл вместе.
+    pub fn material(&self) -> Option<String> {
+        password_material(self.password(), self.keyfile.as_deref())
     }
 
     pub fn describe(&self) -> String {
@@ -50,6 +78,13 @@ impl ContainerOptions {
         }
         if self.password().is_some() {
             parts.push("шифрование паролем".to_owned());
+        }
+        if self
+            .keyfile
+            .as_deref()
+            .is_some_and(|bytes| !bytes.is_empty())
+        {
+            parts.push("ключ-файл".to_owned());
         }
         if parts.is_empty() {
             "без сжатия и шифрования".to_owned()
@@ -383,10 +418,10 @@ pub fn build_container(
         }
     }
     let mut cipher_params = None;
-    if let Some(password) = options.password() {
+    if let Some(password) = options.material() {
         job.check()?;
         job.report(16.0, "Шифрование: Argon2id + ChaCha20-Poly1305...");
-        let (encrypted, params) = codes::encrypt(&blob, password)?;
+        let (encrypted, params) = codes::encrypt(&blob, &password)?;
         blob = encrypted;
         cipher_params = Some(params);
         flags |= FLAG_ENCRYPTED;

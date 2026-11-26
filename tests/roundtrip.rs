@@ -134,6 +134,7 @@ fn compression_and_password_work_on_every_carrier() {
     let options = ContainerOptions {
         compress: true,
         password: Some("top-secret".to_owned()),
+        keyfile: None,
         bundle: false,
     };
 

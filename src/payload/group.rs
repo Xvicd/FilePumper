@@ -734,6 +734,7 @@ mod tests {
         let base = ContainerOptions {
             compress: true,
             password: Some("shared".to_owned()),
+            keyfile: None,
             bundle: false,
         };
         let mut pair = EmbedPair::single(PathBuf::from("a.png"), PathBuf::from("one.txt"));
@@ -867,6 +868,7 @@ mod tests {
             &ContainerOptions {
                 compress: false,
                 password: Some("second".to_owned()),
+                keyfile: None,
                 bundle: false,
             },
             1,

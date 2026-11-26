@@ -309,6 +309,117 @@ fn verify_accepts_flag_after_pump() {
 }
 
 #[test]
+fn share_and_join_roundtrip_through_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = text_file(dir.path(), "secret.bin", 1024);
+    let shares_dir = dir.path().join("shares");
+    assert_eq!(
+        cli(&[
+            "share",
+            path_str(&secret),
+            "--parts",
+            "5",
+            "--threshold",
+            "3",
+            "--out-dir",
+            path_str(&shares_dir),
+        ]),
+        0
+    );
+    let parts: Vec<String> = (1..=5)
+        .map(|index| shares_dir.join(format!("secret.bin.share{index}")))
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .collect();
+    assert_eq!(parts.len(), 5);
+
+    let restored = dir.path().join("restored.bin");
+    assert_eq!(
+        cli(&[
+            "join",
+            &parts[0],
+            &parts[2],
+            &parts[4],
+            "--output",
+            path_str(&restored),
+        ]),
+        0
+    );
+    assert_eq!(fs::read(&restored).unwrap(), fs::read(&secret).unwrap());
+
+    // Меньше порога — ошибка и никакого файла.
+    let too_few = dir.path().join("too_few.bin");
+    assert_eq!(
+        cli(&["join", &parts[0], &parts[1], "--output", path_str(&too_few),]),
+        1
+    );
+    assert!(!too_few.exists());
+}
+
+#[test]
+fn keyfile_is_required_to_extract() {
+    let dir = tempfile::tempdir().unwrap();
+    let carrier = png_file(dir.path(), "carrier.png");
+    let payload = text_file(dir.path(), "secret.txt", 24);
+    let keyfile = dir.path().join("key.bin");
+    fs::write(&keyfile, b"key material for tests").unwrap();
+    let out_dir = dir.path().join("out");
+    assert_eq!(
+        cli(&[
+            "embed",
+            path_str(&carrier),
+            "--payload",
+            path_str(&payload),
+            "--password",
+            "pw",
+            "--keyfile",
+            path_str(&keyfile),
+            "--out-dir",
+            path_str(&out_dir),
+        ]),
+        0
+    );
+    let hidden = out_dir.join("carrier_with_payload.png");
+    assert_eq!(
+        cli(&[
+            "verify",
+            path_str(&hidden),
+            "--password",
+            "pw",
+            "--keyfile",
+            path_str(&keyfile),
+        ]),
+        0
+    );
+    assert_ne!(
+        cli(&[
+            "extract",
+            path_str(&hidden),
+            "--password",
+            "pw",
+            "--out-dir",
+            path_str(&dir.path().join("no-key")),
+        ]),
+        0
+    );
+    let extracted = dir.path().join("with-key");
+    assert_eq!(
+        cli(&[
+            "extract",
+            path_str(&hidden),
+            "--password",
+            "pw",
+            "--keyfile",
+            path_str(&keyfile),
+            "--out-dir",
+            path_str(&extracted),
+        ]),
+        0
+    );
+    assert_eq!(fs::read(extracted.join("secret.txt")).unwrap().len(), 24);
+}
+
+#[test]
 fn extract_only_keeps_the_requested_bundle_entry() {
     let dir = tempfile::tempdir().unwrap();
     let carrier = png_file(dir.path(), "carrier.png");
