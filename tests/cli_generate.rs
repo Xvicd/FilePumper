@@ -290,10 +290,10 @@ fn every_size_is_repeated_for_every_count() {
     assert_eq!(code, 0);
     // Каждый размер из --size повторяется --count раз, имена не сталкиваются.
     for name in [
-        "seed_0.25MB.bin",
-        "seed_0.25MB-2.bin",
-        "seed_0.5MB.bin",
-        "seed_0.5MB-2.bin",
+        "seed_0_25MB.bin",
+        "seed_0_25MB-2.bin",
+        "seed_0_5MB.bin",
+        "seed_0_5MB-2.bin",
     ] {
         let path = out_dir.join(name);
         assert!(path.is_file(), "нет файла {}", path.display());

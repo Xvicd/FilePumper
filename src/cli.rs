@@ -97,8 +97,9 @@ FilePumper
   --vary-mode    куда отклоняться: both — в обе стороны (по умолчанию),
                  plus — только прибавлять, minus — только убавлять
   --names        имена результатов: size — с размером (photo_10MB.png,
-                 по умолчанию), plain — без размера (photo.png), random —
-                 случайное имя (quiet-river-4821.png или набор символов)
+                 по умолчанию; дробный размер через «_»: photo_12_3MB.png),
+                 plain — без размера (photo.png), random — случайное имя
+                 (quiet-river-4821.png или набор символов)
   --random-style вид случайного имени: words — два слова и число
                  (green-apple-4821, по умолчанию), chars — символы из алфавита
   --random-length  сколько символов в случайном имени при --random-style chars
@@ -139,8 +140,9 @@ FilePumper
                  каждого типа (по умолчанию), random — всего --count файлов,
                  тип каждого выбирается случайно из указанных
   --count N      сколько файлов создать: при --mix even на каждый тип, при
-                 --mix random всего. --size 5,10 --count 2 --type png,gif даёт
-                 восемь файлов (по два на каждый размер и тип)
+                 --mix random всего; от 1 до 10000.
+                 --size 5,10 --count 2 --type png,gif даёт восемь файлов
+                 (по два на каждый размер и тип)
   --name         основа имени без расширения (по умолчанию file)
   --payload      что спрятать внутрь: контейнер встаёт в заранее посчитанное
                  место, поэтому размер файла остаётся ровно заданным
@@ -537,7 +539,7 @@ impl Flags {
                     flags.count = raw
                         .parse::<usize>()
                         .map_err(|_| format!("Неверное число файлов: {raw}"))?
-                        .clamp(1, 64);
+                        .clamp(1, batch::MAX_GENERATED_FILES);
                 }
                 other if other.starts_with("--") => {
                     return Err(format!("Неизвестный параметр: {other}"));

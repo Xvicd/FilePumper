@@ -302,6 +302,8 @@ pub struct PumperApp {
     gen_mix: MixMode,
     gen_base: String,
     gen_count: usize,
+    /// Поле ручного ввода количества файлов: число берётся отсюда.
+    gen_count_text: String,
     gen_attach: bool,
     preview: Option<Preview>,
     /// Пары «носитель ← нагрузка» для группового встраивания.
@@ -359,6 +361,7 @@ impl Default for PumperApp {
             gen_mix: MixMode::default(),
             gen_base: "file".to_owned(),
             gen_count: 1,
+            gen_count_text: "1".to_owned(),
             gen_attach: false,
             preview: None,
             pairs: Vec::new(),
@@ -501,7 +504,8 @@ impl PumperApp {
         if !settings.gen_base.trim().is_empty() {
             self.gen_base = settings.gen_base;
         }
-        self.gen_count = settings.gen_count.clamp(1, 64);
+        self.gen_count = settings.gen_count.clamp(1, batch::MAX_GENERATED_FILES);
+        self.gen_count_text = self.gen_count.to_string();
         self.gen_attach = settings.gen_attach;
     }
 
@@ -2060,6 +2064,15 @@ fn paint_drop_zones(ui: &egui::Ui, carriers: Option<egui::Rect>, payloads: Optio
     }
 }
 
+/// Число файлов из поля ручного ввода: `None`, если это не число или оно вне
+/// диапазона 1…[`batch::MAX_GENERATED_FILES`].
+fn parse_generated_count(text: &str) -> Option<usize> {
+    let value = text.trim().parse::<usize>().ok()?;
+    (1..=batch::MAX_GENERATED_FILES)
+        .contains(&value)
+        .then_some(value)
+}
+
 /// Что найдено в файле: строка для списка очистки и признак «разобрали».
 ///
 /// Файлы больше 8 МиБ при добавлении не разбираются: обзор читает файл целиком,
@@ -3034,9 +3047,28 @@ impl PumperApp {
                 );
                 ui.add_enabled(
                     !self.busy,
-                    egui::DragValue::new(&mut self.gen_count).range(1..=32),
-                );
+                    egui::TextEdit::singleline(&mut self.gen_count_text)
+                        .desired_width(70.0)
+                        .hint_text("1"),
+                )
+                .on_hover_text(format!(
+                    "Сколько файлов создать: введите число от 1 до {}",
+                    batch::MAX_GENERATED_FILES
+                ));
+                ui.weak("файлов");
             });
+            match parse_generated_count(&self.gen_count_text) {
+                Some(count) => self.gen_count = count,
+                None => {
+                    ui.colored_label(
+                        WARN_COLOR,
+                        format!(
+                            "Количество файлов — число от 1 до {}.",
+                            batch::MAX_GENERATED_FILES
+                        ),
+                    );
+                }
+            }
             if self.gen_kinds.len() > 1 {
                 ui.horizontal(|ui| {
                     ui.label("Распределение:");

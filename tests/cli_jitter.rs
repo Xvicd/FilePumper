@@ -267,10 +267,13 @@ fn size_in_the_name_matches_the_actual_random_size() {
         let path = entry.unwrap().path();
         let length = fs::metadata(&path).unwrap().len();
         let stem = path.file_stem().and_then(|value| value.to_str()).unwrap();
-        let label = stem.rsplit('_').next().unwrap();
+        // Имя вида `file_0_72MB` или `file_0_72MB-2`: дробная часть пишется
+        // через `_`, поэтому обратно меняем её на точку.
+        let label = stem.strip_prefix("file_").unwrap_or(stem);
         let label = label.split('-').next().unwrap();
         let labelled: f64 = label
             .trim_end_matches("MB")
+            .replace('_', ".")
             .parse()
             .unwrap_or_else(|_| panic!("имя {} без размера", path.display()));
         let actual = length as f64 / MIB as f64;

@@ -335,6 +335,9 @@ pub const DEFAULT_RANDOM_LENGTH: usize = 10;
 pub const RANDOM_LENGTH_RANGE: std::ops::RangeInclusive<usize> = 3..=48;
 /// Зерно образца по умолчанию: пример в окне не меняется, пока не нажали «другой».
 pub const DEFAULT_SAMPLE_SEED: u64 = 0x5EED_0523;
+/// Верхняя граница числа файлов за один запуск: защищает от случайного
+/// «100000» в поле количества, но не мешает ввести разумную серию руками.
+pub const MAX_GENERATED_FILES: usize = 10_000;
 
 /// Настройки случайных имён: способ, длина набора символов и сам алфавит.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -698,7 +701,7 @@ pub fn output_extension(method: Method, format: AnimationFormat, input: &Path) -
     }
 }
 
-/// Подпись размера для имени файла: `10MB`, `1.5MB`, `0.25MB`.
+/// Подпись размера: `10MB`, `1.5MB`, `0.25MB`. Для показа человеку.
 pub fn size_label(target_bytes: u64) -> String {
     let value = target_bytes as f64 / MIB as f64;
     if value >= 1.0 && (value - value.round()).abs() < 1e-9 {
@@ -714,9 +717,21 @@ pub fn size_label(target_bytes: u64) -> String {
     format!("{text}MB")
 }
 
+/// Подпись размера для имени файла: `10MB`, `1_5MB`, `0_25MB`.
+///
+/// Точка в дробной части заменяется на `_`: иначе `photo_12.3MB.png` система
+/// читает как файл `photo_12` с расширением `.3MB.png`, и формат файла может
+/// сброситься.
+pub fn size_label_for_name(target_bytes: u64) -> String {
+    size_label(target_bytes).replace('.', "_")
+}
+
 /// Имя результата: `photo.jpg` → `photo_10MB.png`. Расширение зависит от метода,
 /// а [`NameMode`] решает, попадёт ли в имя размер (`Size`), исчезнет ли он (`Plain`)
 /// или имя станет случайным (`Random`, вид задаёт [`RandomNames`]).
+///
+/// Дробный размер пишется через `_` (`photo_12_3MB.png`), чтобы точка не
+/// выглядела началом расширения.
 pub fn result_name(
     input: &Path,
     target_bytes: u64,
@@ -770,7 +785,7 @@ fn compose_name(
     random_stem: impl FnOnce() -> String,
 ) -> String {
     match mode {
-        NameMode::Size => format!("{stem}_{}.{extension}", size_label(target_bytes)),
+        NameMode::Size => format!("{stem}_{}.{extension}", size_label_for_name(target_bytes)),
         NameMode::Plain => format!("{stem}.{extension}"),
         NameMode::Random => format!("{}.{extension}", random_stem()),
     }
@@ -1209,7 +1224,7 @@ pub fn plan_generate(
         return Err("Выберите хотя бы один тип файла.".to_owned());
     }
     let names = names.into();
-    let count = targets.count.clamp(1, 64);
+    let count = targets.count.clamp(1, MAX_GENERATED_FILES);
     let mut reservations = Reservations::new();
     let mut items = Vec::with_capacity(targets.sizes.len() * count * targets.kinds.len());
     let mut rng = rand::thread_rng();
@@ -1392,6 +1407,25 @@ mod tests {
         assert_eq!(size_label(0), "0MB");
         assert_eq!(size_label(MIB / 4), "0.25MB");
         assert_eq!(size_label(MIB), "1MB");
+    }
+
+    #[test]
+    fn size_in_file_name_has_no_dot() {
+        // Точка в имени выглядела бы как начало расширения.
+        assert_eq!(size_label_for_name(10 * MIB), "10MB");
+        assert_eq!(size_label_for_name(MIB / 4), "0_25MB");
+        let twelve_three = (12.3 * MIB as f64) as u64;
+        assert_eq!(size_label_for_name(twelve_three), "12_3MB");
+        assert_eq!(
+            result_name(
+                Path::new("C:/photos/photo.png"),
+                twelve_three,
+                Method::PngChunks,
+                AnimationFormat::Gif,
+                NameMode::Size
+            ),
+            "photo_12_3MB.png"
+        );
     }
 
     #[test]
@@ -2042,8 +2076,8 @@ mod tests {
         let names: Vec<PathBuf> = items.iter().map(|item| item.output.clone()).collect();
         assert_eq!(names[0], dir.path().join("seed_1MB.bin"));
         assert_eq!(names[1], dir.path().join("seed_1MB-2.bin"));
-        assert_eq!(names[2], dir.path().join("seed_0.5MB.bin"));
-        assert_eq!(names[3], dir.path().join("seed_0.5MB-2.bin"));
+        assert_eq!(names[2], dir.path().join("seed_0_5MB.bin"));
+        assert_eq!(names[3], dir.path().join("seed_0_5MB-2.bin"));
         assert_eq!(items[0].target, MIB);
         assert_eq!(items[2].target, MIB / 2);
         assert!(items.iter().all(|item| item.payloads.is_empty()));
