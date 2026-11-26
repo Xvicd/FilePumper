@@ -19,7 +19,7 @@ use crate::report;
 use crate::scan;
 use crate::util::{
     format_bytes, format_duration, format_speed, CancelToken, Job, Reservations, CANCELLED_MESSAGE,
-    MIB,
+    GIB, MIB,
 };
 
 /// Обычная строка результата: в quiet/json-режиме её не печатаем.
@@ -87,7 +87,8 @@ FilePumper
                                    [--quiet] [--no-progress] [--json]
 
   --size         размер; список через запятую задаёт размер каждому файлу
-                 (дробную часть пишите через точку: 1.5)
+                 (дробную часть пишите через точку: 1.5). Единицы: 700KB,
+                 1.5GB, 512B; без суффикса — мегабайты
   --size-mode    exact — ровно столько (по умолчанию), at-least — не меньше,
                  add — прибавить указанный объём к каждому файлу
   --vary         разброс размера: вместо ровных 400 МБ файл получит случайный
@@ -108,6 +109,9 @@ FilePumper
   --image-size   размер видимой «шумовой» картинки у png/gif/jpg/webp:
                  «512x512», «1024x768» или одно число (квадрат). По умолчанию
                  16x16 — файл выглядит как маленькая шумовая картинка
+  --noise        вид шума в картинке: rgb (цветной снег, по умолчанию),
+                 gradient (градиент), checker (шахматка), tv (телевизионный
+                 снег), perlin (плавные пятна)
   --random-alphabet  из каких символов собирать имя (по умолчанию a-z0-9);
                  лишние символы отбрасываются: годятся латиница, цифры, - и _
   --from-dir     добавить все файлы папки, --recursive — вместе с подпапками
@@ -128,7 +132,7 @@ FilePumper
                                    [--random-style words|chars]
                                    [--random-length N|N-M|random]
                                    [--random-alphabet НАБОР]
-                                   [--image-size 512x512]
+                                   [--image-size 512x512] [--noise rgb|gradient|checker|tv|perlin]
                                    [--out-dir ПАПКА] [--output ФАЙЛ]
                                    [--payload ФАЙЛ ...] [--copies 1..3]
                                    [--compress] [--password ПАРОЛЬ]
@@ -244,6 +248,8 @@ struct Flags {
     random: RandomNames,
     /// Размер видимой «шумовой» картинки у созданных типов-картинок.
     image_size: crate::pumper::generate::ImageSize,
+    /// Вид шума в видимой части созданных картинок.
+    noise: crate::pumper::generate::NoiseKind,
     method: Method,
     format: AnimationFormat,
     copies: usize,
@@ -318,15 +324,45 @@ fn parse_sizes(value: &str) -> Result<Vec<f64>, String> {
         if raw.is_empty() {
             continue;
         }
-        sizes.push(
-            raw.parse::<f64>()
-                .map_err(|_| format!("Неверный размер: {raw}"))?,
-        );
+        sizes.push(parse_size_item(&raw)?);
     }
     if sizes.is_empty() {
         return Err("Неверный размер: укажите число в мегабайтах.".to_owned());
     }
     Ok(sizes)
+}
+
+/// Один размер в мегабайтах: `10`, `700KB`, `1.5GB`, `512B`.
+///
+/// Без суффикса число считается мегабайтами, как и раньше: `--size 10` —
+/// это 10 МБ, `--size 700KB` — 700 КБ, `--size 1.5GB` — полтора гигабайта.
+fn parse_size_item(raw: &str) -> Result<f64, String> {
+    let normalized = raw.replace(',', ".");
+    let split = normalized
+        .char_indices()
+        .find(|(_, symbol)| symbol.is_alphabetic());
+    let (number, suffix) = match split {
+        Some((index, _)) => (&normalized[..index], &normalized[index..]),
+        None => (normalized.as_str(), ""),
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("Неверный размер: {raw}"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("Неверный размер: {raw}"));
+    }
+    let factor: f64 = match suffix.to_ascii_lowercase().as_str() {
+        "" | "m" | "mb" | "м" | "мб" => MIB as f64,
+        "b" | "б" => 1.0,
+        "k" | "kb" | "к" | "кб" => 1024.0,
+        "g" | "gb" | "г" | "гб" => GIB as f64,
+        other => {
+            return Err(format!(
+                "Неизвестная единица размера: «{other}». Допустимо: B, KB, MB, GB."
+            ))
+        }
+    };
+    Ok(value * factor / MIB as f64)
 }
 
 /// Разброс размера в мегабайтах: запятая тоже работает, отрицательный — ошибка.
@@ -352,6 +388,7 @@ impl Flags {
             names: NameMode::Size,
             random: RandomNames::default(),
             image_size: crate::pumper::generate::ImageSize::default(),
+            noise: crate::pumper::generate::NoiseKind::default(),
             method: Method::Animation,
             format: AnimationFormat::Gif,
             copies: 1,
@@ -437,6 +474,10 @@ impl Flags {
                 "--image-size" | "--image" => {
                     let raw = next("--image-size", &mut iterator)?;
                     flags.image_size = crate::pumper::generate::ImageSize::parse(&raw)?;
+                }
+                "--noise" | "--noise-kind" => {
+                    let raw = next("--noise", &mut iterator)?;
+                    flags.noise = crate::pumper::generate::NoiseKind::parse(&raw)?;
                 }
                 "--copies" => {
                     let raw = next("--copies", &mut iterator)?;
@@ -1121,6 +1162,7 @@ fn command_generate(flags: &Flags) -> Result<(), String> {
         kinds: kinds.clone(),
         mix: flags.mix,
         image: flags.image_size,
+        noise: flags.noise,
     };
     let mut items = batch::plan_generate(
         &flags.base_name,
@@ -2175,7 +2217,7 @@ fn command_clean(flags: &Flags) -> Result<(), String> {
 fn completion_script(shell: &str) -> Result<&'static str, String> {
     let script = match shell.trim().to_ascii_lowercase().as_str() {
         "bash" => {
-            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
+            r#"complete -W "pump generate make embed extract inspect verify clean completions --help --version --size --size-mode --vary --vary-mode --names --random-style --random-length --random-alphabet --image-size --noise --method --format --from-dir --from-file --recursive --ext --skip-unsupported --jobs --dry-run --verify --report --out-dir --output --payload --pair --pair-by --pair-password --copies --compress --password --password-file --password-stdin --quiet --no-progress --json --type --mix --name --count" file-pumper-cli
 "#
         }
         "zsh" => {
@@ -2197,7 +2239,7 @@ complete -c file-pumper-cli -l password-file -r -d "Пароль из файла
     param($wordToComplete, $commandAst, $cursorPosition)
     $items = 'pump','generate','make','embed','extract','inspect','verify','clean','completions',
         '--help','--version','--size','--size-mode','--vary','--vary-mode','--names',
-        '--random-style','--random-length','--random-alphabet','--image-size','--method','--format',
+        '--random-style','--random-length','--random-alphabet','--image-size','--noise','--method','--format',
         '--from-dir','--from-file','--recursive','--ext','--skip-unsupported','--jobs',
         '--dry-run','--verify','--report','--out-dir','--output','--payload','--pair',
         '--pair-by','--pair-password','--copies','--compress','--password',
@@ -2224,6 +2266,21 @@ mod tests {
     fn parse(args: &[&str]) -> Flags {
         let args: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
         Flags::parse(&args).unwrap()
+    }
+
+    #[test]
+    fn size_units_are_parsed() {
+        assert_eq!(parse_size_item("10").unwrap(), 10.0);
+        assert_eq!(
+            parse_size_item("700KB").unwrap(),
+            700.0 * 1024.0 / MIB as f64
+        );
+        assert_eq!(parse_size_item("1.5GB").unwrap(), 1536.0);
+        assert_eq!(parse_size_item("512B").unwrap(), 512.0 / MIB as f64);
+        assert_eq!(parse_size_item("2мб").unwrap(), 2.0);
+        assert!(parse_size_item("10XB").is_err());
+        assert!(parse_size_item("0").is_err());
+        assert!(parse_size_item("abc").is_err());
     }
 
     #[test]

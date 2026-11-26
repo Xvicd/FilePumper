@@ -1,7 +1,9 @@
 //! Режимы увеличения размера файла и создание файлов «с нуля».
 
 pub mod animation;
+pub mod documents;
 pub mod generate;
+pub mod noise;
 pub mod office;
 pub mod padding;
 pub mod png_chunks;
@@ -78,15 +80,24 @@ pub enum GeneratedKind {
     Gif,
     Jpeg,
     Webp,
+    /// PDF-документ с одной страницей и заполнителем.
+    Pdf,
+    /// DOCX-документ: пакет OPC с частью-заполнителем.
+    Docx,
+    /// XLSX-книга: пакет OPC с частью-заполнителем.
+    Xlsx,
 }
 
 impl GeneratedKind {
-    pub const ALL: [GeneratedKind; 5] = [
+    pub const ALL: [GeneratedKind; 8] = [
         GeneratedKind::Bin,
         GeneratedKind::Png,
         GeneratedKind::Gif,
         GeneratedKind::Jpeg,
         GeneratedKind::Webp,
+        GeneratedKind::Pdf,
+        GeneratedKind::Docx,
+        GeneratedKind::Xlsx,
     ];
 
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -101,8 +112,11 @@ impl GeneratedKind {
             "gif" => Ok(GeneratedKind::Gif),
             "jpg" | "jpeg" => Ok(GeneratedKind::Jpeg),
             "webp" => Ok(GeneratedKind::Webp),
+            "pdf" => Ok(GeneratedKind::Pdf),
+            "docx" | "doc" => Ok(GeneratedKind::Docx),
+            "xlsx" | "xls" => Ok(GeneratedKind::Xlsx),
             other => Err(format!(
-                "Неизвестный тип файла: {other}. Допустимо: bin, png, gif, jpg, webp."
+                "Неизвестный тип файла: {other}. Допустимо: bin, png, gif, jpg, webp, pdf, docx, xlsx."
             )),
         }
     }
@@ -133,7 +147,7 @@ impl GeneratedKind {
         }
         if kinds.is_empty() {
             return Err(
-                "Укажите хотя бы один тип файла: bin, png, gif, jpg, webp или all.".to_owned(),
+                "Укажите хотя бы один тип файла: bin, png, gif, jpg, webp, pdf, docx, xlsx или all.".to_owned(),
             );
         }
         Ok(kinds)
@@ -147,6 +161,9 @@ impl GeneratedKind {
             GeneratedKind::Gif => "gif",
             GeneratedKind::Jpeg => "jpg",
             GeneratedKind::Webp => "webp",
+            GeneratedKind::Pdf => "pdf",
+            GeneratedKind::Docx => "docx",
+            GeneratedKind::Xlsx => "xlsx",
         }
     }
 
@@ -158,12 +175,26 @@ impl GeneratedKind {
             GeneratedKind::Gif => "GIF-картинка (.gif)",
             GeneratedKind::Jpeg => "JPEG-картинка (.jpg)",
             GeneratedKind::Webp => "WebP-картинка (.webp)",
+            GeneratedKind::Pdf => "PDF-документ (.pdf)",
+            GeneratedKind::Docx => "Документ Word (.docx)",
+            GeneratedKind::Xlsx => "Таблица Excel (.xlsx)",
         }
     }
 
     /// Картиночные типы — валидные изображения с «вторым дном» внутри структуры.
     pub fn is_image(self) -> bool {
-        !matches!(self, GeneratedKind::Bin)
+        matches!(
+            self,
+            GeneratedKind::Png | GeneratedKind::Gif | GeneratedKind::Jpeg | GeneratedKind::Webp
+        )
+    }
+
+    /// Документы: валидный PDF или пакет OPC с частью-заполнителем.
+    pub fn is_document(self) -> bool {
+        matches!(
+            self,
+            GeneratedKind::Pdf | GeneratedKind::Docx | GeneratedKind::Xlsx
+        )
     }
 }
 

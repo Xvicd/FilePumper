@@ -1294,6 +1294,8 @@ pub struct GenerateItem {
     pub payloads: Vec<PathBuf>,
     /// Размер видимой «шумовой» картинки внутри файла.
     pub image: generate::ImageSize,
+    /// Вид шума в видимой части картинки.
+    pub noise: generate::NoiseKind,
 }
 
 /// Как разложить несколько выбранных типов по серии файлов.
@@ -1354,6 +1356,8 @@ pub struct GenerateTargets {
     pub mix: MixMode,
     /// Размер видимой «шумовой» картинки (`16×16` по умолчанию).
     pub image: generate::ImageSize,
+    /// Вид шума в видимой части картинки.
+    pub noise: generate::NoiseKind,
 }
 
 /// План генерации: каждый размер создаётся по правилам [`MixMode`], имена — по
@@ -1394,6 +1398,7 @@ pub fn plan_generate(
                 kind,
                 payloads: payloads.to_vec(),
                 image: targets.image.sanitized(),
+                noise: targets.noise,
             });
         }
     }
@@ -1432,8 +1437,21 @@ pub fn generate_one(
 ) -> Result<u64, String> {
     job.check()?;
     create_parent_dir(&item.output)?;
+    if item.kind.is_document() && !item.payloads.is_empty() {
+        return Err(format!(
+            "Встроить нагрузку в «{}» пока нельзя: выберите картинку или обычный файл.",
+            item.kind.title()
+        ));
+    }
     if item.payloads.is_empty() {
-        return generate::run(item.kind, &item.output, item.target, item.image, job);
+        return generate::run(
+            item.kind,
+            &item.output,
+            item.target,
+            item.image,
+            item.noise,
+            job,
+        );
     }
 
     let copies = copies.clamp(payload::MIN_COPIES, payload::MAX_COPIES);
@@ -1441,7 +1459,7 @@ pub fn generate_one(
     let mut options = options.clone();
     options.bundle = prepared.bundle;
     let container_len = prepared.container_len(&options, copies, job)?;
-    let min_size = generate::min_size(item.kind, item.image)?;
+    let min_size = generate::min_size(item.kind, item.image, item.noise)?;
     if item.target < min_size + container_len {
         return Err(too_small_message(item.kind, min_size, container_len));
     }
@@ -1451,6 +1469,7 @@ pub fn generate_one(
     let overhead = measure_overhead(
         item.kind,
         item.image,
+        item.noise,
         &prepared,
         &options,
         copies,
@@ -1470,7 +1489,14 @@ pub fn generate_one(
     let directory = parent_dir(&item.output).to_path_buf();
     let carrier = tempfile::NamedTempFile::new_in(&directory)
         .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
-    generate::run(item.kind, carrier.path(), carrier_target, item.image, job)?;
+    generate::run(
+        item.kind,
+        carrier.path(),
+        carrier_target,
+        item.image,
+        item.noise,
+        job,
+    )?;
     payload::embed_bytes(
         carrier.path(),
         &prepared.bytes,
@@ -1497,9 +1523,11 @@ pub fn generate_one(
 
 /// Сколько байт формат добавляет вокруг контейнера: узнаём на минимальном
 /// носителе, чтобы не считать формулы для PNG, GIF, JPEG и WebP вручную.
+#[allow(clippy::too_many_arguments)]
 fn measure_overhead(
     kind: GeneratedKind,
     image: generate::ImageSize,
+    noise: generate::NoiseKind,
     prepared: &payload::PreparedPayload,
     options: &ContainerOptions,
     copies: usize,
@@ -1507,7 +1535,7 @@ fn measure_overhead(
     job: &Job<'_>,
 ) -> Result<u64, String> {
     let directory = parent_dir(output);
-    let base = generate::base_bytes(kind, image)?;
+    let base = generate::base_bytes(kind, image, noise)?;
     let carrier = tempfile::NamedTempFile::new_in(directory)
         .map_err(|err| format!("Не удалось создать временный файл: {err}"))?;
     fs::write(carrier.path(), &base).map_err(|err| err.to_string())?;

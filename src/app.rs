@@ -15,6 +15,7 @@ use crate::batch::{
 use crate::metadata::{self, CleanOptions};
 use crate::payload::group::PairMode;
 use crate::payload::{self, ContainerOptions, PayloadSummary};
+use crate::pumper::generate::NoiseKind;
 use crate::pumper::{AnimationFormat, GeneratedKind, Method};
 use crate::scan;
 use crate::util::{
@@ -192,6 +193,8 @@ struct Settings {
     /// Размер видимой «шумовой» картинки в сгенерированных файлах.
     image_width: u32,
     image_height: u32,
+    /// Вид шума: индекс в `NoiseKind::ALL`.
+    noise: usize,
     clean_text: bool,
     clean_profiles: bool,
 }
@@ -233,6 +236,7 @@ impl Default for Settings {
             gen_attach: false,
             image_width: crate::pumper::generate::ImageSize::default().width,
             image_height: crate::pumper::generate::ImageSize::default().height,
+            noise: 0,
             clean_text: true,
             clean_profiles: false,
         }
@@ -317,6 +321,8 @@ pub struct PumperApp {
     /// Размер видимой «шумовой» картинки в сгенерированных файлах.
     image_width: u32,
     image_height: u32,
+    /// Вид шума в видимой части созданных картинок.
+    noise: NoiseKind,
     gen_attach: bool,
     preview: Option<Preview>,
     /// Пары «носитель ← нагрузка» для группового встраивания.
@@ -378,6 +384,7 @@ impl Default for PumperApp {
             gen_count_text: "1".to_owned(),
             image_width: crate::pumper::generate::ImageSize::default().width,
             image_height: crate::pumper::generate::ImageSize::default().height,
+            noise: NoiseKind::default(),
             gen_attach: false,
             preview: None,
             pairs: Vec::new(),
@@ -458,6 +465,10 @@ impl PumperApp {
             gen_attach: self.gen_attach,
             image_width: self.image_width,
             image_height: self.image_height,
+            noise: NoiseKind::ALL
+                .iter()
+                .position(|kind| *kind == self.noise)
+                .unwrap_or(0),
             clean_text: self.clean_text,
             clean_profiles: self.clean_profiles,
         }
@@ -540,6 +551,10 @@ impl PumperApp {
         .sanitized();
         self.image_width = image.width;
         self.image_height = image.height;
+        self.noise = NoiseKind::ALL
+            .get(settings.noise)
+            .copied()
+            .unwrap_or_default();
     }
 
     /// Сохранить текущие настройки как профиль (или обновить выбранный).
@@ -1054,6 +1069,7 @@ impl PumperApp {
                 width: self.image_width,
                 height: self.image_height,
             },
+            noise: self.noise,
         };
         let items = match batch::plan_generate(
             &self.gen_base,
@@ -3120,23 +3136,38 @@ impl PumperApp {
                     )
                     .on_hover_text("Высота видимой «шумовой» картинки в пикселях");
                     ui.label("px");
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("512×512").small())
-                        .on_hover_text("Шумовая картинка 512×512 — как обычное фото")
-                        .clicked()
-                    {
-                        self.image_width = 512;
-                        self.image_height = 512;
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("16×16").small())
-                        .on_hover_text("Служебная картинка по умолчанию: файл меньше")
-                        .clicked()
-                    {
-                        self.image_width = 16;
-                        self.image_height = 16;
-                    }
                     ui.weak(format!("сейчас {}", size.label()));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Пресеты:");
+                    for (label, width, height) in [
+                        ("1920×1080", 1920, 1080),
+                        ("1080×1080", 1080, 1080),
+                        ("2560×1440", 2560, 1440),
+                        ("A4 300 dpi", 2480, 3508),
+                        ("512×512", 512, 512),
+                        ("16×16", 16, 16),
+                    ] {
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new(label).small())
+                            .clicked()
+                        {
+                            self.image_width = width;
+                            self.image_height = height;
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Шум:");
+                    egui::ComboBox::from_id_salt("noise_kind")
+                        .selected_text(self.noise.label())
+                        .show_ui(ui, |ui| {
+                            for kind in NoiseKind::ALL {
+                                ui.selectable_value(&mut self.noise, kind, kind.label())
+                                    .on_hover_text(kind.title());
+                            }
+                        });
+                    ui.weak(self.noise.title());
                 });
                 ui.weak("Картинки остаются рабочими: объём лежит внутри структуры файла, а шум занимает всю видимую площадь.");
             } else {

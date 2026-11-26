@@ -435,6 +435,7 @@ mod tests {
                 &path,
                 64 * 1024,
                 generate::ImageSize::default(),
+                crate::pumper::generate::NoiseKind::default(),
                 &Job::quiet(),
             )
             .unwrap();

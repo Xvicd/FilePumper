@@ -10,7 +10,8 @@ use std::fs::{self, File};
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-use crate::pumper::{padding, GeneratedKind};
+pub use crate::pumper::noise::NoiseKind;
+use crate::pumper::{documents, padding, GeneratedKind};
 use crate::util::{random_bytes, Job};
 
 /// Сторона служебной картинки по умолчанию: она даёт валидный заголовок формата,
@@ -101,9 +102,16 @@ impl ImageSize {
 ///
 /// Для обычного файла это один случайный байт: так у любого типа есть
 /// «нулевой» носитель, к которому можно прицепить второе дно.
-pub fn base_bytes(kind: GeneratedKind, size: ImageSize) -> Result<Vec<u8>, String> {
+pub fn base_bytes(
+    kind: GeneratedKind,
+    size: ImageSize,
+    noise: NoiseKind,
+) -> Result<Vec<u8>, String> {
     if kind == GeneratedKind::Bin {
         return random_bytes(1);
+    }
+    if kind.is_document() {
+        return documents::skeleton(kind);
     }
     let size = size.sanitized();
     let format = match kind {
@@ -111,13 +119,11 @@ pub fn base_bytes(kind: GeneratedKind, size: ImageSize) -> Result<Vec<u8>, Strin
         GeneratedKind::Gif => image::ImageFormat::Gif,
         GeneratedKind::Jpeg => image::ImageFormat::Jpeg,
         GeneratedKind::Webp => image::ImageFormat::WebP,
-        GeneratedKind::Bin => unreachable!("обычный файл обработан выше"),
+        other => unreachable!("{} — не картинка", other.title()),
     };
     // Шумовая картинка: она и сама плохо сжимается, и не выглядит заглушкой.
-    let pixels = u64::from(size.width) * u64::from(size.height) * 3;
-    let noise =
-        random_bytes(usize::try_from(pixels).map_err(|_| "Слишком большая картинка.".to_owned())?)?;
-    let image = image::RgbImage::from_raw(size.width, size.height, noise)
+    let pixels = crate::pumper::noise::pixels(noise, size)?;
+    let image = image::RgbImage::from_raw(size.width, size.height, pixels)
         .ok_or_else(|| "Не удалось собрать служебное изображение.".to_owned())?;
     let mut bytes = Vec::new();
     image
@@ -127,8 +133,11 @@ pub fn base_bytes(kind: GeneratedKind, size: ImageSize) -> Result<Vec<u8>, Strin
 }
 
 /// Минимально возможный файл этого типа: меньше служебной картинки не выйдет.
-pub fn min_size(kind: GeneratedKind, size: ImageSize) -> Result<u64, String> {
-    Ok(base_bytes(kind, size)?.len() as u64)
+pub fn min_size(kind: GeneratedKind, size: ImageSize, noise: NoiseKind) -> Result<u64, String> {
+    if kind.is_document() {
+        return documents::min_size(kind);
+    }
+    Ok(base_bytes(kind, size, noise)?.len() as u64)
 }
 
 /// Дописывает файл до `target` так, чтобы он остался рабочим.
@@ -139,6 +148,10 @@ pub fn pad_to(kind: GeneratedKind, path: &Path, target: u64, job: &Job<'_>) -> R
         GeneratedKind::Bin | GeneratedKind::Jpeg | GeneratedKind::Webp => {
             padding::append_random_padding(path, target, job)
         }
+        other => Err(format!(
+            "«{}» пишется целиком, добивка к нему не применяется.",
+            other.title()
+        )),
     }
 }
 
@@ -148,13 +161,17 @@ pub fn run(
     output: &Path,
     target: u64,
     image: ImageSize,
+    noise: NoiseKind,
     job: &Job<'_>,
 ) -> Result<u64, String> {
     job.check()?;
     if target == 0 {
         return Err("Размер файла должен быть больше нуля.".to_owned());
     }
-    let base = base_bytes(kind, image)?;
+    if kind.is_document() {
+        return documents::build(kind, output, target, job);
+    }
+    let base = base_bytes(kind, image, noise)?;
     if base.len() as u64 > target {
         return Err(format!(
             "Для файла типа «{}» нужно минимум {} байт.",
@@ -195,7 +212,15 @@ mod tests {
         let target = 256 * 1024;
         for kind in GeneratedKind::ALL {
             let output = dir.path().join(format!("made.{}", kind.extension()));
-            let len = run(kind, &output, target, ImageSize::default(), &Job::quiet()).unwrap();
+            let len = run(
+                kind,
+                &output,
+                target,
+                ImageSize::default(),
+                NoiseKind::default(),
+                &Job::quiet(),
+            )
+            .unwrap();
             assert_eq!(len, target, "тип {}", kind.title());
             assert_eq!(fs::metadata(&output).unwrap().len(), target);
         }
@@ -207,7 +232,15 @@ mod tests {
         let target = 512 * 1024;
         for kind in GeneratedKind::ALL {
             let output = dir.path().join(format!("made.{}", kind.extension()));
-            run(kind, &output, target, ImageSize::default(), &Job::quiet()).unwrap();
+            run(
+                kind,
+                &output,
+                target,
+                ImageSize::default(),
+                NoiseKind::default(),
+                &Job::quiet(),
+            )
+            .unwrap();
             let bytes = fs::read(&output).unwrap();
             let packed = deflate_len(&bytes);
             assert!(
@@ -224,7 +257,15 @@ mod tests {
         let target = 128 * 1024;
         for kind in GeneratedKind::ALL.iter().filter(|kind| kind.is_image()) {
             let output = dir.path().join(format!("made.{}", kind.extension()));
-            run(*kind, &output, target, ImageSize::default(), &Job::quiet()).unwrap();
+            run(
+                *kind,
+                &output,
+                target,
+                ImageSize::default(),
+                NoiseKind::default(),
+                &Job::quiet(),
+            )
+            .unwrap();
             let picture = image::open(&output);
             assert!(picture.is_ok(), "тип {} не открылся", kind.title());
         }
@@ -272,6 +313,7 @@ mod tests {
                 width: 512,
                 height: 512,
             },
+            NoiseKind::default(),
             &Job::quiet(),
         )
         .unwrap();
@@ -290,6 +332,7 @@ mod tests {
             &first,
             8192,
             ImageSize::default(),
+            NoiseKind::default(),
             &Job::quiet(),
         )
         .unwrap();
@@ -298,6 +341,7 @@ mod tests {
             &second,
             8192,
             ImageSize::default(),
+            NoiseKind::default(),
             &Job::quiet(),
         )
         .unwrap();
@@ -313,6 +357,7 @@ mod tests {
             &output,
             16,
             ImageSize::default(),
+            NoiseKind::default(),
             &Job::quiet(),
         )
         .unwrap_err();
@@ -323,6 +368,7 @@ mod tests {
             &output,
             0,
             ImageSize::default(),
+            NoiseKind::default(),
             &Job::quiet(),
         )
         .unwrap_err();

@@ -1,4 +1,4 @@
-FilePumper 0.6.0 — готовые сборки
+FilePumper 0.6.1 — готовые сборки
 ===========================================
 
 windows\
@@ -18,7 +18,8 @@ windows\
     FilePumper-cli.exe pump --from-dir ПАПКА [--recursive] [--ext png,jpg] --size 10
     FilePumper-cli.exe pump --from-file список.txt --size 10
     FilePumper-cli.exe generate --size 10 --type png[,gif,...] [--mix even|random]
-                        [--count N] [--image-size WxH] [--name ОСНОВА]
+                        [--count N] [--image-size WxH] [--noise rgb|gradient|checker|tv|perlin]
+                        [--name ОСНОВА]
                         [--vary <МБ> [--vary-mode plus|minus|both]]
                         [--names size|plain|random] [--random-style words|chars]
                         [--payload <файл> ...] [--out-dir ПАПКА]
@@ -46,11 +47,15 @@ windows\
 
   Файлы с нуля: generate (алиас make) создаёт файл нужного размера без исходника —
   внутри криптослучайные байты, поэтому zip/gzip/7z его не сожмут. Тип задаётся
-  --type bin|png|gif|jpg|webp: картиночные типы остаются открывающимися файлами.
+  --type bin|png|gif|jpg|webp|pdf|docx|xlsx: картиночные типы остаются
+  открывающимися файлами, pdf/docx/xlsx — настоящие документы ровно нужного
+  размера.
   Типов может быть несколько: --type png,gif,bin (список через запятую, all — все
   пять). Число файлов задаёт --count (от 1 до 10000) или поле в окне.
   Размер видимой картинки задаёт --image-size 512x512 (по умолчанию 16x16):
-  файл выглядит как шумовое фото нужного разрешения.
+  файл выглядит как шумовое фото нужного разрешения. Вид шума выбирает --noise:
+  rgb (цветной снег), gradient, checker, tv, perlin.
+  Размер можно писать с единицами: --size 700KB, --size 1.5GB, --size 512B.
   Как разложить типы, решает --mix: even (по умолчанию) — по --count файлов
   каждого типа, random — всего --count файлов со случайным типом.
   С --payload внутрь прячется нагрузка, но размер остаётся ровно целевым.
